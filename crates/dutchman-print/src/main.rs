@@ -261,11 +261,23 @@ async fn command(command: Command, backend: &dyn Backend, data: &Path) -> Result
                 let estimate = estimate?;
                 if !json {
                     eprintln!(
-                        "Estimate: {} seconds, {} mm filament, {} g, {} layers (simulated).",
-                        estimate.seconds.unwrap_or_default(),
-                        estimate.filament_mm.unwrap_or_default(),
-                        estimate.filament_g.unwrap_or_default(),
-                        estimate.layers.unwrap_or_default()
+                        "Estimate: {} seconds, {} mm filament, {} g, {} layers.",
+                        estimate
+                            .seconds
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "unavailable".into()),
+                        estimate
+                            .filament_mm
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "unavailable".into()),
+                        estimate
+                            .filament_g
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "unavailable".into()),
+                        estimate
+                            .layers
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "unavailable".into())
                     );
                 }
                 let start = if json {
@@ -326,6 +338,7 @@ async fn prepare_cli(
     dir: &Path,
 ) -> Result<dutchman_print::backend::Estimate, dutchman_print::backend::Error> {
     use dutchman_print::backend::Error;
+    options.validate().map_err(Error::Refused)?;
     let settings = dutchman_print::StorageConfig::default();
     if !file
         .extension()

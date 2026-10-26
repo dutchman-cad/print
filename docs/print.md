@@ -2,7 +2,7 @@
 
 Dutchman Print is a local print companion for SolidCraft and a standalone command line.
 A backend prepares 3MF files, estimates jobs, and controls printers. The included
-`simulated` backend is a demo: it does no slicing, contacts no printers, and uses no network.
+`simulated` backend is a demo: it contacts no printers and can optionally run a local slicer.
 Real printer backends come later.
 
 Build `dutchman-print` from this checkout with Rust 1.88 or newer:
@@ -45,6 +45,100 @@ Without `--config`, the config path is:
 | macOS | `~/Library/Application Support/dutchman-print/config.toml` |
 | Windows | `%APPDATA%\dutchman-print\config.toml` |
 
+## Slicer
+
+Install PrusaSlicer or OrcaSlicer separately and set it up in its own application first.
+Dutchman runs its public command line as a separate program; it does not include or link
+slicer code. The slicer's AGPL licence stays with that program. Cura is not supported yet.
+No printer backend is included here.
+
+```toml
+[backend]
+kind = "simulated"
+slice = true
+
+[slicer]
+kind = "prusaslicer" # or "orcaslicer"
+# path = "/path/to/prusa-slicer"
+# datadir = "/path/to/PrusaSlicer"
+timeout_seconds = 600
+
+[[printers]]
+id = "workbench"
+name = "Workbench demo"
+model = "Example printer"
+printer_profile = "Original Prusa MINI & MINI+"
+print_profile = "0.20mm QUALITY @MINI"
+filament_profile = "Generic PLA @MINI"
+```
+
+Profile values are names already installed in the slicer, including its system presets
+and presets you saved there. Dutchman keeps no profile set. Job options (CLI flags or API
+fields) override each printer's corresponding name. Omitted names leave the input project's
+settings and slicer defaults in effect. Profile names must contain 1–256 bytes of nonempty
+plain text without control characters and cannot start with `-`. This applies to config,
+CLI flags, and both API upload forms; refusal says "Profile names can't start with '-'."
+Job names are metadata only; uploaded files and slicer outputs use companion-built paths.
+Unknown slicer kinds produce an error naming the kind.
+`slice = true` requires `[slicer]`; without it the simulator keeps its size-based estimates.
+
+An explicit `path` takes precedence and disables executable discovery. Otherwise Dutchman
+searches each `PATH` directory in order: `prusa-slicer-console`, `prusa-slicer`, then
+`PrusaSlicer` for Prusa; `orca-slicer`, then `OrcaSlicer` for Orca (`.exe` on Windows).
+It next checks `/usr/bin`, `/usr/local/bin`, and `/opt` on Linux (directly and under the
+application name); application bundles under `/Applications` and `~/Applications` on
+macOS, including `Original Prusa Drivers`; and the application's folders under Program
+Files, Program Files (x86), and LocalAppData on Windows.
+
+Linux discovery then checks `/var/lib/flatpak/exports/bin`, followed by
+`~/.local/share/flatpak/exports/bin`. The launcher names are `com.prusa3d.PrusaSlicer` for
+Prusa and `io.github.softfever.OrcaSlicer`, then `com.orcaslicer.OrcaSlicer`, for Orca.
+Both Orca IDs are public; the newer ID is listed on
+[Flathub](https://github.com/flathub/com.orcaslicer.OrcaSlicer).
+These exports are executable launcher scripts and receive the same slicer arguments.
+For other locations, including AppImages, set `slicer.path` to the executable file.
+A missing executable error tells you to set that field. Relative paths use the companion's
+working folder. `datadir` selects the slicer's data folder; otherwise the slicer uses its
+normal platform folder. Timeout defaults to 600 seconds; set 1–86400 seconds.
+
+Orca profile lookup reads JSON preset files' `name` fields below `datadir/user` and
+`datadir/system`, in `machine`, `process`, or `filament` subfolders. Without `datadir`, the
+root is `$XDG_CONFIG_HOME/OrcaSlicer` (or `~/.config/OrcaSlicer`) on Linux,
+`~/Library/Application Support/OrcaSlicer` on macOS, or `%APPDATA%\OrcaSlicer` on Windows.
+When the selected Linux executable is named for either Orca Flatpak ID, lookup instead
+uses `~/.var/app/<app-id>/config/OrcaSlicer`. An explicit `datadir` still takes precedence.
+Missing or ambiguous names report the folders searched. Keep names unique across system
+and user presets. Lookup skips symbolic links, searches at most eight folder levels and
+20,000 entries, and limits each JSON file to 1 MiB and total JSON reads to 64 MiB per
+profile lookup. Preset file paths must not contain semicolons, which Orca uses to separate
+settings files. Orca CLI settings files need inherited values resolved. Dutchman follows
+`inherits` names, preferring the same vendor or user account before searching the full
+catalog, and writes merged settings into the private job folder. Child values override
+parent values. Chains are limited to 32 presets; cycles, missing parents, ambiguous
+parents and merged settings above 1 MiB produce an error. The 64 MiB read limit includes
+inheritance reads.
+
+Backends choose plain text G-code or a 3MF containing `Metadata/plate_1.gcode`.
+PrusaSlicer runs with binary G-code off. Its G-code can be packaged with the input 3MF;
+Orca receives an export filename relative to `--outputdir` and exports a sliced 3MF, from which plain G-code can also be retained. The simulator
+chooses plain G-code. Preparation never starts a print.
+
+Estimates come from the slicer's own G-code comments: time, filament length in mm, weight
+in g, and layer count when present. Unavailable values remain absent in JSON and display
+as `unavailable` on the command line. A plate PNG or G-code PNG thumbnail is kept for the
+preview route. Only the first and last 256 KiB of G-code are inspected for comments and
+thumbnails. G-code and 3MF files are limited to 512 MiB, previews to 4 MiB, and 3MFs to
+5,000 entries. Large thumbnails outside those comment regions are omitted.
+
+The child runs in the private job folder, with arguments passed directly rather than
+through a shell. Both output streams are drained, retaining only their last 8 KiB; failure
+messages show at most 20 lines from each. Timeout and request cancellation kill the child.
+Slicer diagnostics may contain local file paths and profile names.
+
+The command lines follow the public [PrusaSlicer profile selection documentation](https://github.com/prusa3d/PrusaSlicer/releases/tag/version_2.8.0-alpha5)
+and [OrcaSlicer CLI documentation](https://github.com/OrcaSlicer/OrcaSlicer/wiki/cli_mode).
+Use a PrusaSlicer release with those profile-selection flags (2.8 or newer).
+
 ## Commands
 
 ```sh
@@ -74,10 +168,10 @@ starts and returns the printing job. Estimates go to stderr in plain mode; job J
 to stdout. `status`, `pause`, `resume`, and confirmed `cancel` return job JSON.
 `cancel` asks for confirmation on a terminal unless given `--yes`.
 
-The simulator estimates from the compressed 3MF size in bytes: seconds = 60 + size / 1024,
+Without `backend.slice = true`, the simulator estimates from the compressed 3MF size in bytes: seconds = 60 + size / 1024,
 filament mm = size / 10, filament g = size / 1000, and layers = 1 + size / 4096.
 Integer divisions round down. These are demonstration values, not slicing results.
-Profile names are accepted but do not affect the demo. Started jobs progress with elapsed
+Profile names affect slicing only when it is enabled. Started jobs progress with elapsed
 time, pause freezes progress, resume continues, and cancel ends the job.
 
 CLI simulation state is saved in the private data folder, separately for each config path,
@@ -118,7 +212,7 @@ are `printer_profile`, `print_profile`, `filament_profile`, and `name`. Each tex
 nonempty plain UTF-8, at most 256 bytes. Duplicate or unknown fields are refused. Without
 `name`, the uploaded filename is used. A 3MF must be a zip with a `3D/*.model` part. The
 companion checks paths, entry counts, and actual expanded sizes before calling the backend.
-The simulator does not produce previews.
+The simulator supplies previews only when slicing produces one.
 
 Printer objects have `id`, `name`, `model`, and `state`: `idle`, `printing`, `paused`, `error`,
 or `offline`. While printing or paused they may include `job_id`, `job_name`, `progress`
@@ -175,3 +269,67 @@ Backend authors implement the asynchronous `backend::Backend` trait in
 job ID, private 3MF path, printer ID, and profile names. Typed errors distinguish not found,
 busy, refused with a message, unavailable/offline, and failed. The simulated implementation
 accepts a clock so lifecycle tests can advance time without sleeping.
+
+### Flatpak manual check
+
+Keep job folders under your home folder, where the Flatpaks have filesystem access.
+A host `/tmp` folder is separate from the Flatpak's `/tmp`. Set `TMPDIR` to a private
+folder below home before starting the companion or a manual check.
+
+Some Prusa Flatpak entrypoints start a background theme helper that keeps diagnostic
+pipes open after slicing. If preparation times out after producing G-code, use a launcher
+that selects the CLI directly, and set `slicer.path` to that executable script:
+
+```sh
+#!/bin/sh
+exec flatpak run --unshare=network --nodevice=all --command=prusa-slicer com.prusa3d.PrusaSlicer "$@"
+```
+
+For Orca, replace the command with `orca-slicer` and the app ID with the installed Orca ID.
+The script disables networking and device access. When using a custom Orca launcher,
+set `slicer.datadir` explicitly because its filename no longer identifies the Flatpak.
+Orca presets available only in the application bundle must be installed into the selected
+data folder's `system` tree first, with their vendor manifests and inherited presets.
+
+The ignored `real_slicer` test builds a 20 mm cube 3MF and checks G-code and sliced 3MF
+output with system printer, print and filament profiles. It uses isolated temporary data
+and the CLI launchers above. It requires Linux system Flatpaks at
+`/var/lib/flatpak/app`, their bundled presets, and `flatpak` and `timeout` on PATH:
+
+```sh
+mkdir -p "$HOME/Documents/diag-print-lead/slicer/tmp"
+DUTCHMAN_PRINT_REAL_SLICER=prusaslicer buildq run dutchman /path/to/dutchman -- \
+  cargo --config 'env.TMPDIR="/absolute/home/path/Documents/diag-print-lead/slicer/tmp"' \
+  test -p dutchman-print --locked -- --ignored real_slicer --nocapture
+```
+
+Repeat with `DUTCHMAN_PRINT_REAL_SLICER=orcaslicer`. The test prints parsed estimates and
+requires positive time, length and weight. Its preset names come from installed preset
+data. To print the installed CLI help instead, also set
+`DUTCHMAN_PRINT_REAL_SLICER_HELP=1`.
+
+PrusaSlicer 2.9.6 passed with `Original Prusa MINI & MINI+`, `0.20mm QUALITY @MINI`,
+and `Prusament PLA`: 1,439 seconds, 1,248.1 mm and 3.72 g for both output kinds.
+The temporary Prusa data folder registers the MINI model and PLA filament in
+`PrusaSlicer.ini`; copying a vendor bundle alone leaves default printer and filament
+presets selected. Set up the required printer and filament in PrusaSlicer before using
+your own data folder.
+
+The installed legacy Orca Flatpak reports 2.0.0 in its package metadata and
+`OrcaSlicer-01.10.01.50` in CLI help. Its bundled `Bambu Lab A1 0.4 nozzle`,
+`0.20mm Standard @BBL A1`, and `Generic PLA @BBL A1` presets fail validation: relative
+extrusion is enabled, but `before_layer_change_gcode` is empty. The CLI asks for `G92 E0`
+to reset extrusion at every layer and exits with status 205 before slicing.
+
+To use that installation, save an A1 printer preset with `G92 E0` in its before-layer-change
+G-code, and select the saved preset's name. The manual test can verify this correction by
+setting `DUTCHMAN_PRINT_REAL_SLICER_ORCA_LAYER_RESET=1`; it changes only a temporary copy
+of the bundled machine preset. That corrected copy passed both output checks with
+1,338 seconds, 1,214.72 mm, 3.62 g and 100 layers. A run without that variable still
+exposes the installed preset's validation failure. Dutchman does not change installed
+presets or skip validation. Missing display access prevented Orca thumbnails in this
+check; G-code and sliced 3MF estimates were available.
+
+Set `DUTCHMAN_PRINT_REAL_SLICER_KEEP=1` to retain the temporary model, preset copies,
+resolved settings and output for inspection. Orca's effective settings are exported as
+`effective.json` in that folder.

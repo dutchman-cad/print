@@ -4,6 +4,7 @@ pub mod backend;
 pub mod config;
 mod server;
 pub mod simulated;
+pub mod slicer;
 pub mod upload;
 
 pub use server::{router, ServerConfig, StorageConfig};

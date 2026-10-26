@@ -1,4 +1,4 @@
-//! In-memory demonstration backend. No slicing or network access.
+//! In-memory demonstration backend. Optional external slicing; no printer connections.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -37,12 +37,21 @@ pub struct Simulated {
     printers: Vec<crate::config::Printer>,
     jobs: Mutex<BTreeMap<String, Running>>,
     clock: Arc<dyn Clock>,
+    slicer: Option<crate::slicer::Slicer>,
 }
 
 impl Simulated {
     pub fn new(config: crate::config::Config, clock: Arc<dyn Clock>) -> Result<Self, String> {
         config.validate()?;
+        let slicer = if config.backend.slice {
+            Some(crate::slicer::Slicer::new(
+                config.slicer.clone().ok_or("Set [slicer].")?,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
+            slicer,
             printers: config.printers,
             jobs: Mutex::new(BTreeMap::new()),
             clock,
@@ -194,19 +203,30 @@ impl Backend for Simulated {
         options: Options,
     ) -> Reply<'a, Estimate> {
         Box::pin(async move {
-            if !self.printers.iter().any(|p| p.id == printer) {
-                return Err(Error::NotFound);
-            }
-            let size = tokio::fs::metadata(input)
-                .await
-                .map_err(|_| Error::Failed("Cannot read the 3MF file.".into()))?
-                .len();
-            let estimate = Estimate {
-                seconds: Some(60 + size / 1024),
-                filament_mm: Some(size as f64 / 10.0),
-                filament_g: Some(size as f64 / 1000.0),
-                layers: Some(1 + size / 4096),
-                preview: None,
+            options.validate().map_err(Error::Refused)?;
+            let profile = self
+                .printers
+                .iter()
+                .find(|p| p.id == printer)
+                .ok_or(Error::NotFound)?;
+            let estimate = if let Some(slicer) = &self.slicer {
+                slicer
+                    .prepare(input, profile, &options, crate::slicer::OutputKind::Gcode)
+                    .await
+                    .map_err(Error::Failed)?
+                    .estimate
+            } else {
+                let size = tokio::fs::metadata(input)
+                    .await
+                    .map_err(|_| Error::Failed("Cannot read the 3MF file.".into()))?
+                    .len();
+                Estimate {
+                    seconds: Some(60 + size / 1024),
+                    filament_mm: Some(size as f64 / 10.0),
+                    filament_g: Some(size as f64 / 1000.0),
+                    layers: Some(1 + size / 4096),
+                    preview: None,
+                }
             };
             let mut jobs = self.jobs()?;
             if jobs.contains_key(job_id) {

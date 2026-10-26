@@ -991,3 +991,83 @@ async fn raw_3mf_checks_zip_budgets_and_removes_failed_uploads() {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }
+
+#[tokio::test]
+async fn option_like_profiles_are_refused_by_api_cli_and_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let app = router(simulation(clock.clone()), settings(dir.path(), clock));
+    let input = dir.path().join("part.3mf");
+    std::fs::write(&input, model()).unwrap();
+    let path = private_config(dir.path(), CONFIG);
+    let message = "Profile names can't start with '-'.";
+    for field in ["printer_profile", "print_profile", "filament_profile"] {
+        let error = accepted(
+            &app,
+            upload(
+                &[("part.3mf", &model())],
+                &[("printer", "demo"), (field, "--post-process=command")],
+            ),
+            400,
+        )
+        .await;
+        assert_eq!(error["error"], message);
+        let request = Request::post(format!(
+            "/api/v1/jobs?printer=demo&{field}=--post-process%3Dcommand"
+        ))
+        .header(header::CONTENT_TYPE, "model/3mf")
+        .body(Body::from(model()))
+        .unwrap();
+        assert_eq!(accepted(&app, request, 400).await["error"], message);
+        let flag = format!("--{}=--post-process=command", field.replace('_', "-"));
+        let output = cli(
+            &path,
+            &[
+                "print",
+                input.to_str().unwrap(),
+                "--printer",
+                "demo",
+                "--json",
+                &flag,
+            ],
+        );
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(message));
+        std::fs::write(
+            &path,
+            format!("{CONFIG}{field} = \"--post-process=command\"\n"),
+        )
+        .unwrap();
+        assert_eq!(Config::load(&path).err().unwrap(), message);
+        std::fs::write(&path, CONFIG).unwrap();
+    }
+}
+
+#[test]
+fn profile_validation_keeps_plain_text_and_length_limits() {
+    for value in ["", " ", "a\nb", "a\0b", &"a".repeat(257)] {
+        let options = Options {
+            print_profile: Some(value.into()),
+            ..Default::default()
+        };
+        assert!(options.validate().is_err(), "{value:?}");
+    }
+    for value in ["-preset", "--post-process=command"] {
+        assert_eq!(
+            Options {
+                filament_profile: Some(value.into()),
+                ..Default::default()
+            }
+            .validate(),
+            Err("Profile names can't start with '-'.".into())
+        );
+    }
+    for value in ["Fine - quality", "PLA; name=value", &"a".repeat(256)] {
+        assert!(Options {
+            printer_profile: Some(value.into()),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
+    }
+}

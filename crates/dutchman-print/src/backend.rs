@@ -83,6 +83,34 @@ pub struct Options {
     pub name: Option<String>,
 }
 
+/// Validates a preset name before it can reach an external slicer.
+pub(crate) fn validate_profile_name(name: &str) -> Result<(), String> {
+    if name.starts_with('-') {
+        return Err("Profile names can't start with '-'.".into());
+    }
+    if name.trim().is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+        return Err("Use plain profile names of 1–256 bytes.".into());
+    }
+    Ok(())
+}
+
+impl Options {
+    /// Applies the same preset rules to API, CLI, and direct backend callers.
+    pub fn validate(&self) -> Result<(), String> {
+        for name in [
+            &self.printer_profile,
+            &self.print_profile,
+            &self.filament_profile,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            validate_profile_name(name)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Estimate {
     #[serde(skip_serializing_if = "Option::is_none")]

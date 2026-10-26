@@ -274,6 +274,12 @@ fn job_field(
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(bad("Use nonempty plain text job fields."));
     }
+    if matches!(
+        key.as_str(),
+        "printer_profile" | "print_profile" | "filament_profile"
+    ) {
+        crate::backend::validate_profile_name(&value).map_err(bad)?;
+    }
     fields.insert(key, value);
     Ok(())
 }

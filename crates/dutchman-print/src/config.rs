@@ -13,6 +13,7 @@ pub const MAX_PRINTERS: usize = 64;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub backend: Backend,
+    pub slicer: Option<crate::slicer::Config>,
     #[serde(default)]
     pub printers: Vec<Printer>,
 }
@@ -21,6 +22,8 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct Backend {
     pub kind: String,
+    #[serde(default)]
+    pub slice: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -29,6 +32,9 @@ pub struct Printer {
     pub id: String,
     pub name: String,
     pub model: String,
+    pub printer_profile: Option<String>,
+    pub print_profile: Option<String>,
+    pub filament_profile: Option<String>,
 }
 
 impl Config {
@@ -77,8 +83,24 @@ impl Config {
                 self.backend.kind
             ));
         }
+        if let Some(slicer) = &self.slicer {
+            slicer.validate()?;
+        }
+        if self.backend.slice && self.slicer.is_none() {
+            return Err("Set [slicer] when backend.slice is true.".into());
+        }
         let mut ids = HashSet::new();
         for printer in &self.printers {
+            for name in [
+                &printer.printer_profile,
+                &printer.print_profile,
+                &printer.filament_profile,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                crate::backend::validate_profile_name(name)?;
+            }
             if printer.id.is_empty()
                 || printer.id.len() > 64
                 || !printer
