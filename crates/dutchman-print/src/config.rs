@@ -26,9 +26,14 @@ pub struct Backend {
     pub slice: bool,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Printer {
+    pub kind: Option<String>,
+    pub url: Option<String>,
+    pub api_key: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
     pub id: String,
     pub name: String,
     pub model: String,
@@ -77,9 +82,9 @@ impl Config {
         if self.printers.len() > MAX_PRINTERS {
             return Err("Use at most 64 printers in the config.".into());
         }
-        if self.backend.kind != "simulated" {
+        if !matches!(self.backend.kind.as_str(), "simulated" | "printers") {
             return Err(format!(
-                "Backend kind {:?} is not supported yet. Use simulated.",
+                "Backend kind {:?} is not supported yet. Use simulated or printers.",
                 self.backend.kind
             ));
         }
@@ -89,8 +94,32 @@ impl Config {
         if self.backend.slice && self.slicer.is_none() {
             return Err("Set [slicer] when backend.slice is true.".into());
         }
+        if self.backend.kind == "printers"
+            && self.slicer.as_ref().is_none_or(|s| s.kind != "prusaslicer")
+        {
+            return Err("PrusaLink requires [slicer] kind = prusaslicer.".into());
+        }
         let mut ids = HashSet::new();
         for printer in &self.printers {
+            if self.backend.kind == "printers" {
+                if printer.kind.as_deref() != Some("prusalink") {
+                    return Err("Set each printer kind to prusalink.".into());
+                }
+                crate::prusalink::validate(printer)?;
+                if [
+                    &printer.printer_profile,
+                    &printer.print_profile,
+                    &printer.filament_profile,
+                ]
+                .iter()
+                .any(|p| p.is_none())
+                {
+                    return Err(
+                        "Set printer, print, and filament profiles for each PrusaLink printer."
+                            .into(),
+                    );
+                }
+            }
             for name in [
                 &printer.printer_profile,
                 &printer.print_profile,

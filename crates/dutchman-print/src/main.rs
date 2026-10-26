@@ -52,20 +52,28 @@ enum Command {
         json: bool,
     },
     /// Show a simulated CLI job.
-    Status {
-        job: String,
-    },
+    Status { job: String },
     /// Cancel a job after confirmation.
     Cancel {
         job: String,
         #[arg(long)]
         yes: bool,
     },
+    /// Acknowledge that a printer bed has been checked and cleared.
+    Clear {
+        printer: String,
+        #[arg(long)]
+        yes: bool,
+    },
     Pause {
         printer: String,
+        #[arg(long)]
+        yes: bool,
     },
     Resume {
         printer: String,
+        #[arg(long)]
+        yes: bool,
     },
     /// Run the plugin job API.
     Serve {
@@ -108,6 +116,9 @@ async fn run(args: Args) -> Result<(), String> {
     let data_dir = args
         .data_dir
         .unwrap_or_else(|| std::env::temp_dir().join("dutchman-print"));
+    if config.backend.kind == "printers" {
+        return real_commands(args.command, config, &data_dir, &path).await;
+    }
     if let Command::Printers { json } = args.command {
         let backend = Simulated::new(config, Arc::new(WallClock))?;
         // Listing also reflects jobs prepared by earlier CLI commands when storage exists.
@@ -117,7 +128,9 @@ async fn run(args: Args) -> Result<(), String> {
                 .map_err(|_| "Cannot use the private data folder.")?;
         }
         backend.restore(&state)?;
-        let reports = backend.printers().await.map_err(|e| e.to_string())?;
+        let safety = dutchman_print::safety::Safety::new(Arc::new(backend));
+        safety.restore(&state.with_extension("safety.json")).await?;
+        let reports = safety.printers().await.map_err(|e| e.to_string())?;
         if json {
             output(&reports)?;
         } else {
@@ -173,7 +186,13 @@ async fn run(args: Args) -> Result<(), String> {
     let _lock = Lock(lock);
     let backend = Simulated::new(config, Arc::new(WallClock))?;
     backend.restore(&state)?;
-    let result = command(args.command, &backend, &data_dir).await;
+    let backend = Arc::new(backend);
+    let safety_path = state.with_extension("safety.json");
+    let safety =
+        dutchman_print::safety::Safety::new(backend.clone()).with_store(safety_path.clone());
+    safety.restore(&safety_path).await?;
+    let result = command(args.command, &safety, &data_dir).await;
+    safety.save(&safety_path).await?;
     backend.save(&state)?;
     result
 }
@@ -312,12 +331,30 @@ async fn command(command: Command, backend: &dyn Backend, data: &Path) -> Result
                     output(&job).map_err(dutchman_print::backend::Error::Failed)?;
                 }
             }
-            Command::Pause { printer } => {
+            Command::Clear { printer, yes } => {
+                if confirm(&format!("Is the bed of {printer} clear?"), yes)
+                    .map_err(dutchman_print::backend::Error::Refused)?
+                {
+                    backend.clear(&printer).await?;
+                    dutchman_print::log_clear(&printer);
+                }
+            }
+            Command::Pause { printer, yes } => {
+                if !confirm(&format!("Pause printing on {printer}?"), yes)
+                    .map_err(dutchman_print::backend::Error::Refused)?
+                {
+                    return Ok(());
+                }
                 let job = backend.pause(&printer).await?;
                 dutchman_print::log_action("pause", &job);
                 output(&job).map_err(dutchman_print::backend::Error::Failed)?;
             }
-            Command::Resume { printer } => {
+            Command::Resume { printer, yes } => {
+                if !confirm(&format!("Resume printing on {printer}?"), yes)
+                    .map_err(dutchman_print::backend::Error::Refused)?
+                {
+                    return Ok(());
+                }
                 let job = backend.resume(&printer).await?;
                 dutchman_print::log_action("resume", &job);
                 output(&job).map_err(dutchman_print::backend::Error::Failed)?;
@@ -419,6 +456,82 @@ async fn stopped() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! { () = interrupt => {} () = terminate => {} }
+}
+
+async fn real_commands(
+    cmd: Command,
+    config: config::Config,
+    data: &Path,
+    config_path: &Path,
+) -> Result<(), String> {
+    let state = state_path(data, config_path)?.with_extension("printers.json");
+    let backend = dutchman_print::printers::Printers::new(config)?;
+    if let Command::Printers { json } = cmd {
+        if data.exists() {
+            dutchman_serve::prepare_data_dir(data)
+                .map_err(|_| "Cannot use the private data folder.")?;
+        }
+        backend.restore(&state).await?;
+        let safety = dutchman_print::safety::Safety::new(Arc::new(backend));
+        safety.restore(&state.with_extension("safety.json")).await?;
+        let reports = safety.printers().await.map_err(|e| e.to_string())?;
+        if json {
+            output(&reports)?;
+        } else {
+            print!("{}", dutchman_print::text_report(&reports));
+        }
+        return Ok(());
+    }
+    dutchman_serve::prepare_data_dir(data).map_err(|_| "Cannot use the private data folder.")?;
+    if let Command::Serve {
+        listen,
+        user,
+        public_origin,
+    } = cmd
+    {
+        let login = std::env::var("DUTCHMAN_PRINT_PASSWORD")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(|password| (user, password));
+        if login.is_none() && !listen.ip().is_loopback() {
+            eprintln!("dutchman-print: set DUTCHMAN_PRINT_PASSWORD to protect machine actions");
+        }
+        let listener = tokio::net::TcpListener::bind(listen)
+            .await
+            .map_err(|_| "Cannot listen on the selected address.")?;
+        let mut settings = ServerConfig {
+            login,
+            public_origin,
+            ..Default::default()
+        };
+        settings.storage.data_dir = data.into();
+        let cleanup = tokio::spawn(dutchman_print::remove_expired(
+            data.into(),
+            settings.storage.keep,
+        ));
+        let result = axum::serve(
+            listener,
+            dutchman_print::router(Arc::new(backend), settings),
+        )
+        .with_graceful_shutdown(stopped())
+        .await;
+        cleanup.abort();
+        return result.map_err(|_| "Print server stopped unexpectedly.".into());
+    }
+    let lock = state.with_extension("lock");
+    std::fs::create_dir(&lock)
+        .map_err(|_| "Another CLI command is using these printers. Wait for it to finish.")?;
+    let _lock = Lock(lock);
+    let backend = Arc::new(backend.with_store(state.clone()));
+    backend.restore(&state).await?;
+    let safety_path = state.with_extension("safety.json");
+    let safety =
+        dutchman_print::safety::Safety::new(backend.clone()).with_store(safety_path.clone());
+    safety.restore(&safety_path).await?;
+    let result = command(cmd, &safety, data).await;
+    backend.save(&state).await?;
+    safety.save(&safety_path).await?;
+    result
 }
 
 #[cfg(test)]

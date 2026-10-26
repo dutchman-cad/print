@@ -22,6 +22,7 @@ response fields. Breaking changes require a new path version such as `/api/v2`.
 | `POST /api/v1/jobs/{id}/cancel` | Empty body; confirmation header | 200, resulting job object |
 | `POST /api/v1/printers/{id}/pause` | Empty body; confirmation header | 200, resulting active job object |
 | `POST /api/v1/printers/{id}/resume` | Empty body; confirmation header | 200, resulting active job object |
+| `POST /api/v1/printers/{id}/clear` | Empty body; confirmation header | 204, bed clearance acknowledged |
 
 IDs are opaque strings returned by the server; clients encode them as URL path segments.
 Health responses contain required `service` (string identifying the implementation) and
@@ -89,8 +90,26 @@ storage and removed on failure.
 | `seconds_left` | nonnegative integer | Optional |
 | `nozzle_temperature` | number | Optional; degrees Celsius |
 | `bed_temperature` | number | Optional; degrees Celsius |
+| `detail` | string | Optional; original printer state or a safe availability reason |
+| `needs_clearing` | boolean | Optional; true when an operator must check and acknowledge the bed |
 
 Unavailable optional fields are omitted. An empty fleet is `[]`.
+
+Bed clearance is an additive v1 safety check. Dutchman Print starts each printer with
+`needs_clearing: true`, including the simulator. After checking the named printer, the
+person sends `POST /api/v1/printers/{id}/clear` with a fresh confirmation header. The
+printer must report fresh idle status. Acknowledgement does not move the printer or
+change its reported state. Start refuses with 409 and names the printer until acknowledged.
+A start attempt consumes that clearance, including an uncertain or failed attempt. Done,
+cancelled, and failed jobs require another check before using the bed again. Reading an old
+terminal job never clears a bed or changes the outcome of a replacement job. Observed active,
+error, or offline state also removes clearance. Restarting the service requires new clearance.
+
+Start and resume require fresh telemetry. Missing, stale, contradictory, or unknown
+readiness blocks movement. Prepared file changes require a new preparation and review.
+Commands with uncertain results require status reconciliation; clients must never repeat
+Start automatically. A cancellation requested while Start is pending remains pending until
+the same live job is cancelled and fresh telemetry confirms the outcome.
 
 ## Job JSON and states
 
@@ -121,13 +140,13 @@ resets service job state on restart. Clients must handle jobs disappearing.
 
 ## Confirmation for machine actions
 
-The four machine routes are start, cancel, pause, and resume. Each requires exactly one
+The five machine routes are start, cancel, pause, resume, and clear. Each requires exactly one
 `Plugin-Confirmation` header whose value is exactly 64 lowercase hexadecimal characters
 (`0`–`9`, `a`–`f`). SolidCraft's host attaches a fresh value after the person confirms the
 action. The plugin does not wrap the 3MF body or generate this confirmation itself.
 Standalone clients obtain confirmation from the person before sending a fresh value.
 
-Values are single use across callers and all four routes. A server consumes a value before
+Values are single use across callers and all five routes. A server consumes a value before
 attempting the backend action, including when that action fails. Missing, malformed,
 duplicate, or reused values return 403. Clients must not retry a machine request with the
 same value. Dutchman Print remembers consumed values for ten minutes; clients never reuse

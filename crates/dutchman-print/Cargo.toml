@@ -23,6 +23,11 @@ toml = "1.1"
 thiserror.workspace = true
 getrandom.workspace = true
 
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+md-5 = "0.11"
+sha2.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 tower = { version = "0.5", default-features = false, features = ["util"] }

@@ -3,7 +3,7 @@
 Dutchman Print is a local print companion for SolidCraft and a standalone command line.
 A backend prepares 3MF files, estimates jobs, and controls printers. The included
 `simulated` backend is a demo: it contacts no printers and can optionally run a local slicer.
-Real printer backends come later.
+The `printers` backend supports individually configured local PrusaLink printers.
 
 Build `dutchman-print` from this checkout with Rust 1.88 or newer:
 
@@ -18,9 +18,9 @@ It is not included in release archives or the Docker image yet. Put the executab
 
 Choose a file with `--config FILE` or `DUTCHMAN_PRINT_CONFIG`; the option takes precedence.
 Print reads only that file. Create it with private permissions (`chmod 600` on Unix).
-Group and other permissions are refused before reading, even for the simulator. Future
-backend credentials belong in private config, never in logs or responses. Parser errors
-do not echo config contents.
+Group and other permissions are refused before reading, even for the simulator. Backend
+credentials belong in private config, never in logs or responses. Parser errors do not echo
+config contents.
 
 ```toml
 [backend]
@@ -50,7 +50,7 @@ Without `--config`, the config path is:
 Install PrusaSlicer or OrcaSlicer separately and set it up in its own application first.
 Dutchman runs its public command line as a separate program; it does not include or link
 slicer code. The slicer's AGPL licence stays with that program. Cura is not supported yet.
-No printer backend is included here.
+PrusaLink requires PrusaSlicer and text G-code.
 
 ```toml
 [backend]
@@ -143,6 +143,7 @@ Use a PrusaSlicer release with those profile-selection flags (2.8 or newer).
 
 ```sh
 dutchman-print --config config.toml printers
+dutchman-print --config config.toml clear workbench --yes
 dutchman printers --config config.toml --json
 dutchman print bracket.3mf --config config.toml --printer workbench
 dutchman-print print bracket.3mf --printer workbench --print-profile Fine --json
@@ -166,7 +167,8 @@ Without a terminal it refuses to start unless `--yes` is present. `--json` never
 without `--yes` it prepares only and returns the ready job and estimate; with `--yes` it
 starts and returns the printing job. Estimates go to stderr in plain mode; job JSON goes
 to stdout. `status`, `pause`, `resume`, and confirmed `cancel` return job JSON.
-`cancel` asks for confirmation on a terminal unless given `--yes`.
+`cancel`, `pause`, and `resume` ask for confirmation on a terminal unless given `--yes`.
+Check and acknowledge the printer bed with `clear <printer> [--yes]` before starting.
 
 Without `backend.slice = true`, the simulator estimates from the compressed 3MF size in bytes: seconds = 60 + size / 1024,
 filament mm = size / 10, filament g = size / 1000, and layers = 1 + size / 4096.
@@ -201,6 +203,7 @@ except `GET /healthz` when `DUTCHMAN_PRINT_PASSWORD` is set.
 | `POST /api/v1/jobs/{id}/cancel` | Cancel a ready, printing, or paused job |
 | `POST /api/v1/printers/{id}/pause` | Pause the printer's active job |
 | `POST /api/v1/printers/{id}/resume` | Resume its paused job |
+| `POST /api/v1/printers/{id}/clear` | Acknowledge its checked, clear bed; 204 |
 
 `POST /api/v1/jobs` accepts a raw 3MF body with `Content-Type: model/3mf` (or
 `application/vnd.ms-package.3dmanufacturing-3dmodel+xml`), with `printer`, optional `name`,
@@ -225,7 +228,7 @@ and `seconds_left` may be null. Estimate fields `seconds`, `filament_mm`, `filam
 Not found maps to 404, busy or refused to 409, unavailable/offline to 503, and backend failure
 to 500. Backend error messages must never contain secrets.
 
-Every start, cancel, pause, and resume requires a `Plugin-Confirmation` header containing
+Every start, cancel, pause, resume, and clear requires a `Plugin-Confirmation` header containing
 exactly 64 lowercase hex characters. SolidCraft supplies a fresh value after its confirmation
 step. Missing, malformed, duplicate, or reused values return 403 with a message requiring
 confirmation in SolidCraft (or `--yes` on the command line). Accepted values are remembered
@@ -333,3 +336,88 @@ check; G-code and sliced 3MF estimates were available.
 Set `DUTCHMAN_PRINT_REAL_SLICER_KEEP=1` to retain the temporary model, preset copies,
 resolved settings and output for inspection. Orca's effective settings are exported as
 `effective.json` in that folder.
+
+
+## PrusaLink
+
+Configure each printer explicitly. Dutchman does no network discovery. Use its local HTTP
+address, without credentials, a path, or a query string. HTTPS proxies are not supported yet;
+redirects are refused. Keep printer HTTP traffic on a trusted private network.
+
+```toml
+[backend]
+kind = "printers"
+
+[slicer]
+kind = "prusaslicer"
+# path = "/path/to/prusa-slicer"
+timeout_seconds = 600
+
+[[printers]]
+kind = "prusalink"
+id = "mini"
+name = "Workbench MINI"
+model = "Original Prusa MINI & MINI+"
+url = "http://printer.local"
+api_key = "REPLACE_WITH_YOUR_PRINTER_KEY"
+printer_profile = "Original Prusa MINI & MINI+"
+print_profile = "0.20mm QUALITY @MINI"
+filament_profile = "Generic PLA @MINI"
+```
+
+Use either `api_key` (`X-Api-Key`) or both `username` and `password` (HTTP Digest), never
+both forms. For MK4 and XL, Prusa documents `maker` as the default Digest username and
+the API key as its password. Pi-hosted i3 installations use their PrusaLink login.
+Digest supports MD5 and MD5-sess, with `auth` protection or older challenges without qop;
+unsupported challenges are refused. Credentials stay in the private config.
+
+On MINI, find the key in **Settings → Network → PrusaLink → Current API Key**. For
+Pi-hosted PrusaLink 0.7.0 and later, Prusa documents the key under Prusa Connect's Settings;
+older versions show it in the setup wizard. A configured local key requires no cloud account
+to use Dutchman. Check the installed firmware's authentication options in Prusa's
+[connection guide](https://help.prusa3d.com/guide/sending-files-from-prusaslicer-to-prusalink_222961)
+and [troubleshooting guide](https://help.prusa3d.com/article/prusalink-troubleshooting_304411).
+
+Commission the configured profiles for the actual model, build volume, nozzle, toolhead,
+material, and plate before use. All three profiles are required; per-job profile changes are
+refused if they differ from that printer's configuration. Multi-material slot assignments
+are not supported yet: printers reporting MMU or omitting its capability are refused. PrusaLink does not provide a
+universal live contract for loaded material, plate, or build volume. Check those physically
+against the configured presets before confirmation; Dutchman cannot detect an unreported
+physical change. This backend is intended for commissioned single-material setups.
+
+Preparation reads status and machine information, then slices locally to text G-code.
+Missing serial, firmware, or nozzle information blocks preparation.
+Before upload and again before Start, Dutchman requires fresh `IDLE` or `READY` status,
+with no job or transfer reported. `BUSY`, `ATTENTION`, terminal, unknown, and unavailable
+states block Start. Status reads have a four-second deadline. Missing estimates stay absent;
+authentication failures appear separately in the safe availability detail.
+
+Dutchman checks prepared input and G-code bytes, configured profiles, machine information,
+and firmware against the preparation review. It selects available writable storage with enough
+reported free space, uploads without overwrite or automatic printing, and checks the stored
+file's name, print-file type, and size. Upload deadlines allow 30 seconds plus one second per
+32 KiB. Start is sent once and confirmed by fresh status matching the intended file and job.
+A lost reply or conflict requires reconciliation through status; Start is never automatically
+retried. Pause, resume, and cancel re-read and verify the live job ID before sending a command.
+Only explicit matching terminal reports establish done, cancelled, or failed; idle alone never
+proves completion. The endpoint contract comes from Prusa's
+[public API documentation](https://github.com/prusa3d/Prusa-Link-Web/blob/master/spec/openapi.yaml).
+
+Check and acknowledge the bed before the first start and after each job ends:
+
+```sh
+dutchman-print clear mini --yes
+dutchman-print print part.3mf --printer mini --yes
+```
+
+`clear <printer> [--yes]` asks on a terminal unless `--yes` is given. Pause and resume also
+ask for confirmation or accept `--yes`. The API uses the single-use `Plugin-Confirmation`
+header for all five machine routes, including clear. Printer JSON includes optional
+`needs_clearing` and `detail`; see [the API](print-api.md). A start attempt consumes bed
+clearance even when the result is uncertain. The simulator follows this same policy.
+
+Standalone CLI commands save jobs and safety checks in the private data folder, separately
+from the running service. Use the service API to control service jobs. The CLI records bed
+consumption and its attempted Start before sending it, so a restart cannot silently retry it.
+The service starts with no bed clearance after a restart.

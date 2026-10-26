@@ -31,6 +31,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let png = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")?;
     if let Some(path) = args.iter().find_map(|s| s.strip_prefix("--output=")) {
         let mut file = std::fs::File::create(path)?;
+        if mode == "binary" {
+            file.write_all(b"GCDE\0binary")?;
+            return Ok(());
+        }
         if mode == "missing" {
             writeln!(file, "G1 X0")?;
             return Ok(());

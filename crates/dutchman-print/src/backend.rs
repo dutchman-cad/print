@@ -18,6 +18,8 @@ pub enum Error {
     Refused(String),
     #[error("The backend is unavailable or offline. Try again later.")]
     Unavailable,
+    #[error("Printer authentication failed. Check its configured credentials.")]
+    Authentication,
     #[error("{0}")]
     Failed(String),
 }
@@ -61,6 +63,10 @@ pub struct Printer {
     pub name: String,
     pub model: String,
     pub state: PrinterState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_clearing: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,6 +145,11 @@ pub struct Job {
 
 /// Errors must be safe to show to callers, without credentials or backend addresses.
 pub trait Backend: Send + Sync {
+    /// Backend bookkeeping after the shared safety policy accepts bed acknowledgement.
+    fn clear<'a>(&'a self, _printer: &'a str) -> Reply<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Return fresh telemetry; unavailable or unknown readiness must never become idle.
     fn printers(&self) -> Reply<'_, Vec<Printer>>;
     fn prepare<'a>(
         &'a self,

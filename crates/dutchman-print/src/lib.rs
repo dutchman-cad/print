@@ -2,6 +2,9 @@
 
 pub mod backend;
 pub mod config;
+pub mod printers;
+pub mod prusalink;
+pub mod safety;
 mod server;
 pub mod simulated;
 pub mod slicer;
@@ -73,4 +76,13 @@ fn remove_older_than(data_dir: &std::path::Path, keep: std::time::Duration) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// Audit a bed clearance without credentials.
+pub fn log_clear(printer: &str) {
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    eprintln!("time={time} printer={printer} job=- action=clear");
 }

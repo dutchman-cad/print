@@ -23,6 +23,7 @@ fn printer() -> Printer {
         printer_profile: Some("Machine".into()),
         print_profile: Some("Draft".into()),
         filament_profile: Some("PLA".into()),
+        ..Default::default()
     }
 }
 fn input(dir: &Path) -> PathBuf {

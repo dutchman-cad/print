@@ -149,6 +149,7 @@ async fn real_slicer() {
         printer_profile: Some(machine.into()),
         print_profile: Some(process.into()),
         filament_profile: Some(filament.into()),
+        ..Default::default()
     };
     let input = dir.join("cube.3mf");
     cube(&input);

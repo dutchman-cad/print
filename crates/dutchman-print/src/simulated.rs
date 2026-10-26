@@ -175,6 +175,8 @@ impl Backend for Simulated {
                         })
                         .map(|r| &r.job);
                     Printer {
+                        detail: None,
+                        needs_clearing: None,
                         id: p.id.clone(),
                         name: p.name.clone(),
                         model: p.model.clone(),

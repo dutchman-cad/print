@@ -137,6 +137,14 @@ async fn accepted(app: &Router, request: Request<Body>, expected: u16) -> Value 
     serde_json::from_slice(&body).unwrap()
 }
 async fn ready(app: &Router) -> Value {
+    let _ = send(
+        app,
+        action(
+            "/api/v1/printers/demo/clear",
+            Some(&dutchman_print::new_job_id().unwrap().repeat(2)),
+        ),
+    )
+    .await;
     accepted(
         app,
         upload(
@@ -237,6 +245,7 @@ async fn api_lifecycle_and_all_machine_routes_require_fresh_confirmation() {
         format!("/api/v1/jobs/{id}/cancel"),
         "/api/v1/printers/demo/pause".into(),
         "/api/v1/printers/demo/resume".into(),
+        "/api/v1/printers/demo/clear".into(),
     ];
     for path in &paths {
         for token in [
@@ -422,6 +431,11 @@ async fn authentication_origin_and_security_headers_cover_routes() {
         .insert(header::AUTHORIZATION, basic.parse().unwrap());
     let job = accepted(&app, request, 201).await;
     let path = format!("/api/v1/jobs/{}/start", job["id"].as_str().unwrap());
+    let mut clear = action("/api/v1/printers/demo/clear", Some(&"0".repeat(64)));
+    clear
+        .headers_mut()
+        .insert(header::AUTHORIZATION, basic.parse().unwrap());
+    assert_eq!(send(&app, clear).await.0, StatusCode::NO_CONTENT);
     let token = "f".repeat(64);
     assert_eq!(
         send(&app, action(&path, Some(&token))).await.0,
@@ -552,7 +566,7 @@ fn cli_output_confirmation_and_json_prepare_only() {
     assert!(listed.status.success());
     assert_eq!(
         serde_json::from_slice::<Value>(&listed.stdout).unwrap(),
-        json!([{"id":"demo", "name":"Demo printer", "model":"Example model", "state":"idle"}])
+        json!([{"id":"demo", "name":"Demo printer", "model":"Example model", "state":"idle", "needs_clearing":true}])
     );
     let input = dir.path().join("part.3mf");
     std::fs::write(&input, model()).unwrap();
@@ -581,6 +595,7 @@ fn cli_output_confirmation_and_json_prepare_only() {
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("Use --yes"));
     assert!(String::from_utf8_lossy(&refused.stderr).contains("Estimate:"));
+    assert!(cli(&path, &["clear", "demo", "--yes"]).status.success());
     let started = cli(
         &path,
         &["print", input, "--printer", "demo", "--json", "--yes"],
@@ -596,8 +611,8 @@ fn cli_output_confirmation_and_json_prepare_only() {
     assert!(String::from_utf8_lossy(&started.stderr).contains("action=start"));
     for (args, state) in [
         (vec!["status", id], "printing"),
-        (vec!["pause", "demo"], "paused"),
-        (vec!["resume", "demo"], "printing"),
+        (vec!["pause", "demo", "--yes"], "paused"),
+        (vec!["resume", "demo", "--yes"], "printing"),
     ] {
         let output = cli(&path, &args);
         assert!(
@@ -619,6 +634,7 @@ fn cli_output_confirmation_and_json_prepare_only() {
         serde_json::from_slice::<Value>(&cancelled.stdout).unwrap()["state"],
         "cancelled"
     );
+    assert!(cli(&path, &["clear", "demo", "--yes"]).status.success());
     let plain = cli(&path, &["print", input, "--printer", "demo", "--yes"]);
     assert!(plain.status.success());
     assert!(String::from_utf8_lossy(&plain.stderr).contains("Estimate:"));
@@ -1070,4 +1086,91 @@ fn profile_validation_keeps_plain_text_and_length_limits() {
         .validate()
         .is_ok());
     }
+}
+
+#[tokio::test]
+async fn bed_clearance_is_confirmed_single_use_and_shared_with_simulation() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let app = router(
+        simulation(clock.clone()),
+        settings(dir.path(), clock.clone()),
+    );
+    let job = accepted(
+        &app,
+        upload(&[("part.3mf", &model())], &[("printer", "demo")]),
+        201,
+    )
+    .await;
+    let start = format!("/api/v1/jobs/{}/start", job["id"].as_str().unwrap());
+    assert_eq!(
+        send(&app, action(&start, Some(&"1".repeat(64)))).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send(&app, action("/api/v1/printers/demo/clear", None))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let token = "2".repeat(64);
+    assert_eq!(
+        send(&app, action("/api/v1/printers/demo/clear", Some(&token)))
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(&app, action(&start, Some(&token))).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(&app, action(&start, Some(&"3".repeat(64)))).await.0,
+        StatusCode::OK
+    );
+    clock.advance(1000);
+    assert_eq!(
+        accepted(
+            &app,
+            get(&format!("/api/v1/jobs/{}", job["id"].as_str().unwrap())),
+            200
+        )
+        .await["state"],
+        "done"
+    );
+    assert_eq!(
+        accepted(&app, get("/api/v1/printers"), 200).await[0]["needs_clearing"],
+        true
+    );
+    let next = accepted(
+        &app,
+        upload(&[("next.3mf", &model())], &[("printer", "demo")]),
+        201,
+    )
+    .await;
+    assert_eq!(
+        send(
+            &app,
+            action(
+                &format!("/api/v1/jobs/{}/start", next["id"].as_str().unwrap()),
+                Some(&"4".repeat(64))
+            )
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send(
+            &app,
+            action("/api/v1/printers/demo/clear", Some(&"5".repeat(64)))
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        accepted(&app, get("/api/v1/printers"), 200).await[0]["needs_clearing"],
+        false
+    );
 }

@@ -92,7 +92,7 @@ fn backend_error(error: Error) -> Problem {
     let status = match &error {
         Error::NotFound => StatusCode::NOT_FOUND,
         Error::Busy | Error::Refused(_) => StatusCode::CONFLICT,
-        Error::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        Error::Unavailable | Error::Authentication => StatusCode::SERVICE_UNAVAILABLE,
         Error::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, error.to_string())
@@ -104,7 +104,7 @@ pub fn router(backend: Arc<dyn Backend>, config: ServerConfig) -> Router {
         .unwrap_or(usize::MAX)
         .saturating_add(1 << 20);
     let app = Arc::new(App {
-        backend,
+        backend: Arc::new(crate::safety::Safety::new(backend)),
         uploads: Semaphore::new(config.storage.uploads.clamp(1, Semaphore::MAX_PERMITS)),
         runs: Semaphore::new(config.storage.runs.clamp(1, Semaphore::MAX_PERMITS)),
         config,
@@ -124,6 +124,7 @@ pub fn router(backend: Arc<dyn Backend>, config: ServerConfig) -> Router {
         .route("/api/v1/jobs/{id}/cancel", post(cancel))
         .route("/api/v1/printers/{id}/pause", post(pause))
         .route("/api/v1/printers/{id}/resume", post(resume))
+        .route("/api/v1/printers/{id}/clear", post(clear))
         .layer(DefaultBodyLimit::max(limit))
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .layer(middleware::from_fn(hardening::security_headers))
@@ -553,4 +554,15 @@ async fn resume(
     headers: HeaderMap,
 ) -> Result<Json<Job>, Problem> {
     action(&app, &id, headers, "resume").await
+}
+
+async fn clear(
+    State(app): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, Problem> {
+    confirm(&app, &headers).await?;
+    app.backend.clear(&id).await.map_err(backend_error)?;
+    crate::log_clear(&id);
+    Ok(StatusCode::NO_CONTENT)
 }
