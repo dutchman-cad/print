@@ -6,6 +6,30 @@ It slices with your own PrusaSlicer or OrcaSlicer, installed separately.
 
 Not released yet. Tested against simulated printers.
 
+## First run
+
+1. Build `dutchman-print` (see [Build from source](#build-from-source)) and put it on `PATH`.
+2. Write a config for your printer. `init` asks for the printer type, its address, and any
+   key, password, or access code, then writes a private config file. It contacts nothing.
+
+   ```sh
+   dutchman-print init
+   ```
+
+3. Check that Print can read the printer:
+
+   ```sh
+   dutchman-print printers
+   ```
+
+4. Start the job API for the [SolidCraft plugin](https://github.com/dutchman-cad/plugins):
+
+   ```sh
+   dutchman-print serve
+   ```
+
+Choose `simulated` in step 2 to try Print without a printer.
+
 ## Printers
 
 | Printer or software | `kind` | Status | Control |

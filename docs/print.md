@@ -35,6 +35,7 @@ name = "Workbench demo"
 model = "Example printer"
 ```
 
+To write this file for one printer, run `dutchman-print init` (see [Commands](#commands)).
 Repeat `[[printers]]` to add printers. Leave it out for an empty fleet. Unknown backend kinds
 produce an error naming the kind. Config files are limited to 1 MiB and 64 printers.
 IDs must be unique, with 1–64 ASCII letters, digits, hyphens, or underscores. Names are
@@ -154,6 +155,7 @@ Use a PrusaSlicer release with those profile-selection flags (2.8 or newer).
 ## Commands
 
 ```sh
+dutchman-print init
 dutchman-print --config config.toml printers
 dutchman-print --config config.toml clear workbench --yes
 dutchman printers --config config.toml --json
@@ -168,6 +170,50 @@ dutchman-print resume workbench
 
 `dutchman printers …` runs `dutchman-print printers …`; `dutchman print …` runs
 `dutchman-print print …`. Other companion commands use `dutchman-print` directly.
+
+`init` writes a commented config for one printer. On a terminal it asks for the printer
+type, its address, the key, password, or access code that kind needs, a name, id, and model,
+and, for printers Print slices for, the slicer (PrusaSlicer or OrcaSlicer) and its printer,
+print, and filament preset names. Keys, passwords, and access codes are hidden as you type
+on Linux and macOS; on Windows they show. Every answer also has a flag, for scripts:
+
+```sh
+dutchman-print init --kind prusalink --url http://192.168.1.30 --api-key KEY --name "Workbench MINI"
+dutchman-print init --kind bambu --host 192.168.1.40 --serial SERIAL --access-code CODE --output bambu.toml
+```
+
+| Flag | Answer |
+|---|---|
+| `--kind` | `simulated`, `prusalink`, `octoprint`, `moonraker`, `snapmaker-u1`, `duet`, `repetier`, `bambu`, `elegoo-sdcp`, `snapmaker-2`, or `snapmaker-j1` |
+| `--url` | Address for PrusaLink, OctoPrint, Moonraker, Snapmaker U1, Duet, and Repetier-Server; `http://` is added when left out |
+| `--host`, `--port` | Address for Bambu, Elegoo, Snapmaker 2.0, and J1; the port only when it is not the usual one |
+| `--api-key` | PrusaLink, OctoPrint, Repetier-Server, and Moonraker or Snapmaker U1 (optional there) |
+| `--username`, `--password` | PrusaLink login instead of an API key; `--password` is also the optional Duet machine password |
+| `--serial`, `--access-code` | Bambu serial number and LAN access code |
+| `--cert-sha256` or `--ca-file` | Bambu trust; leave both out to read the fingerprint later |
+| `--profile` | Elegoo `centauri` or `resin` |
+| `--nozzle-diameter` | Duet or Repetier-Server installed nozzle, in millimetres |
+| `--slug` | Repetier-Server printer slug, from the server's printer settings |
+| `--slicer` | `prusaslicer` (default) or `orcaslicer`; PrusaLink needs PrusaSlicer and Bambu needs OrcaSlicer |
+| `--printer-profile`, `--print-profile`, `--filament-profile` | Preset names; they default to the MINI or A1 examples on this page |
+| `--name`, `--id`, `--model` | Defaults come from the kind; the id defaults to the name in lower case with hyphens |
+| `--output FILE` | File to write; otherwise `--config`, `DUTCHMAN_PRINT_CONFIG`, or the platform path above |
+| `--force` | Replace an existing file |
+
+Without a terminal, `init` never asks: a missing required answer is an error naming its
+flag, and answers with defaults use them. A flag the chosen kind does not use is refused.
+Flags can end up in your shell history; on a shared computer, answer the questions instead.
+
+`init` creates the file's folder if needed and refuses to replace an existing file unless
+given `--force`. On Unix the file is created with mode 0600. Before writing, the text is
+checked with the same loader every other command uses; a refused answer shows the loader's
+message and writes nothing. Credentials go only into the file, never into the output.
+`init` never contacts the printer, the network, or the slicer, and does not check that the
+slicer or the preset names exist. Its last lines name the next commands: `printers` to read
+the printer, then `serve`. Bambu printers are written with `lan_control = false`; without
+`--cert-sha256` or `--ca-file`, the file loads only for `fingerprint` until you add one, and
+the closing message names that command first. Elegoo and Snapmaker 2.0 and J1 printers are
+written as monitoring only, without a slicer.
 
 `printers` writes one line per printer, such as `Workbench demo: idle`. `--json` returns
 the same array as `GET /api/v1/printers`. The CLI calls the backend directly; no server is needed.

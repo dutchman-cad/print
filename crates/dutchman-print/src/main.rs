@@ -30,6 +30,8 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Write a config for one printer, asking on a terminal. Contacts nothing.
+    Init(Box<dutchman_print::init::Flags>),
     /// List printers.
     Printers {
         #[arg(long)]
@@ -132,6 +134,9 @@ async fn main() -> ExitCode {
     }
 }
 async fn run(args: Args) -> Result<(), String> {
+    if let Command::Init(flags) = args.command {
+        return dutchman_print::init::run(*flags, args.config);
+    }
     let path = args.config.map(Ok).unwrap_or_else(config::default_path)?;
     if let Command::Fingerprint { printer, json } = &args.command {
         let config = config::Config::load_for_fingerprint(&path, printer)?;
@@ -462,7 +467,10 @@ async fn command(
                 dutchman_print::log_action("resume", &job);
                 output(&job).map_err(dutchman_print::backend::Error::Failed)?;
             }
-            Command::Printers { .. } | Command::Serve { .. } | Command::Fingerprint { .. } => {}
+            Command::Init(_)
+            | Command::Printers { .. }
+            | Command::Serve { .. }
+            | Command::Fingerprint { .. } => {}
         }
         Ok(())
     }
