@@ -2,10 +2,24 @@
 
 Dutchman Print is a local companion that prepares and sends print jobs from
 [SolidCraft](https://github.com/tangency-labs/solidcraft) through an open job API.
-It slices with your own PrusaSlicer or OrcaSlicer, installed separately. Backends include
-simulated printers, PrusaLink, OctoPrint, Moonraker (Klipper), and Bambu Lab LAN control.
+It slices with your own PrusaSlicer or OrcaSlicer, installed separately.
 
 Not released yet. Tested against simulated printers.
+
+## Printers
+
+| Printer or software | `kind` | Status | Control |
+| --- | --- | --- | --- |
+| Simulated printers | `simulated` | Built in, for trying the API | Start, pause, resume, cancel |
+| Prusa printers with PrusaLink | `prusalink` | Simulated only | Start, pause, resume, cancel, Stop |
+| OctoPrint | `octoprint` | Simulated only | Start, pause, resume, cancel, Stop |
+| Klipper with Moonraker | `moonraker` | Simulated only | Start, pause, resume, cancel, Stop |
+| Duet (RepRapFirmware, standalone) | `duet` | Simulated only | Start, pause, resume, cancel, Stop |
+| Bambu Lab in LAN mode | `bambu` | Simulated only | Monitoring; control is experimental and off unless `lan_control = true` |
+
+Every machine action needs a confirmation the server issues for that printer and job, and
+a person who has checked the bed. [docs/print.md](docs/print.md) describes each kind's
+setup and what still needs checking on real hardware.
 
 ## Build from source
 
