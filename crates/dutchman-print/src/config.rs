@@ -52,6 +52,8 @@ pub struct Printer {
     pub api_key: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
+    /// Commissioned nozzle size for printers that do not report one (Duet).
+    pub nozzle_diameter: Option<f64>,
     pub id: String,
     pub name: String,
     pub model: String,
@@ -145,18 +147,20 @@ impl Config {
                     }
                     Some("octoprint") => crate::octoprint::validate(printer)?,
                     Some("moonraker") => crate::moonraker::validate(printer)?,
+                    Some("duet") => crate::duet::validate(printer)?,
                     Some("bambu") => {
                         crate::bambu::validate_enrollment(
                             printer,
                             enrollment == Some(printer.id.as_str()),
                         )?;
                     }
-                    _ => {
-                        return Err(
-                            "Set each printer kind to prusalink, octoprint, moonraker, or bambu."
-                                .into(),
-                        )
-                    }
+                    _ => return Err(
+                        "Set each printer kind to prusalink, octoprint, moonraker, duet, or bambu."
+                            .into(),
+                    ),
+                }
+                if printer.nozzle_diameter.is_some() && printer.kind.as_deref() != Some("duet") {
+                    return Err("Set nozzle_diameter only for Duet printers.".into());
                 }
                 if [
                     &printer.printer_profile,
