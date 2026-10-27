@@ -146,12 +146,9 @@ impl Confirmations {
             "start" => {
                 job.as_ref().is_some_and(|j| j.state == JobState::Ready)
                     && printer.state == PrinterState::Idle
+                    // Terminal idle states may retain a historical identity. Native
+                    // readiness is validated by review_action before issuing the challenge.
                     && printer.needs_clearing == Some(false)
-                    && printer.job_id.is_none()
-                    && printer
-                        .detail
-                        .as_deref()
-                        .is_none_or(|d| matches!(d, "IDLE" | "READY"))
             }
             "clear" => job.is_none() && printer.state == PrinterState::Idle,
             "cancel" => {
@@ -160,17 +157,27 @@ impl Confirmations {
                         j.state,
                         JobState::Ready | JobState::Printing | JobState::Paused
                     )
-                }) && !matches!(printer.state, PrinterState::Offline | PrinterState::Error)
+                }) && printer.state != PrinterState::Offline
             }
             "pause" => job.is_none() && printer.state == PrinterState::Printing,
             "resume" => {
                 job.is_none()
                     && printer.state == PrinterState::Paused
-                    && printer.detail.as_deref().is_none_or(|s| s == "PAUSED")
+                    && printer
+                        .detail
+                        .as_deref()
+                        .is_none_or(|s| matches!(s, "PAUSED" | "PAUSE"))
             }
             _ => false,
         };
         if !possible {
+            if intent.action == "start" {
+                if let Some(detail) = printer.detail.as_deref().filter(|d| d.contains("HMS")) {
+                    return Err(Error::Refused(format!(
+                        "Resolve Bambu alerts before starting: {detail}."
+                    )));
+                }
+            }
             return Err(Error::Refused(
                 "This action is not possible now. Read fresh status and check bed clearance."
                     .into(),

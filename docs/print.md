@@ -478,12 +478,14 @@ the service API to control service jobs. The attempted Start is saved before sen
 so restarting cannot silently retry it. The service persists tracked jobs and reconciles
 live identity before control after a restart.
 
-## Bambu Lab LAN monitoring
+## Bambu Lab LAN control (experimental)
 
-Bambu printers support status monitoring and local preparation with OrcaSlicer. Upload,
-Start, pause, resume, and cancel are not supported yet, including cancellation of a prepared
-Bambu job. Preparation produces a sliced 3MF containing plate G-code and returns its
-estimates; it sends no file to the printer. No account or cloud connection is used.
+Bambu monitoring and local preparation with OrcaSlicer are available by default.
+Control is **experimental, verified against simulated printers only**. Check it on your
+own printer before relying on it. Set `lan_control = true` in that printer's config
+only after confirming LAN/Developer Mode allows control. Upload, Start, pause, resume,
+and cancel then use the same review and bed-clear checks as PrusaLink. Preparation
+produces a sliced 3MF and estimates without contacting storage. No cloud account is used.
 
 Enable LAN mode using Bambu's [LAN setup instructions](https://wiki.bambulab.com/en/knowledge-sharing/enable-lan-mode).
 Find the LAN access code in the printer's LAN/network settings. Find the serial number on
@@ -528,6 +530,8 @@ name = "Workbench Bambu"
 model = "Bambu Lab A1"
 host = "printer.local"
 # port = 8883 # Optional MQTT TLS port; defaults to 8883.
+# ftps_port = 990 # Optional implicit FTPS port.
+lan_control = false # Change only after confirming control permission.
 serial = "REPLACE_WITH_PRINTER_SERIAL"
 access_code = "REPLACE_WITH_LAN_ACCESS_CODE"
 ca_file = "/path/to/trusted-bambu-ca.pem"
@@ -562,17 +566,91 @@ is possible; normal monitoring still requires exactly one trust option. JSON fie
 `cert_sha256`, `subject`, `issuer`, `not_before`, `not_after`, and `instruction`.
 
 The service keeps one connection per configured printer once status is first requested.
-Standalone commands read a state and disconnect. Reports merge changed fields, preserve
+Standalone commands disconnect when they finish; control-enabled commands keep monitoring
+during review and execution. Reports merge changed fields, preserve
 missing estimates, convert remaining minutes to seconds, and retain the original state in
-`detail`. IDLE/FINISH map to idle, PREPARE/RUNNING to printing, PAUSE to paused, and
-FAILED or unknown states to error. Nonzero reported print errors also block readiness.
-No report for 30 seconds means offline. A finished or failed report requires another bed
-check even if the printer has already returned to idle. Idle never establishes success.
+`detail`. IDLE, FINISH and FAILED map to idle when no active serious fault is present;
+PREPARE/RUNNING map to printing and PAUSE to paused. Unknown states map to error.
+FINISH/FAILED retain the completed execution's identity and require a new bed check.
+Their existing `print_error` is historical; an error appearing or changing after the
+terminal transition is active and blocks readiness. Idle never establishes success.
 
-After a connection drops, telemetry is discarded and reconnects back off from one to 60
-seconds. Each connection requests one complete report after subscribing; full-state
-requests are spaced at least five minutes apart across reconnects to protect P1 printers.
-Status reads wait at most four seconds, so an early read during reconnect pacing can be
-offline. Only a fresh report establishes availability again. These wire fields and units
-follow the survey's community evidence; compatibility with every model and firmware has
-not been established. No discovery, FTPS, AMS assignment, or cloud login is implemented.
+Up to 64 active HMS entries are retained. Severity comes from bits 8–11 of `attr`:
+1 (fatal) and 2 (serious) block Start; 3 (common) and 4 (info) do not. Unknown severity
+or malformed/oversized HMS data blocks Start. Active codes and their Bambu HMS wiki
+links appear in `detail`. Any HMS alert accompanying PAUSE adds “Needs attention”
+and prevents Resume. Stop remains available for the matching live execution.
+
+Freshness requires an established MQTT connection and an incoming message within
+30 seconds. Changed fields merge onto the cached state, including across reconnects;
+unchanged machine state and error fields need not repeat. A disconnected connection
+is offline. Reconnects back off from one to 60 seconds. Complete-report requests are
+spaced at least five minutes apart to protect P1 printers, while incoming deltas are
+processed throughout that wait. Only a live connection with recent traffic restores
+availability. P1/A1 delta and reconnect pacing behaviour still needs a hardware check.
+No discovery or cloud login is implemented.
+
+Start stages the reviewed bytes over implicit FTPS (`ftps_port`, default 990). Both
+connections use the configured certificate trust. The passive data connection must
+resume the control TLS session before file bytes are sent; completion requires a
+matching server-reported file size. Start checks fresh idle status and no active fault
+before upload and again before sending `project_file` once. FINISH/FAILED permit Start
+after a separate bed acknowledgement through the running server. The attempt is saved before
+sending, so a lost reply or restart cannot cause an automatic second Start. Read job
+status to reconcile an uncertain outcome. A reply reporting rejection names authorization
+as a possible cause; delivery or an acknowledgement alone never means execution.
+A matching live state must arrive within four seconds or the result is “not confirmed”.
+Pause, resume, and stop apply only to the matching live job started by this companion.
+Matching requires both the unique subtask name and a positive `gcode_start_time`; missing
+execution identity blocks control. A later execution of the same file is a different job.
+FINISH and FAILED consume bed clearance even between status polls. Stop requires FAILED
+for the matching job before reporting cancellation; idle alone proves no outcome.
+
+The single start profile is `lan-project-1`, a local plate-1 project profile. It uses
+`Metadata/plate_1.gcode`, local identifiers of zero, automatic bed type, and no timelapse.
+Calibration options default off. It requires `Metadata/project_settings.config` with
+an explicit `filament_type` array. Missing metadata or tool selections outside that list
+are refused. Prepare and review again after changing any start setting.
+
+Before upload, the sliced plate G-code comments or project settings must provide one
+unambiguous `nozzle_diameter` matching the installed report. A slicer-written
+`nozzle_type`, when present, must match the installed nozzle material. Each mapped
+`filament_type` must match its AMS slot's `tray_type`; a single filament without AMS
+mapping must match external-spool `vt_tray.tray_type`. Missing live values or mismatches
+refuse upload and name the required and installed values. Fit/load matching hardware
+and material or prepare again; there is no mismatch override.
+
+Optional settings belong to the Bambu printer table (place these after its profile names):
+
+```toml
+# Map every project filament, numbered from 1, to a zero-based global AMS slot.
+# ams_mapping = { "1" = 3, "2" = 0 }
+[printers.start_profile]
+name = "lan-project-1"
+archive_url = "sdcard"          # Alternative: "ftp"
+md5_target = "plate"            # Alternative: "empty"
+leveling_field = "bed_leveling" # Alternative: "bed_levelling"
+ams_convention = "per-filament" # Alternative: "right-aligned-five"
+bed_leveling = false
+flow_cali = false
+vibration_cali = false
+layer_inspect = false
+```
+
+`sdcard` sends a `file:///sdcard/` archive URL; `ftp` sends `ftp:///`. `plate` hashes the
+plate G-code with MD5; `empty` sends an empty MD5 string. No archive-hash target is
+established by the cited documentation. The spelling setting chooses exactly one bed
+leveling field. `per-filament` sends one slot per filament, in project order, with global
+slots 0–15. `right-aligned-five` puts the same ordered assignments at the end of a
+five-element array, pads with -1, and supports at most four filaments and slots 0–3.
+Every filament in a multi-filament archive needs an explicit mapping; refusal lists each
+missing filament number and material. A single filament with no mapping uses the
+community-documented `use_ams = false` and empty-string mapping form for external spool.
+This does not load filament: check the spool and physical tooling before review.
+
+Defaults follow the more recent [first-hand project notes](https://github.com/voska/bambu/blob/main/docs/protocol.md)
+for the URL, plate checksum, spelling, and per-filament mapping. The alternatives follow
+[OpenBambuAPI's project and AMS documentation](https://github.com/Doridian/OpenBambuAPI/blob/main/mqtt.md).
+These sources disagree and provide no universal firmware contract. Select alternatives
+only after checking your model and firmware; the profile name is a version identifier,
+not a hardware certification. Unsupported values are refused before a command is sent.

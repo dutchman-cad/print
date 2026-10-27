@@ -171,6 +171,86 @@ impl Printers {
         }
         Ok(serde_json::json!({"info":info,"version":version}))
     }
+    async fn reconcile_bambu(&self, target: &mut Prepared) -> Result<Printer, Error> {
+        let client = self.bambu.get(&target.job.printer).ok_or(Error::NotFound)?;
+        let live = client.snapshot().await;
+        let name = target.filename.trim_end_matches(".gcode.3mf");
+        if target.attempted
+            && live.job_name.as_deref() == Some(name)
+            && live.job_id.is_some()
+            && (target.remote.is_none() || target.remote == live.job_id)
+            && matches!(
+                target.job.state,
+                JobState::Ready | JobState::Printing | JobState::Paused
+            )
+            && live.state != crate::backend::PrinterState::Offline
+        {
+            // A terminal report can only finish an execution previously observed active.
+            let active = matches!(target.job.state, JobState::Printing | JobState::Paused);
+            target.job.state = match live.detail.as_deref().and_then(|d| d.split("; ").next()) {
+                Some("RUNNING" | "PREPARE")
+                    if live.state == crate::backend::PrinterState::Printing =>
+                {
+                    JobState::Printing
+                }
+                Some("PAUSE") => JobState::Paused,
+                Some("FINISH") if active && live.state == crate::backend::PrinterState::Idle => {
+                    JobState::Done
+                }
+                Some("FAILED") if active => JobState::Failed,
+                _ => target.job.state,
+            };
+            if matches!(target.job.state, JobState::Printing | JobState::Paused) {
+                target.remote = live.job_id.clone();
+            }
+            target.job.progress = live.progress;
+            target.job.seconds_left = live.seconds_left;
+        }
+        Ok(live)
+    }
+    async fn bambu_control(&self, target: &mut Prepared, action: &str) -> Result<Job, Error> {
+        let client = self.bambu.get(&target.job.printer).ok_or(Error::NotFound)?;
+        client.check_control()?;
+        let live = self.reconcile_bambu(target).await?;
+        if !target.attempted
+            || target.remote.is_none()
+            || target.remote != live.job_id
+            || live.state == crate::backend::PrinterState::Offline
+            || !matches!(target.job.state, JobState::Printing | JobState::Paused)
+            || (action == "resume" && live.detail.as_deref() != Some("PAUSE"))
+            || (action != "cancel"
+                && !matches!(
+                    (
+                        action,
+                        live.detail.as_deref().and_then(|d| d.split("; ").next())
+                    ),
+                    ("pause", Some("RUNNING")) | ("resume", Some("PAUSE"))
+                ))
+        {
+            return Err(refuse(
+                "No matching live job for this command. Read status to reconcile the printer.",
+            ));
+        }
+        let (command, expected) = match action {
+            "cancel" => ("stop", "FAILED"),
+            "pause" => ("pause", "PAUSE"),
+            _ => ("resume", "RUNNING"),
+        };
+        let result = client
+            .command(
+                serde_json::json!({"print":{"command":command,"param":""}}),
+                target.filename.trim_end_matches(".gcode.3mf"),
+                expected,
+                target.remote.as_deref(),
+            )
+            .await;
+        self.reconcile_bambu(target).await?;
+        result?;
+        if action == "cancel" {
+            target.job.state = JobState::Cancelled;
+        }
+        Ok(target.job.clone())
+    }
     async fn reconcile(&self, prepared: &mut Prepared) -> Result<Snapshot, Error> {
         let snapshot = self.client(&prepared.job.printer)?.snapshot().await?;
         let filename = snapshot
@@ -201,8 +281,16 @@ impl Printers {
         Ok(snapshot)
     }
     async fn control(&self, printer: &str, action: &str, expected: JobState) -> Result<Job, Error> {
-        if self.bambu.contains_key(printer) {
-            return Err(crate::bambu::unsupported());
+        if let Some(client) = self.bambu.get(printer) {
+            client.check_control()?;
+            let mut jobs = self.jobs.lock().await;
+            let target = jobs
+                .values_mut()
+                .find(|p| p.job.printer == printer && p.attempted && p.job.state == expected)
+                .ok_or_else(|| {
+                    refuse("No matching tracked job. Read status to reconcile the printer.")
+                })?;
+            return self.bambu_control(target, action).await;
         }
         let live = self.client(printer)?.snapshot().await?;
         let mut jobs = self.jobs.lock().await;
@@ -304,6 +392,44 @@ impl Backend for Printers {
                 return Ok(());
             }
             self.check_control(printer)?;
+            if let Some(client) = self.bambu.get(printer) {
+                let live = client.snapshot().await;
+                let jobs = self.jobs.lock().await;
+                let target = job
+                    .and_then(|id| jobs.get(id))
+                    .or_else(|| {
+                        jobs.values().find(|p| {
+                            p.job.printer == printer
+                                && p.remote.is_some()
+                                && p.remote == live.job_id
+                        })
+                    })
+                    .ok_or_else(|| {
+                        refuse("No matching tracked job. Read status to reconcile the printer.")
+                    })?;
+                if action == "start" {
+                    client.ready().await?;
+                    if target.attempted || target.job.state != JobState::Ready {
+                        return Err(refuse(
+                            "Start was already attempted. Read status; do not repeat Start.",
+                        ));
+                    }
+                    let bytes = file_bytes(&target.path).await?;
+                    if hash(&bytes) != target.digest || self.profiles(printer)? != target.profiles {
+                        return Err(refuse(
+                            "Prepared file or printer changed. Prepare and review again.",
+                        ));
+                    }
+                    client.check_materials(&bytes).await?;
+                } else if target.attempted
+                    && (target.remote.is_none() || target.remote != live.job_id)
+                {
+                    return Err(refuse(
+                        "The live job differs from the reviewed job. No command was sent.",
+                    ));
+                }
+                return Ok(());
+            }
             let snapshot = self.client(printer)?.snapshot().await?;
             let jobs = self.jobs.lock().await;
             let target = if let Some(id) = job {
@@ -383,8 +509,8 @@ impl Backend for Printers {
         self.client(printer).is_ok() && detail == Some("READY")
     }
     fn check_control(&self, printer: &str) -> Result<(), Error> {
-        if self.bambu.contains_key(printer) {
-            Err(crate::bambu::unsupported())
+        if let Some(client) = self.bambu.get(printer) {
+            client.check_control()
         } else {
             Ok(())
         }
@@ -484,6 +610,18 @@ impl Backend for Printers {
                         )
                     })?;
                 let bytes = file_bytes(&output.path).await?;
+                let filename = format!("dutchman-{}.gcode.3mf", hash(id.as_bytes()));
+                // Monitor-only preparation remains available; executable review is required for control.
+                let info = if profile.lan_control {
+                    crate::bambu::start_payload(
+                        profile,
+                        &filename,
+                        filename.trim_end_matches(".gcode.3mf"),
+                        &bytes,
+                    )?
+                } else {
+                    Value::Null
+                };
                 let mut jobs = self.jobs.lock().await;
                 if jobs.len() >= 5000 || jobs.contains_key(id) {
                     return Err(refuse("Job storage is full or this id is already in use."));
@@ -502,10 +640,10 @@ impl Backend for Printers {
                         },
                         path: output.path,
                         digest: hash(&bytes),
-                        info: Value::Null,
+                        info,
                         remote: None,
                         attempted: false,
-                        filename: "sliced.3mf".into(),
+                        filename,
                         profiles: self.profiles(printer)?,
                     },
                 );
@@ -573,8 +711,57 @@ impl Backend for Printers {
         Box::pin(async move {
             let mut jobs = self.jobs.lock().await;
             let target = jobs.get_mut(id).ok_or(Error::NotFound)?;
-            if self.bambu.contains_key(&target.job.printer) {
-                return Err(crate::bambu::unsupported());
+            if let Some(client) = self.bambu.get(&target.job.printer) {
+                client.check_control()?;
+                if target.attempted || target.job.state != JobState::Ready {
+                    return Err(refuse("Start was already attempted. Read status to reconcile it; Start will not be repeated."));
+                }
+                if self.profiles(&target.job.printer)? != target.profiles {
+                    return Err(refuse(
+                        "Printer profiles changed. Prepare and review again.",
+                    ));
+                }
+                client.ready().await?;
+                let bytes = file_bytes(&target.path).await?;
+                if hash(&bytes) != target.digest {
+                    return Err(refuse("Prepared 3MF changed. Prepare and review again."));
+                }
+                let profile = self
+                    .configs
+                    .iter()
+                    .find(|p| p.id == target.job.printer)
+                    .ok_or(Error::NotFound)?;
+                let name = target.filename.trim_end_matches(".gcode.3mf").to_owned();
+                let payload =
+                    crate::bambu::start_payload(profile, &target.filename, &name, &bytes)?;
+                if target.info != payload {
+                    return Err(refuse(
+                        "Start configuration changed. Prepare and review again.",
+                    ));
+                }
+                client.upload(&target.filename, &bytes).await?;
+                client.ready().await?;
+                target.attempted = true;
+                if let Some(path) = &self.store {
+                    let bytes = serde_json::to_vec(&*jobs).map_err(|_| Error::Unavailable)?;
+                    let temporary = path.with_extension("new");
+                    tokio::fs::write(&temporary, bytes)
+                        .await
+                        .map_err(|_| Error::Unavailable)?;
+                    tokio::fs::rename(temporary, path)
+                        .await
+                        .map_err(|_| Error::Unavailable)?;
+                }
+                let target = jobs.get_mut(id).ok_or(Error::NotFound)?;
+                let result = client.command(payload, &name, "RUNNING", None).await;
+                self.reconcile_bambu(target).await?;
+                result?;
+                if target.job.state != JobState::Printing {
+                    return Err(refuse(
+                        "Start is not confirmed. Read status to reconcile the job.",
+                    ));
+                }
+                return Ok(target.job.clone());
             }
             if target.attempted || target.job.state != JobState::Ready {
                 return Err(refuse("Start was already attempted. Read status and reconcile the intended file and job; do not repeat Start."));
@@ -679,8 +866,13 @@ impl Backend for Printers {
         Box::pin(async move {
             let mut jobs = self.jobs.lock().await;
             let target = jobs.get_mut(id).ok_or(Error::NotFound)?;
-            if self.bambu.contains_key(&target.job.printer) {
-                return Err(crate::bambu::unsupported());
+            if let Some(client) = self.bambu.get(&target.job.printer) {
+                client.check_control()?;
+                if !target.attempted && target.job.state == JobState::Ready {
+                    target.job.state = JobState::Cancelled;
+                    return Ok(target.job.clone());
+                }
+                return self.bambu_control(target, "cancel").await;
             }
             if !target.attempted && target.job.state == JobState::Ready {
                 target.job.state = JobState::Cancelled;
@@ -700,7 +892,11 @@ impl Backend for Printers {
             let mut jobs = self.jobs.lock().await;
             let target = jobs.get_mut(id).ok_or(Error::NotFound)?;
             if target.attempted {
-                self.reconcile(target).await?;
+                if self.bambu.contains_key(&target.job.printer) {
+                    self.reconcile_bambu(target).await?;
+                } else {
+                    self.reconcile(target).await?;
+                }
             }
             Ok(target.job.clone())
         })

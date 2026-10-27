@@ -217,3 +217,18 @@ output text G-code comments (first and last 256 KiB). Missing, ambiguous, or mul
 settings are refused. Before upload it must match `/api/v1/info` `nozzle_diameter`; a
 mismatch names both diameters and requires a matching nozzle or a newly sliced profile.
 There is no per-printer mismatch override.
+
+For Bambu, `detail` includes active HMS hexadecimal codes and Bambu wiki links.
+Fatal/serious HMS alerts block Start; any HMS alert during PAUSE requires attention
+and blocks Resume. FINISH/FAILED without an active fault are idle terminal states:
+clearance can be acknowledged with a `clear` challenge, followed by a separate Start
+challenge. A terminal job's existing `print_error` is historical; one appearing or
+changing afterward is active. Historical job identity can remain in the report.
+
+Bambu readiness uses a live MQTT connection and any incoming message within 30 seconds.
+Deltas merge with cached fields, including while reconnect full-report requests are
+paced. Stop requires live telemetry and the matching last-known execution identity.
+Before upload, sliced `nozzle_diameter` and any specified `nozzle_type` must match the
+installed nozzle; each `filament_type` must match its mapped AMS `tray_type` or the
+single-filament external `vt_tray.tray_type`. Unknown values and mismatches are refused
+with no override. These checks also apply to command line actions.

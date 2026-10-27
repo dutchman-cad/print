@@ -52,7 +52,7 @@ async fn full_state_deltas_states_missing_values_and_stale() {
         ("RUNNING", PrinterState::Printing),
         ("PAUSE", PrinterState::Paused),
         ("FINISH", PrinterState::Idle),
-        ("FAILED", PrinterState::Error),
+        ("FAILED", PrinterState::Idle),
         ("NEW_STATE", PrinterState::Error),
         ("IDLE", PrinterState::Idle),
     ] {
@@ -79,8 +79,70 @@ async fn full_state_deltas_states_missing_values_and_stale() {
     assert_eq!(fake.connections.load(Ordering::SeqCst), 1);
     assert_eq!(fake.requests.load(Ordering::SeqCst), 1);
 }
+
 #[tokio::test]
-async fn reconnect_resets_baseline_and_paces_requests() {
+async fn upload_refuses_unknown_errors_busy_unknown_and_stale_status() {
+    let fake = Fake::new().await;
+    let mut c = client(&fake, false);
+    c.config.lan_control = true;
+    c.snapshot().await;
+    // The fixture's first report omits print_error, so readiness is unknown.
+    assert!(c
+        .upload("test.gcode.3mf", b"x")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("readiness"));
+    for wire in ["RUNNING", "PAUSE", "NEW_STATE"] {
+        fake.reports
+            .send(json!({"print":{"gcode_state":wire,"print_error":0}}))
+            .unwrap();
+        let expected = match wire {
+            "RUNNING" => PrinterState::Printing,
+            "PAUSE" => PrinterState::Paused,
+            "FINISH" => PrinterState::Idle,
+            _ => PrinterState::Error,
+        };
+        state(&c, expected, wire).await;
+        assert!(c
+            .upload("test.gcode.3mf", b"x")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("readiness"));
+    }
+    fake.reports
+        .send(json!({"print":{"gcode_state":"IDLE","print_error":42}}))
+        .unwrap();
+    state(&c, PrinterState::Error, "IDLE").await;
+    assert!(c
+        .upload("test.gcode.3mf", b"x")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("readiness"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(c
+        .upload("test.gcode.3mf", b"x")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("readiness"));
+    fake.reports
+        .send(json!({"print":{"gcode_state":"IDLE","print_error":0}}))
+        .unwrap();
+    state(&c, PrinterState::Idle, "IDLE").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A live delta refreshes the merged state even when machine state and errors do not repeat.
+    fake.reports
+        .send(json!({"print":{"bed_temper":61}}))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(c.snapshot().await.state, PrinterState::Idle);
+    assert!(c.ready().await.is_ok());
+}
+#[tokio::test]
+async fn reconnect_merges_deltas_while_full_request_is_paced() {
     let fake = Fake::new().await;
     let mut c = client(&fake, false);
     c.pacing = Duration::from_millis(1500);
@@ -92,10 +154,16 @@ async fn reconnect_resets_baseline_and_paces_requests() {
     fake.reports.send(Value::Null).unwrap();
     Fake::wait(&fake.connections, 2).await;
     assert_eq!(fake.requests.load(Ordering::SeqCst), 1);
-    assert!(c.state.borrow().received.is_none());
+    fake.reports
+        .send(json!({"print":{"mc_percent":42}}))
+        .unwrap();
+    let p = state(&c, PrinterState::Paused, "PAUSE").await;
+    assert_eq!(p.bed_temperature, Some(99.0));
+    assert_eq!(p.progress, Some(0.42));
+    assert_eq!(fake.requests.load(Ordering::SeqCst), 1);
     Fake::wait(&fake.requests, 2).await;
-    let p = state(&c, PrinterState::Idle, "IDLE").await;
-    assert_eq!(p.bed_temperature, Some(55.0));
+    let p = state(&c, PrinterState::Paused, "PAUSE").await;
+    assert_eq!(p.bed_temperature, Some(99.0));
 }
 #[tokio::test]
 async fn authentication_and_tls_identity_fail_before_credentials() {
@@ -150,7 +218,7 @@ fn bounds_and_contradictory_reports() {
     assert_eq!(report.state, PrinterState::Error);
     assert_eq!(report.seconds_left, None);
     assert_eq!(report.progress, None);
-    assert!(!s.report(br#"{"print":{"command":"ack"}}"#));
+    assert!(s.report(br#"{"print":{"command":"ack"}}"#));
     assert!(s.report(br#"{"print":{"subtask_name":null,"gcode_file":"fallback.gcode","nozzle_temper":-5,"mc_percent":-1}}"#));
     let report = s.printer(&p, FRESH);
     assert_eq!(report.job_name.as_deref(), Some("fallback.gcode"));
@@ -212,6 +280,9 @@ async fn configuration_requires_explicit_trust_and_private_credentials() {
     let mut p = good.clone();
     p.port = Some(0);
     assert!(validate(&p).is_err());
+    let mut p = good.clone();
+    p.ftps_port = Some(0);
+    assert!(validate(&p).is_err());
     for port in ["-1", "65536", "'8883'"] {
         let text = format!("id='test'\nname='Test'\nmodel='Synthetic'\nport={port}\n");
         assert!(toml::from_str::<crate::config::Printer>(&text).is_err());
@@ -239,4 +310,91 @@ async fn configuration_requires_explicit_trust_and_private_credentials() {
     p.api_key = Some("unused".into());
     assert!(validate(&p).is_err());
     assert_eq!(fake.connections.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn idle_deltas_keep_merged_readiness_online() {
+    let fake = Fake::new().await;
+    fake.ready.store(true, Ordering::SeqCst);
+    let mut c = client(&fake, false);
+    c.config.lan_control = true;
+    c.snapshot().await;
+    for temperature in 30..36 {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        fake.reports
+            .send(json!({"print":{"bed_temper":temperature}}))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(c.snapshot().await.state, PrinterState::Idle);
+        c.ready().await.unwrap();
+    }
+    assert_eq!(fake.requests.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn oversized_or_malformed_hms_blocks_and_cannot_grow_cache() {
+    let mut s = Telemetry::default();
+    s.report(&serde_json::to_vec(&json!({"print":{"gcode_state":"IDLE","print_error":0,"hms":vec![json!({"attr":1024,"code":1});65]}})).unwrap());
+    assert!(s.serious_hms());
+    assert!(!s.fields.contains_key("hms"));
+    s.report(br#"{"print":{"hms":[{"attr":"invalid","code":1}]}}"#);
+    assert!(s.serious_hms());
+    s.report(br#"{"print":{"hms":[]}}"#);
+    assert!(!s.serious_hms());
+}
+
+#[tokio::test]
+async fn control_enabled_one_shot_keeps_monitoring_until_drop() {
+    let fake = Fake::new().await;
+    let mut config = config(&fake);
+    config.lan_control = true;
+    let c = Client::new(config, true).unwrap();
+    assert_eq!(c.snapshot().await.state, PrinterState::Idle);
+    fake.reports
+        .send(json!({"print":{"gcode_state":"PAUSE"}}))
+        .unwrap();
+    state(&c, PrinterState::Paused, "PAUSE").await;
+    assert_eq!(fake.disconnects.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn hms_severity_ignores_adjacent_attribute_flags() {
+    let mut s = Telemetry::default();
+    s.report(br#"{"print":{"gcode_state":"IDLE","print_error":0,"hms":[{"attr":50336768,"code":65543}]}}"#);
+    // 0x03001400: informational severity, with a separate higher attribute flag.
+    assert!(!s.serious_hms());
+    s.report(br#"{"print":{"hms":[{"attr":50336000,"code":262151}]}}"#);
+    // 0x03001100: fatal severity despite the code's high word being 4.
+    assert!(s.serious_hms());
+}
+
+#[test]
+fn explicit_ams_removal_clears_cached_material() {
+    let mut s = Telemetry::default();
+    let full = br#"{"print":{"gcode_state":"IDLE","ams":{"ams":[{"id":"0","tray":[{"id":"0","tray_type":"PLA"}]}]}}}"#;
+    for removed in [
+        br#"{"print":{"ams":{"ams":[]}}}"#.as_slice(),
+        br#"{"print":{"ams":{"ams":[{"id":"0","tray":[]}]}}}"#.as_slice(),
+    ] {
+        s.report(full);
+        assert_eq!(s.fields.get("tray_0").and_then(Value::as_str), Some("PLA"));
+        s.report(removed);
+        assert!(!s.fields.contains_key("tray_0"));
+    }
+}
+
+#[test]
+fn historical_error_stays_historical_until_its_value_changes() {
+    let p = crate::config::Printer::default();
+    let mut s = Telemetry::default();
+    s.report(br#"{"print":{"gcode_state":"FAILED","print_error":42}}"#);
+    assert_eq!(s.printer(&p, FRESH).state, PrinterState::Idle);
+    s.report(br#"{"print":{"gcode_state":"PREPARE","print_error":42}}"#);
+    assert_eq!(s.printer(&p, FRESH).state, PrinterState::Printing);
+    s.report(br#"{"print":{"print_error":43}}"#);
+    assert_eq!(s.printer(&p, FRESH).state, PrinterState::Error);
+    s.report(br#"{"print":{"print_error":0}}"#);
+    assert_eq!(s.printer(&p, FRESH).state, PrinterState::Printing);
+    s.report(br#"{"print":{"print_error":42}}"#);
+    assert_eq!(s.printer(&p, FRESH).state, PrinterState::Error);
 }
