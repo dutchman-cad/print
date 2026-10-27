@@ -131,6 +131,7 @@ async fn slow_progress_succeeds_and_missing_completion_deletes_file() {
         "test.gcode.3mf",
         &vec![1; 16 << 20],
         Duration::from_millis(500),
+        Duration::from_millis(1000),
     )
     .await;
     assert!(
@@ -145,7 +146,8 @@ async fn slow_progress_succeeds_and_missing_completion_deletes_file() {
         &fake.config,
         "test.gcode.3mf",
         b"test",
-        Duration::from_millis(200)
+        Duration::from_millis(200),
+        Duration::from_millis(400),
     )
     .await
     .is_err());

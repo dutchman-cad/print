@@ -117,7 +117,8 @@ impl Client {
         } else {
             STATUS_TIMEOUT
         };
-        let (progress, updates) = tokio::sync::watch::channel(tokio::time::Instant::now());
+        let (progress, updates) = crate::progress::channel();
+        let size = body.len() as u64;
         let operation = async {
             let host = self
                 .uri
@@ -190,7 +191,7 @@ impl Client {
             Ok((code, bytes))
         };
         if upload {
-            crate::progress::timeout(deadline, updates, operation)
+            crate::progress::timeout(deadline, crate::progress::REPLY, updates, size, operation)
                 .await
                 .map_err(|_| Error::Unavailable)?
         } else {

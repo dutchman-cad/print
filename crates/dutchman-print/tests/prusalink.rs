@@ -1388,7 +1388,8 @@ async fn stalled_upload_is_deleted_and_never_started() {
     let b = fake.backend(dir.path()).await;
     b.clear("test").await.unwrap();
     fake.shared.machine.lock().await.block_upload = true;
-    let result = tokio::time::timeout(std::time::Duration::from_secs(40), b.start("one"))
+    // The body fits the socket buffers, so the stall is the printer never replying.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(75), b.start("one"))
         .await
         .unwrap();
     assert!(result.is_err());

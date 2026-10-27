@@ -20,7 +20,7 @@ pub struct Client {
 struct Connection {
     sender: hyper::client::conn::http1::SendRequest<Full<Bytes>>,
     driver: tokio::task::JoinHandle<()>,
-    progress: tokio::sync::watch::Sender<tokio::time::Instant>,
+    progress: tokio::sync::watch::Sender<crate::progress::Progress>,
 }
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -115,13 +115,14 @@ impl Client {
         if active.as_ref().is_some_and(|c| c.sender.is_closed()) {
             active = None;
         }
-        let (progress, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
+        let (progress, _) = crate::progress::channel();
         let progress = active
             .as_ref()
             .map(|c| c.progress.clone())
             .unwrap_or(progress);
-        progress.send_replace(tokio::time::Instant::now());
+        crate::progress::touch(&progress);
         let updates = progress.subscribe();
+        let size = body.len() as u64;
         let operation = async {
             if active.as_ref().is_some_and(|c| c.sender.is_closed()) {
                 active = None;
@@ -148,9 +149,7 @@ impl Client {
                 });
             }
             let connection = active.as_mut().ok_or(Error::Unavailable)?;
-            connection
-                .progress
-                .send_replace(tokio::time::Instant::now());
+            crate::progress::touch(&connection.progress);
             let mut request = Request::builder()
                 .method(method)
                 .uri(path)
@@ -190,7 +189,7 @@ impl Client {
         };
         let result = if upload {
             // Reused sockets retain their own progress channel.
-            crate::progress::timeout(deadline, updates, operation)
+            crate::progress::timeout(deadline, crate::progress::REPLY, updates, size, operation)
                 .await
                 .map_err(|_| Error::Unavailable)
         } else {

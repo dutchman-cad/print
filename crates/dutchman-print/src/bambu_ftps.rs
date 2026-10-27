@@ -99,7 +99,14 @@ pub(super) async fn upload(
     filename: &str,
     bytes: &[u8],
 ) -> Result<(), Error> {
-    upload_with_idle(config, filename, bytes, Duration::from_secs(30)).await
+    upload_with_idle(
+        config,
+        filename,
+        bytes,
+        Duration::from_secs(30),
+        crate::progress::REPLY,
+    )
+    .await
 }
 
 async fn upload_with_idle(
@@ -107,6 +114,7 @@ async fn upload_with_idle(
     filename: &str,
     bytes: &[u8],
     idle: Duration,
+    reply_budget: Duration,
 ) -> Result<(), Error> {
     // A basename cannot inject FTP commands, traverse storage, or alter URL semantics.
     if filename.is_empty()
@@ -124,7 +132,7 @@ async fn upload_with_idle(
         ));
     }
     let mut staged = false;
-    let (progress, updates) = tokio::sync::watch::channel(tokio::time::Instant::now());
+    let (progress, updates) = crate::progress::channel();
     let operation = async {
         let host = config.host.as_deref().ok_or(Error::Unavailable)?;
         let serial = ServerName::try_from(config.serial.clone().unwrap_or_default())
@@ -192,10 +200,11 @@ async fn upload_with_idle(
         accepted(command(&mut control, "QUIT").await?.0, &[221])?;
         Ok(())
     };
-    let result = crate::progress::timeout(idle, updates, operation)
-        .await
-        .map_err(|_| refused("FTPS upload stopped making progress. No print was started."))
-        .and_then(|result| result);
+    let result =
+        crate::progress::timeout(idle, reply_budget, updates, bytes.len() as u64, operation)
+            .await
+            .map_err(|_| refused("FTPS upload stopped making progress. No print was started."))
+            .and_then(|result| result);
     if let Err(error) = result {
         if !staged {
             return Err(error);
@@ -223,7 +232,7 @@ async fn delete(config: &crate::config::Printer, filename: &str) -> Result<(), E
         .connect(serial, socket)
         .await
         .map_err(|_| Error::Unavailable)?;
-    let (progress, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
+    let (progress, _) = crate::progress::channel();
     let mut control = BufReader::new(crate::progress::Stream::new(socket, progress));
     accepted(reply(&mut control).await?.0, &[220])?;
     let user = command(&mut control, "USER bblp").await?.0;

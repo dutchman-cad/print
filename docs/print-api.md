@@ -316,7 +316,9 @@ unconfirmed outcome is returned. Waiting never resends a command. Read status af
 an uncertain outcome before confirming another action.
 
 Uploads to PrusaLink, Bambu FTPS, OctoPrint, and Moonraker use a 30-second transport
-idle timeout, reset by byte progress, rather than a fixed total deadline. Failed or
+idle timeout, reset by byte progress, rather than a fixed total deadline. Once the whole body has
+been written, the printer's reply gets 60 seconds, since storing the file or draining socket
+buffers moves no bytes. Failed or
 uncertain PrusaLink and Bambu uploads attempt deletion of the staged remote file before
 returning an error and never send Start. Unconfirmed cleanup requires inspection and
 removal in the printer's storage before preparing again.
