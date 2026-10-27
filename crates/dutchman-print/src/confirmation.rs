@@ -133,9 +133,7 @@ impl Confirmations {
         {
             return Err(refused());
         }
-        if intent.action != "clear" {
-            safety.check_control(&intent.printer)?;
-        }
+        safety.check_action(&intent.printer, &intent.action)?;
         let printer = safety.printer(&intent.printer).await?;
         let job = if let Some(id) = &intent.job {
             let job = safety.job(id).await?;
@@ -283,6 +281,7 @@ impl Confirmations {
         header: Option<&str>,
         now: Duration,
     ) -> Result<Observation, Error> {
+        safety.check_action(&intent.printer, &intent.action)?;
         let started = std::time::Instant::now();
         let mut guard = self.ledger.lock().await;
         self.load(&mut guard).await?;

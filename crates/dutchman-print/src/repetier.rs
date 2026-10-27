@@ -11,6 +11,10 @@ use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
 
+pub(crate) fn controls() -> Vec<&'static str> {
+    vec!["start", "cancel", "clear"]
+}
+
 const STATUS_TIMEOUT: Duration = Duration::from_secs(4);
 /// Model and job lists carry per-file statistics, so they get more room than status.
 const MAX_REPLY: usize = 4 << 20;
@@ -601,6 +605,7 @@ impl Client {
     }
     pub fn offline(&self, error: &Error) -> Printer {
         Printer {
+            controls: controls().into_iter().map(String::from).collect(),
             id: self.config.id.clone(),
             name: self.config.name.clone(),
             model: self.config.model.clone(),

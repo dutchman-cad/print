@@ -464,6 +464,11 @@ impl Client {
     }
     pub fn offline(&self, error: &Error) -> Printer {
         Printer {
+            controls: crate::backend::ALL_CONTROLS
+                .iter()
+                .copied()
+                .map(String::from)
+                .collect(),
             id: self.config.id.clone(),
             name: self.config.name.clone(),
             model: self.config.model.clone(),

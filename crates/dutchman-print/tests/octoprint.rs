@@ -1,5 +1,7 @@
 //! Synthetic OctoPrint REST fixtures on test-owned loopback sockets.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::unreachable)]
+#[path = "helpers/controls.rs"]
+mod controls;
 #[path = "helpers/slicer.rs"]
 mod slicer_fixture;
 
@@ -1451,4 +1453,11 @@ async fn uploaded_ready_file_is_cleaned_on_cancel_or_forget() {
         drop(m);
         assert!(f.commands().await.is_empty());
     }
+}
+
+#[tokio::test]
+async fn api_reports_configured_controls() {
+    let f = Fake::new().await;
+    let (_dir, app) = controls::app(f.config());
+    controls::listed(&app, controls::ALL).await;
 }

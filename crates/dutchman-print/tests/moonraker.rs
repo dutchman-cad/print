@@ -1,5 +1,7 @@
 //! Moonraker control policy exercised only against test-owned loopback servers.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::unreachable)]
+#[path = "helpers/controls.rs"]
+mod controls;
 #[path = "helpers/moonraker.rs"]
 mod fake;
 #[path = "helpers/slicer.rs"]
@@ -1187,4 +1189,22 @@ async fn uploaded_ready_file_is_cleaned_on_cancel_or_forget() {
         drop(m);
         assert!(f.commands().await.is_empty());
     }
+}
+
+#[tokio::test]
+async fn api_reports_configured_controls() {
+    let f = Fake::new().await;
+    let (_dir, app) = controls::app(f.config());
+    controls::listed(&app, controls::ALL).await;
+}
+
+#[tokio::test]
+async fn uncommissioned_resume_is_omitted_and_refused_without_reads() {
+    let f = Fake::new().await;
+    let mut config = f.config();
+    config.printers[0].resume_commissioned = false;
+    let (_dir, app) = controls::app(config);
+    controls::unsupported(&app, "test", &["resume"]).await;
+    assert!(f.shared.machine.lock().await.records.is_empty());
+    controls::listed(&app, &["start", "pause", "cancel", "stop", "clear"]).await;
 }

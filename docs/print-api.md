@@ -78,7 +78,7 @@ storage and removed on failure.
 ## Printer JSON
 
 ```json
-[{"id":"workbench","name":"Workbench","model":"Example printer","state":"idle"}]
+[{"id":"workbench","name":"Workbench","model":"Example printer","state":"idle","controls":["start","pause","resume","cancel","stop","clear"]}]
 ```
 
 | Field | Type | Presence |
@@ -86,6 +86,7 @@ storage and removed on failure.
 | `id` | string | Required |
 | `name` | string | Required |
 | `model` | string | Required |
+| `controls` | array of strings | Required; supported machine actions in this configuration |
 | `state` | string | Required: `idle`, `printing`, `paused`, `attention`, `busy`, `error`, or `offline` |
 | `job_id` | string | Optional; active job ID, the live file path for Duet, the queued job id for Repetier-Server, or the `TaskId` for Elegoo SDCP |
 | `job_name` | string | Optional; active job name |
@@ -98,6 +99,21 @@ storage and removed on failure.
 | `needs_clearing` | boolean | Optional; true when an operator must check and acknowledge the bed |
 
 Unavailable optional fields are omitted. An empty fleet is `[]`.
+
+### Controls
+
+`controls` lists supported actions independently of the printer's current state: `start`,
+`pause`, `resume`, `cancel`, `stop`, and `clear`. `stop` means printer-level Stop of any live
+job, including external work; `cancel` acts on a tracked job. `clear` is listed wherever
+`start` is. Clients use this list to choose which controls to show, then use fresh state and
+confirmation challenges to determine what is possible now. Unsupported actions return 409
+from both confirmations and action routes, before reading printer status.
+
+Simulated, PrusaLink, OctoPrint, and Duet printers list all six. Moonraker and Snapmaker U1
+list all six with `resume_commissioned = true`, otherwise they omit `resume`. Bambu lists all
+six only with `lan_control = true`, otherwise `[]`. Repetier-Server lists
+`["start", "cancel", "clear"]`. Elegoo resin lists `["stop"]`; Centauri, Snapmaker 2.0, J1,
+and Artisan list `[]`. Readiness and reviewed tooling still apply.
 
 A remote bed-clear acknowledgement exists only in the running process. While it is held,
 the server polls that printer every 5 seconds (`--clearance-interval-seconds`, 2–30).
@@ -237,10 +253,10 @@ model, requires exactly one listed model of that name with the reviewed size, re
 or uncertain uploads with `removeModel` before returning an error, saves the attempt, sends
 `copyModel` with `autostart` false once, and sends `startJob` once for the queued job; a lost
 reply is reconciled from status and never resent. Pause and resume challenges and routes are
-refused: the manual documents no pause and the server reports no paused state. Cancel and
-Stop send `stopJob` once and only while the live job is the one this companion started;
-`stopJob` names no job, so Stop is refused for external work. A queued job that never ran is
-cancelled with `removeJob`. Waits match Moonraker. Job endings are not reported over this
+refused: the manual documents no pause and the server reports no paused state. Cancel sends
+`stopJob` once and only while the live job is the one this companion started;
+`stopJob` names no job, so printer-level Stop is refused. Use Cancel for tracked work.
+A queued job that never ran is cancelled with `removeJob`. Waits match Moonraker. Job endings are not reported over this
 interface: a companion cancellation yields `cancelled` and other endings `ended`. See
 [Repetier-Server configuration and checks](print.md#repetier-server).
 
@@ -258,14 +274,14 @@ substate 0, 8, or 9 is `idle`; a nonzero `ErrorNumber`, a contradictory, or an u
 `progress` is the layer fraction while printing or paused. Resin `seconds_left` comes from
 millisecond ticks; Centauri omits it. Resin UV LED and enclosure temperatures appear only in
 `detail`; Centauri reports nozzle and bed temperatures. Centauri is monitoring only: every
-challenge except `clear` and every action route are refused, and no command is sent. Resin
+challenge and every action route are refused, and no command is sent. Resin
 supports printer Stop only; `pause` and `resume` challenges and routes are refused, because
 they act on and return a tracked job, and Print never starts resin jobs. See
 [Elegoo (SDCP)](print.md#elegoo-sdcp).
 
 Snapmaker 2.0 (`kind = "snapmaker-2"`) and Snapmaker J1 and Artisan (`kind = "snapmaker-j1"`)
 printers are monitoring only and report status only through the printer routes. Preparation,
-every confirmation challenge except `clear`, and every action route are refused with a
+every confirmation challenge, and every action route are refused with a
 message that Snapmaker has not published the control contract, and nothing beyond the
 documented status requests is sent; they never have tracked jobs and never report
 `printing`, `paused`, `job_id`, `job_name`, `progress`, `seconds_left`, or temperatures. A
@@ -443,8 +459,8 @@ outcome. External jobs are not added to the prepared-job list.
 PrusaLink addresses the live job ID; OctoPrint cancels only the same live origin/file path;
 Moonraker requires the same history execution and filename; Bambu requires the same
 subtask name and positive start time; Duet requires the same live file path and pauses a
-running job before sending `M0`; Repetier-Server sends `stopJob` only while the live job is the
-one this companion started and refuses Stop for any other job, since `stopJob` names no job;
+running job before sending `M0`; Repetier-Server refuses printer-level Stop because
+`stopJob` names no job (use Cancel for tracked work);
 Elegoo resin requires the same `TaskId` and `Filename`, sends
 command 130 once, waits up to 10 seconds for its `Ack`, and is confirmed by STOPPED for that
 task. OctoPrint cannot distinguish another execution of

@@ -1,6 +1,8 @@
 //! Snapmaker 2.0 (HTTP) and J1/Artisan (SACP) monitoring, exercised only against byte
 //! fixtures and test-owned loopback servers.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+#[path = "helpers/controls.rs"]
+mod controls;
 #[path = "helpers/snapmaker.rs"]
 mod fake;
 #[path = "helpers/slicer.rs"]
@@ -869,4 +871,19 @@ fn config_takes_only_host_and_port() {
         .err()
         .unwrap()
         .contains("snapmaker-2, snapmaker-j1"));
+}
+
+#[tokio::test]
+async fn api_reports_controls_and_refuses_unsupported_actions_without_reads() {
+    let f = Fake2::new(Approval::Immediate).await;
+    let (_dir, app) = controls::app(f.config());
+    controls::unsupported(&app, "test", controls::ALL).await;
+    assert!(f.machine.lock().await.requests.is_empty());
+    controls::listed(&app, &[]).await;
+    let f = FakeJ1::new(&[0]).await;
+    let (_dir, app) = controls::app(f.config());
+    controls::unsupported(&app, "test", controls::ALL).await;
+    assert_eq!(f.machine.lock().await.connections, 0);
+    assert!(f.machine.lock().await.requests.is_empty());
+    controls::listed(&app, &[]).await;
 }

@@ -236,6 +236,7 @@ filament mm = size / 10, filament g = size / 1000, and layers = 1 + size / 4096.
 Integer divisions round down. These are demonstration values, not slicing results.
 Profile names affect slicing only when it is enabled. Started jobs progress with elapsed
 time, pause freezes progress, resume continues, and cancel ends the job.
+Simulated controls are `start`, `pause`, `resume`, `cancel`, `stop`, and `clear`.
 
 CLI simulation state is saved in the private data folder, separately for each config path,
 so later commands can read and control it. Jobs older than one hour are removed on the
@@ -281,10 +282,16 @@ nonempty plain UTF-8, at most 256 bytes. Duplicate or unknown fields are refused
 companion checks paths, entry counts, and actual expanded sizes before calling the backend.
 The simulator supplies previews only when slicing produces one.
 
-Printer objects have `id`, `name`, `model`, and `state`: `idle`, `printing`, `paused`,
+Printer objects have `id`, `name`, `model`, required `controls`, and `state`: `idle`, `printing`, `paused`,
 `attention`, `busy`, `error`, or `offline`. While printing or paused they may include `job_id`, `job_name`, `progress`
 (0–1), `seconds_left`, `nozzle_temperature`, and `bed_temperature` (degrees Celsius).
 Unavailable printer fields are omitted.
+
+`controls` lists machine actions supported in configuration, independent of live state.
+It contains `start`, `pause`, `resume`, `cancel`, `stop`, and `clear` where supported; `clear`
+requires start support. `stop` includes jobs started elsewhere. Use this list to choose
+which buttons to show; fresh state and confirmation still decide whether an action can run.
+Unsupported challenges and action routes return 409 before reading printer status.
 
 Job states are `ready`, `printing`, `paused`, `done`, `cancelled`, `failed`, and `ended`. Job `progress`
 and `seconds_left` may be null. Estimate fields `seconds`, `filament_mm`, `filament_g`, and
@@ -294,7 +301,7 @@ to 500. Backend error messages must never contain secrets.
 
 Before each machine action, request a server-issued challenge with
 `POST /api/v1/confirmations` and JSON `{"action":"start","printer":"workbench","job":"JOB_ID"}`.
-Actions are `start`, `cancel`, `pause`, `resume`, and `clear`; `job` is required for start
+Actions are `start`, `cancel`, `stop`, `pause`, `resume`, and `clear`; `job` is required for start
 and cancel and omitted for printer actions. Issuance re-reads the printer and refuses
 incompatible actions with 409. Success is 201 with `id`, `action`, `printer`, nullable `job`,
 `summary`, `observed`, and `expires_at` (Unix seconds). `observed` contains normalized `state`,
@@ -440,6 +447,8 @@ resolved settings and output for inspection. Orca's effective settings are expor
 
 ## PrusaLink
 
+Controls: `start`, `pause`, `resume`, `cancel`, `stop`, and `clear`.
+
 Configure each printer explicitly. Dutchman does no network discovery. Use its local HTTP
 address, without credentials, a path, or a query string. HTTPS proxies are not supported yet;
 redirects are refused. Keep printer HTTP traffic on a trusted private network.
@@ -551,6 +560,8 @@ live identity before control after a restart.
 
 ## OctoPrint
 
+Controls: `start`, `pause`, `resume`, `cancel`, `stop`, and `clear`.
+
 Configure the host explicitly; Dutchman performs no discovery. HTTP and HTTPS are accepted,
 including a reverse proxy base path. HTTPS verifies the hostname and certificate against system
 trust; there are no certificate exceptions. Redirects are refused. Keep HTTP on a trusted local
@@ -650,6 +661,9 @@ restarts; the service uses the same confirmation and safety policy described in
 [the job API](print-api.md).
 
 ## Bambu Lab LAN control (experimental)
+
+Controls: none by default; `start`, `pause`, `resume`, `cancel`, `stop`, and `clear`
+with `lan_control = true`.
 
 Bambu monitoring and local preparation with OrcaSlicer are available by default.
 Control is **experimental, verified against simulated printers only**. Check it on your
@@ -832,6 +846,9 @@ not a hardware certification. Unsupported values are refused before a command is
 
 ## Moonraker (Klipper)
 
+Controls: `start`, `pause`, `resume`, `cancel`, `stop`, and `clear`.
+`resume` is omitted unless `resume_commissioned = true`.
+
 Configure the Moonraker address explicitly; there is no discovery. HTTP and HTTPS are
 supported, including reverse-proxy base paths. HTTPS uses system certificate trust and
 checks the configured hostname; redirects and certificate exceptions are refused.
@@ -925,6 +942,9 @@ macro commissioning remains an installation step.
 
 ## Snapmaker U1
 
+Controls: `start`, `pause`, `resume`, `cancel`, `stop`, and `clear`.
+`resume` is omitted unless `resume_commissioned = true`.
+
 The Snapmaker U1 runs Snapmaker's fork of Moonraker. Its published
 [API documentation](https://github.com/Snapmaker/u1-moonraker/blob/main/docs/web_api.md) is
 upstream Moonraker's, so `kind = "snapmaker-u1"` uses the Moonraker backend above: the same
@@ -964,6 +984,8 @@ Check the material loaded in the print tool, the physical nozzle, and the plate 
 confirming each start. Testing uses a simulated U1 on a test-owned loopback server.
 
 ## Duet (RepRapFirmware standalone)
+
+Controls: `start`, `pause`, `resume`, `cancel`, `stop`, and `clear`.
 
 This backend uses the standalone RepRapFirmware HTTP interface (`rr_` requests) of a Duet
 board running without a single-board computer. Duet with an attached SBC has a different API
@@ -1075,6 +1097,8 @@ need checking on a real board before relying on control.
 
 ## Repetier-Server
 
+Controls: `start`, `cancel`, and `clear`. Printer-level Stop, pause, and resume are refused.
+
 `kind = "repetier"` talks to a [Repetier-Server](https://www.repetier-server.com/) installation,
 a host program that runs one or more printers. Repetier-Server 2.0 is the final release: the
 vendor has [ended development](https://www.repetier-server.com/the-end-of-repetier-server-development/),
@@ -1178,11 +1202,11 @@ by itself is waited for and never sent `startJob`.
 
 ### Cancel, Stop, pause, and resume
 
-Cancel and printer Stop send `stopJob` once, only while the live `job` is the unique name of
-the job this companion started, and wait up to 25 seconds for the printer to stop reporting
-it. `stopJob` takes no job id and stops whatever runs on the printer, so Stop is refused for
-work started elsewhere; stop it in Repetier-Server. The live name is checked just before the
-command, but a job the server starts in the moment between that check and `stopJob` would be
+Cancel sends `stopJob` once, only while the live `job` is the unique name of
+the job this companion started, and waits up to 25 seconds for the printer to stop reporting
+it. `stopJob` takes no job id and stops whatever runs on the printer, so printer-level Stop
+is refused; use Cancel for tracked jobs and stop external work in Repetier-Server. The live
+name is checked just before the command, but a job the server starts in the moment between that check and `stopJob` would be
 stopped instead; keep the server's automatic start of the next queued job off for printers
 used with Print. A job that was queued but never ran, for example after a refused `startJob`,
 is cancelled with `removeJob`, which the manual allows only for a job that is not printing,
@@ -1214,6 +1238,8 @@ check on a real Repetier-Server 2.0:
 - whether `stopJob` also stops a paused job, and how `removeJob` replies for a printing job.
 
 ## Elegoo (SDCP)
+
+Controls: `stop` only for resin; none for Centauri. Bed clearance is unavailable for both.
 
 `kind = "elegoo-sdcp"` monitors Elegoo printers that speak SDCP, a JSON protocol over a
 WebSocket. Set `profile` to say which protocol variant the printer uses; there is no default
@@ -1326,7 +1352,7 @@ enclosure temperature appears in `detail`. The notes do not give tick units, so
 Centauri printers are monitoring only. The notes show commands for start, pause, resume, and
 cancel, but there is no vendor contract for their fields, effects, or replies on FDM firmware,
 so Print never sends upload, start, pause, resume, or Stop. Preparation, every confirmation
-challenge except bed clearance, and every action route are refused with an explanation, and
+challenge, and every action route are refused with an explanation, and
 nothing but status requests and keepalives reaches the printer.
 
 Resin printers accept printer-level Stop of the live job, using command 130 from the
@@ -1354,6 +1380,8 @@ learned `Id`, the default ports, how often it pushes status unasked, how `Curren
 example in the notes suggests, and which further status codes the firmware uses.
 
 ## Snapmaker 2.0 and J1/Artisan
+
+Controls: none, including bed clearance, for both kinds.
 
 Print monitors two older Snapmaker families. Both are monitoring only: Print reads status
 and never uploads, starts, pauses, resumes, cancels, or stops a job. Each uses the transport
@@ -1470,7 +1498,7 @@ reply exactly gives the same list.
 Snapmaker's 2.0 description documents only connect, status, and disconnect. The SACP
 documentation leaves the 3D-printing commands unfinished and describes no network pairing.
 Without a published contract for uploads, starts, pauses, resumes, and stops, Print sends
-none of them. Preparation, every confirmation challenge except bed clearance, and every
+none of them. Preparation, every confirmation challenge, and every
 action route are refused with a message saying so, and nothing but the requests above
 reaches the printer. Use the touchscreen or Snapmaker Luban to run jobs.
 
@@ -1518,8 +1546,8 @@ Duet Stop addresses the live file path: a running job is paused with `M25`, the 
 confirmed, and then `M0` is sent. Stop is confirmed when the printer is idle with that file
 reported as the last one processed.
 
-Repetier-Server Stop is available only for the live job this companion started, because
-`stopJob` names no job; it is refused for work started elsewhere. See
+Repetier-Server refuses printer-level Stop because `stopJob` names no job. Use Cancel for
+tracked work and stop external jobs in Repetier-Server. See
 [Repetier-Server](#repetier-server).
 
 Bambu commands use the existing monitoring MQTT connection and match replies by sequence

@@ -1,5 +1,7 @@
 //! Duet control policy exercised only against test-owned loopback servers.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::unreachable)]
+#[path = "helpers/controls.rs"]
+mod controls;
 #[path = "helpers/duet.rs"]
 mod fake;
 #[path = "helpers/slicer.rs"]
@@ -800,4 +802,11 @@ async fn api_action(app: &Router, action: &str, job: Option<&str>, token: u64) {
         app.clone().oneshot(request()).await.unwrap().status(),
         StatusCode::CONFLICT
     );
+}
+
+#[tokio::test]
+async fn api_reports_configured_controls() {
+    let f = Fake::new().await;
+    let (_dir, app) = controls::app(f.config());
+    controls::listed(&app, controls::ALL).await;
 }

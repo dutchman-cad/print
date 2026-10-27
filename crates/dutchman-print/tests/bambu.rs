@@ -1,5 +1,7 @@
 //! LAN monitoring uses only this test's loopback broker and synthetic certificates.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+#[path = "helpers/controls.rs"]
+mod controls;
 #[path = "helpers/bambu.rs"]
 mod fake;
 #[path = "helpers/slicer.rs"]
@@ -216,28 +218,11 @@ filament_profile = "PLA"
         safety.printers().await.unwrap()[0].state,
         PrinterState::Idle
     );
-    machine(&app, "clear", None).await.unwrap();
-    // A terminal report followed by idle between polls still consumes clearance.
-    fake.reports
-        .send(json!({"print":{"gcode_state":"FINISH"}}))
-        .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    fake.reports
-        .send(json!({"print":{"gcode_state":"IDLE"}}))
-        .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    assert_eq!(api_printer(&app).await.needs_clearing, Some(true));
-    machine(&app, "clear", None).await.unwrap();
-    // A second completion without an intervening status poll must also remove clearance.
-    fake.reports
-        .send(json!({"print":{"gcode_state":"FAILED"}}))
-        .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    fake.reports
-        .send(json!({"print":{"gcode_state":"IDLE"}}))
-        .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    assert_eq!(api_printer(&app).await.needs_clearing, Some(true));
+    assert!(machine(&app, "clear", None)
+        .await
+        .unwrap_err()
+        .contains("lan_control"));
+    assert!(api_printer(&app).await.controls.is_empty());
     for (category, name) in [
         ("machine", "Machine"),
         ("process", "Draft"),
@@ -302,7 +287,7 @@ filament_profile = "PLA"
             .oneshot(Request::post(path).body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         let response = app
             .clone()
             .oneshot(
@@ -313,11 +298,11 @@ filament_profile = "PLA"
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("confirmation"));
+        assert!(String::from_utf8_lossy(&body).contains("lan_control"));
     }
     assert_eq!(fake.requests.load(Ordering::SeqCst), 2);
     // Read all fixture metadata so the same helper stays warning-free in both test targets.
@@ -552,6 +537,7 @@ impl Control {
 async fn control_lifecycle_and_finish_consume_clearance() {
     use dutchman_print::backend::JobState;
     let c = Control::new().await;
+    assert_eq!(c.status().await.controls, controls::ALL);
     assert!(c
         .start()
         .await
@@ -1258,4 +1244,70 @@ async fn cleanup_cancelled_failed_and_uploaded_ready_files() {
         assert_eq!(c.ftps.deleted.load(Ordering::SeqCst), 1);
         assert!(c.fake.commands.lock().await.is_empty());
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disabled_controls_refuse_challenges_without_connecting() {
+    let f = Fake::new().await;
+    let config = Config {
+        backend: dutchman_print::config::Backend {
+            kind: "printers".into(),
+            slice: false,
+        },
+        slicer: Some(dutchman_print::slicer::Config {
+            kind: "orcaslicer".into(),
+            path: None,
+            datadir: None,
+            timeout_seconds: 600,
+        }),
+        slicers: Default::default(),
+        printers: vec![dutchman_print::config::Printer {
+            kind: Some("bambu".into()),
+            id: "bambu".into(),
+            name: "Bambu".into(),
+            model: "Synthetic".into(),
+            host: Some("127.0.0.1".into()),
+            port: Some(f.port),
+            serial: Some("TESTSERIAL".into()),
+            printer_profile: Some("Machine".into()),
+            print_profile: Some("Draft".into()),
+            filament_profile: Some("PLA".into()),
+            access_code: Some("test-access".into()),
+            cert_sha256: Some(dutchman_print::safety::hash(f.cert.as_ref())),
+            ..Default::default()
+        }],
+    };
+    let raw = Arc::new(Printers::new(config).unwrap());
+    let (dir, app) = controls::app_backend(raw.clone());
+    let saved = dir.path().join("restored.json");
+    std::fs::write(
+        &saved,
+        json!({"restored": {
+            "job": {"id":"restored", "printer":"bambu", "name":"Synthetic", "state":"ready",
+                "estimate":{}, "progress":null, "seconds_left":null},
+            "path":"synthetic.3mf", "digest":"synthetic", "info":null, "profiles":null,
+            "remote":null, "attempted":true, "filename":"synthetic.gcode.3mf"
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    raw.restore(&saved).await.unwrap();
+    let safety = Safety::new(raw.clone());
+    assert!(safety
+        .start("restored")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("lan_control"));
+    assert!(safety
+        .cancel("restored")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("lan_control"));
+    raw.forget("restored").await.unwrap();
+    controls::unsupported(&app, "bambu", controls::ALL).await;
+    assert_eq!(f.connections.load(Ordering::SeqCst), 0);
+    assert_eq!(f.requests.load(Ordering::SeqCst), 0);
+    controls::listed(&app, &[]).await;
 }

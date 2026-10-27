@@ -195,6 +195,7 @@ impl Backend for Simulated {
                         })
                         .map(|r| &r.job);
                     Printer {
+                        controls: self.controls(&p.id).into_iter().map(String::from).collect(),
                         detail: None,
                         needs_clearing: None,
                         id: p.id.clone(),
@@ -364,6 +365,14 @@ impl Backend for Simulated {
     }
     fn resume<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
         Box::pin(async move { self.change(printer, false) })
+    }
+    fn job_printer<'a>(&'a self, id: &'a str) -> Reply<'a, String> {
+        Box::pin(async move {
+            self.jobs()?
+                .get(id)
+                .map(|r| r.job.printer.clone())
+                .ok_or(Error::NotFound)
+        })
     }
     fn job<'a>(&'a self, job_id: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {

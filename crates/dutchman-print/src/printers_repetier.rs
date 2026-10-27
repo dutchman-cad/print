@@ -60,11 +60,7 @@ impl Printers {
         target: &mut Prepared,
         action: &str,
     ) -> Result<Job, Error> {
-        match action {
-            "pause" => return Err(refuse(crate::repetier::PAUSE)),
-            "resume" => return Err(refuse(crate::repetier::RESUME)),
-            _ => {}
-        }
+        self.check_action(&target.job.printer, action)?;
         let client = self
             .repetier
             .get(&target.job.printer)
@@ -316,11 +312,7 @@ impl Printers {
         printer: &str,
         job: Option<&str>,
     ) -> Result<(), Error> {
-        match action {
-            "pause" => return Err(refuse(crate::repetier::PAUSE)),
-            "resume" => return Err(refuse(crate::repetier::RESUME)),
-            _ => {}
-        }
+        self.check_action(printer, action)?;
         let live = client.snapshot().await?;
         let jobs = self.jobs.lock().await;
         let target = job
@@ -373,39 +365,6 @@ impl Printers {
             if !running && !queued {
                 return Err(refuse("The live job differs from the reviewed job or readiness is unknown. Read fresh status."));
             }
-        }
-        Ok(())
-    }
-    /// Stop is offered only for the live job this companion started, since stopJob cannot
-    /// name a job. The tracked job is reconciled so Stop can find it by its live id.
-    pub(super) async fn review_repetier_stop(
-        &self,
-        client: &crate::repetier::Client,
-        printer: &str,
-    ) -> Result<(), Error> {
-        let live = client.snapshot().await?;
-        let target = self
-            .jobs
-            .lock()
-            .await
-            .values()
-            .find(|p| {
-                p.job.printer == printer
-                    && p.attempted
-                    && matches!(
-                        p.job.state,
-                        JobState::Ready | JobState::Printing | JobState::Paused
-                    )
-                    && live.job.as_deref().is_some_and(|j| named(j, &p.filename))
-            })
-            .cloned();
-        let Some(mut target) = target else {
-            return Err(refuse(crate::repetier::STOP));
-        };
-        self.reconcile_repetier(&mut target).await?;
-        self.publish(&mut target).await?;
-        if target.remote.is_none() || target.remote != live.printer.job_id {
-            return Err(refuse(crate::repetier::STOP));
         }
         Ok(())
     }

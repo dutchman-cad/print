@@ -10,7 +10,7 @@ impl Printers {
         name: &str,
         job_path: Option<&str>,
     ) -> Result<Printer, Error> {
-        self.check_control(printer)?;
+        self.check_action(printer, "stop")?;
         let mut guard = self.machine(printer).await?;
         let live = self.printer(printer).await?;
         if live.job_id.as_deref() != Some(identity)

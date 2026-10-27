@@ -1,5 +1,7 @@
 //! Elegoo SDCP monitoring and resin Stop, exercised only against test-owned loopback servers.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+#[path = "helpers/controls.rs"]
+mod controls;
 #[path = "helpers/elegoo_sdcp.rs"]
 mod fake;
 #[path = "helpers/slicer.rs"]
@@ -566,7 +568,7 @@ async fn resin_prepare_and_start_are_refused() {
         None,
     )
     .await;
-    assert_eq!(code, StatusCode::NOT_FOUND);
+    assert_eq!(code, StatusCode::CONFLICT);
     let response = app
         .clone()
         .oneshot(
@@ -629,4 +631,23 @@ fn config_requires_a_profile_and_no_slicing_fields() {
         .err()
         .unwrap()
         .contains("only for Elegoo SDCP"));
+}
+
+#[tokio::test]
+async fn api_reports_controls_and_refuses_unsupported_actions_without_reads() {
+    for (profile, expected, unsupported) in [
+        (
+            "resin",
+            vec!["stop"],
+            vec!["start", "pause", "resume", "cancel", "clear"],
+        ),
+        ("centauri", vec![], controls::ALL.to_vec()),
+    ] {
+        let f = Fake::new(printing()).await;
+        let (_dir, app) = controls::app(f.config(profile));
+        controls::unsupported(&app, "test", &unsupported).await;
+        assert_eq!(f.machine.lock().await.connections, 0);
+        assert!(f.machine.lock().await.requests.is_empty());
+        controls::listed(&app, &expected).await;
+    }
 }
