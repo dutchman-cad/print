@@ -35,6 +35,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             file.write_all(b"GCDE\0binary")?;
             return Ok(());
         }
+        if let Ok(gcode) = std::fs::read("output.gcode") {
+            file.write_all(&gcode)?;
+            return Ok(());
+        }
         if mode == "missing" {
             writeln!(file, "G1 X0")?;
             return Ok(());

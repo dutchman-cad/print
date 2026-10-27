@@ -86,7 +86,7 @@ impl Printers {
             .map(|p| {
                 if matches!(
                     p.kind.as_deref(),
-                    Some("bambu" | "octoprint" | "moonraker" | "duet")
+                    Some("bambu" | "octoprint" | "moonraker" | "snapmaker-u1" | "duet")
                 ) {
                     Ok(None)
                 } else {
@@ -116,7 +116,7 @@ impl Printers {
         let moonraker = config
             .printers
             .iter()
-            .filter(|p| p.kind.as_deref() == Some("moonraker"))
+            .filter(|p| matches!(p.kind.as_deref(), Some("moonraker" | "snapmaker-u1")))
             .map(|p| crate::moonraker::Client::new(p.clone()).map(|c| (p.id.clone(), Arc::new(c))))
             .collect::<Result<_, _>>()?;
         let duet = config
@@ -2161,6 +2161,9 @@ impl Backend for Printers {
 
 // PrusaSlicer's text output includes the resolved printer setting in its comments.
 fn check_nozzle(bytes: &[u8], info: &Value) -> Result<(), Error> {
+    if let Some(tools) = info.pointer("/info/tools").and_then(Value::as_array) {
+        return crate::moonraker::check_tools(bytes, tools);
+    }
     let mut values = Vec::new();
     for region in [
         bytes.get(..bytes.len().min(256 << 10)),

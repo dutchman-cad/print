@@ -15,6 +15,7 @@ Not released yet. Tested against simulated printers.
 | OctoPrint | `octoprint` | Simulated only | Start, pause, resume, cancel, Stop |
 | Klipper with Moonraker | `moonraker` | Simulated only | Start, pause, resume, cancel, Stop |
 | Duet (RepRapFirmware, standalone) | `duet` | Simulated only | Start, pause, resume, cancel, Stop |
+| Snapmaker U1 | `snapmaker-u1` | Simulated only | Start, pause, resume, cancel, Stop (single-tool jobs) |
 | Bambu Lab in LAN mode | `bambu` | Simulated only | Monitoring; control is experimental and off unless `lan_control = true` |
 
 Every machine action needs a confirmation the server issues for that printer and job, and

@@ -508,19 +508,24 @@ impl Client {
             .ok_or_else(|| {
                 refuse("Machine configuration is missing. Review the printer before preparing.")
             })?;
-        if live
+        let active = live
             .objects
             .pointer("/toolhead/extruder")
-            .and_then(Value::as_str)
-            != Some("extruder")
-            || settings
-                .keys()
-                .any(|k| k.starts_with("extruder") && k != "extruder")
-        {
-            return Err(refuse(
-                "Material slot assignments are unresolved. Use a reviewed single-extruder printer.",
-            ));
-        }
+            .and_then(Value::as_str);
+        let tools = if self.config.kind.as_deref() == Some("snapmaker-u1") {
+            Some(tools(settings, active)?)
+        } else {
+            if active != Some("extruder")
+                || settings
+                    .keys()
+                    .any(|k| k.starts_with("extruder") && k != "extruder")
+            {
+                return Err(refuse(
+                    "Material slot assignments are unresolved. Use a reviewed single-extruder printer.",
+                ));
+            }
+            None
+        };
         let nozzle = settings
             .get("extruder")
             .and_then(|v| v.get("nozzle_diameter"))
@@ -586,7 +591,7 @@ impl Client {
         Ok(
             json!({"endpoint":crate::safety::hash(self.config.url.as_deref().unwrap_or_default().as_bytes()),
             "identity":crate::safety::hash(&serde_json::to_vec(&json!({"hostname":host.get("hostname"),"version":host.get("software_version"),"server":live.server.get("moonraker_version")})).map_err(|_| Error::Unavailable)?),
-            "info":{"nozzle_diameter":nozzle},"configuration":crate::safety::hash(&config),"min":bounds("axis_minimum"),"max":bounds("axis_maximum")}),
+            "info":tools.map_or_else(|| json!({"nozzle_diameter":nozzle}), |t| json!({"tools":t})),"configuration":crate::safety::hash(&config),"min":bounds("axis_minimum"),"max":bounds("axis_maximum")}),
         )
     }
     pub fn resume_commissioned(&self) -> bool {
@@ -616,6 +621,130 @@ impl Client {
             bed_temperature: None,
         }
     }
+}
+/// Snapmaker U1 toolheads: `extruder`, `extruder1`, ... in order, each with its nozzle size.
+fn tools(
+    settings: &serde_json::Map<String, Value>,
+    active: Option<&str>,
+) -> Result<Vec<f64>, Error> {
+    let unresolved =
+        || refuse("Toolhead configuration is incomplete. Review the printer's extruder settings.");
+    let count = settings
+        .keys()
+        .filter(|k| k.starts_with("extruder"))
+        .count();
+    if count == 0 || count > 16 {
+        return Err(unresolved());
+    }
+    let names = (0..count)
+        .map(|i| {
+            if i == 0 {
+                "extruder".to_owned()
+            } else {
+                format!("extruder{i}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let nozzles = names
+        .iter()
+        .map(|name| {
+            settings
+                .get(name)
+                .and_then(|v| v.get("nozzle_diameter"))
+                .and_then(Value::as_f64)
+                .filter(|n| n.is_finite() && *n > 0.0)
+                .ok_or_else(unresolved)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if active.is_none_or(|a| !names.iter().any(|n| n == a)) {
+        return Err(refuse(
+            "The active toolhead is unknown. Read fresh status and review the printer.",
+        ));
+    }
+    Ok(nozzles)
+}
+/// The job must select exactly one installed tool with `T<n>`, sliced for that tool's nozzle.
+/// Loaded material per tool is not reported, so jobs using several tools are refused.
+pub fn check_tools(bytes: &[u8], tools: &[Value]) -> Result<(), Error> {
+    let mut used = std::collections::BTreeSet::new();
+    for line in bytes.split(|b| *b == b'\n') {
+        let code = line.split(|b| *b == b';').next().unwrap_or_default();
+        let Some(word) = code.split(u8::is_ascii_whitespace).find(|w| !w.is_empty()) else {
+            continue;
+        };
+        if word.eq_ignore_ascii_case(b"ACTIVATE_EXTRUDER") {
+            return Err(refuse("Sliced G-code changes tools with ACTIVATE_EXTRUDER, which cannot be checked. Slice with T tool commands."));
+        }
+        if let Some(digits) = word.strip_prefix(b"T").or_else(|| word.strip_prefix(b"t")) {
+            if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) {
+                let tool = std::str::from_utf8(digits)
+                    .ok()
+                    .filter(|d| d.len() <= 3)
+                    .and_then(|d| d.parse::<usize>().ok())
+                    .ok_or_else(|| {
+                        refuse(
+                            "Sliced G-code selects an unknown tool. Slice for an installed tool.",
+                        )
+                    })?;
+                used.insert(tool);
+            }
+        }
+    }
+    let tool = match used.iter().collect::<Vec<_>>().as_slice() {
+        [] => return Err(refuse("Sliced G-code selects no tool. Slice with a Snapmaker U1 profile that selects the print tool.")),
+        [tool] => **tool,
+        many => {
+            let names = many.iter().map(|t| format!("T{t}")).collect::<Vec<_>>().join(", ");
+            return Err(Error::Refused(format!("This job uses tools {names}, but the printer does not report the material loaded in each tool. Slice the job for one tool.")));
+        }
+    };
+    let installed = tools.get(tool).and_then(Value::as_f64).ok_or_else(|| {
+        Error::Refused(format!(
+            "Sliced G-code selects T{tool}, but the printer has {} tools, T0 to T{}. Slice for an installed tool.",
+            tools.len(),
+            tools.len().saturating_sub(1)
+        ))
+    })?;
+    let mut sliced: Option<f64> = None;
+    for region in [
+        bytes.get(..bytes.len().min(256 << 10)),
+        bytes.get(bytes.len().saturating_sub(256 << 10)..),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for line in String::from_utf8_lossy(region).lines() {
+            if let Some(list) = line.trim().strip_prefix("; nozzle_diameter =") {
+                let values = list
+                    .split(',')
+                    .map(|v| v.trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| refuse("Cannot verify the sliced nozzle diameters. Export text G-code with its settings comments."))?;
+                let value = values
+                    .get(tool)
+                    .or(values.first().filter(|_| values.len() == 1))
+                    .copied()
+                    .ok_or_else(|| {
+                        Error::Refused(format!(
+                            "Sliced settings list no nozzle diameter for T{tool}. Prepare again."
+                        ))
+                    })?;
+                if sliced.is_some_and(|old| (old - value).abs() > 0.0001) {
+                    return Err(refuse(
+                        "Sliced nozzle settings disagree. Prepare and review again.",
+                    ));
+                }
+                sliced = Some(value);
+            }
+        }
+    }
+    let sliced = sliced.ok_or_else(|| {
+        refuse("Sliced nozzle diameter is missing. Export text G-code with its settings comments.")
+    })?;
+    if (installed - sliced).abs() > 0.0001 {
+        return Err(Error::Refused(format!("T{tool} nozzle is {installed} mm; sliced profile requires {sliced} mm. Fit the matching nozzle or slice with the matching profile.")));
+    }
+    Ok(())
 }
 fn result(bytes: &[u8]) -> Result<Value, Error> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| Error::Unavailable)?;

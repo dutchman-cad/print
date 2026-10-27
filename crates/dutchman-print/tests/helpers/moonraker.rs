@@ -46,6 +46,8 @@ pub struct Machine {
     pub delay_reads: usize,
     pub pending_state: Option<String>,
     pub upload_lost: bool,
+    pub toolheads: usize,
+    pub active_tool: String,
 }
 pub struct Shared {
     pub machine: Mutex<Machine>,
@@ -109,7 +111,23 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
             json!({"state":m.klippy,"hostname":m.identity,"software_version":m.firmware})
         }
         ("GET", "/printer/objects/list") => {
-            json!({"objects":["webhooks","print_stats","virtual_sdcard","display_status","extruder","heater_bed","toolhead","configfile","pause_resume","mcu"]})
+            let mut objects = vec![
+                "webhooks",
+                "print_stats",
+                "virtual_sdcard",
+                "display_status",
+                "extruder",
+                "heater_bed",
+                "toolhead",
+                "configfile",
+                "pause_resume",
+                "mcu",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+            objects.extend((1..m.toolheads).map(|i| format!("extruder{i}")));
+            json!({"objects":objects})
         }
         ("GET", "/server/history/list") => {
             json!({"jobs":if m.id.is_some(){vec![json!({"job_id":m.id,"start_time":m.history_time})]}else{vec![]}})
@@ -129,12 +147,17 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
             } else if m.partial {
                 json!({"eventtime":1,"status":{"heater_bed":{"temperature":59}}})
             } else {
-                json!({"eventtime":1,"status":{"webhooks":{"state":m.webhook,"state_message":"secret http://private.invalid"},
+                let mut status = json!({"webhooks":{"state":m.webhook,"state_message":"secret http://private.invalid"},
                 "print_stats":{"state":m.state,"filename":m.name,"print_duration":20,"message":"secret http://private.invalid"},
                 "virtual_sdcard":{"is_active":m.active.unwrap_or(m.state=="printing"),"progress":m.progress},
                 "display_status":{"progress":m.progress},"extruder":{"temperature":201.5},"heater_bed":{"temperature":59},
                 "toolhead":{"extruder":"extruder","axis_minimum":[0,0,0,0],"axis_maximum":[180,180,180,0]},
-                "mcu":{"mcu_version":m.mcu_version},"configfile":{"settings":m.settings,"config":m.config},"pause_resume":{"is_paused":m.state=="paused"}}})
+                "mcu":{"mcu_version":m.mcu_version},"configfile":{"settings":m.settings,"config":m.config},"pause_resume":{"is_paused":m.state=="paused"}});
+                status["toolhead"]["extruder"] = json!(m.active_tool);
+                for i in 1..m.toolheads {
+                    status[format!("extruder{i}")] = json!({"temperature":200.0 + i as f64});
+                }
+                json!({"eventtime":1,"status":status})
             }
         }
         ("GET", "/server/files/metadata") => {
@@ -190,7 +213,12 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
                 m.state = if m.hold_start { "paused" } else { "printing" }.into();
             }
             if !m.stale_history {
-                m.id = Some("000001".into());
+                let next =
+                    m.id.as_deref()
+                        .and_then(|i| i.parse::<u32>().ok())
+                        .unwrap_or(0)
+                        + 1;
+                m.id = Some(format!("{next:06}"));
                 m.history_state = "in_progress".into();
             }
             if m.lost {
@@ -274,6 +302,8 @@ impl Fake {
                 delay_reads: 0,
                 pending_state: None,
                 upload_lost: false,
+                toolheads: 1,
+                active_tool: "extruder".into(),
             }),
             entered: Notify::new(),
             release: Notify::new(),
