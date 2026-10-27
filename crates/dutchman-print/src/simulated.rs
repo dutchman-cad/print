@@ -37,21 +37,23 @@ pub struct Simulated {
     printers: Vec<crate::config::Printer>,
     jobs: Mutex<BTreeMap<String, Running>>,
     clock: Arc<dyn Clock>,
-    slicer: Option<crate::slicer::Slicer>,
+    slicers: BTreeMap<String, crate::slicer::Slicer>,
 }
 
 impl Simulated {
     pub fn new(config: crate::config::Config, clock: Arc<dyn Clock>) -> Result<Self, String> {
         config.validate()?;
-        let slicer = if config.backend.slice {
-            Some(crate::slicer::Slicer::new(
-                config.slicer.clone().ok_or("Set [slicer].")?,
-            )?)
-        } else {
-            None
-        };
+        let mut slicers = BTreeMap::new();
+        if config.backend.slice {
+            for printer in &config.printers {
+                slicers.insert(
+                    printer.id.clone(),
+                    crate::slicer::Slicer::new(config.slicer_for(printer)?.clone())?,
+                );
+            }
+        }
         Ok(Self {
-            slicer,
+            slicers,
             printers: config.printers,
             jobs: Mutex::new(BTreeMap::new()),
             clock,
@@ -211,7 +213,7 @@ impl Backend for Simulated {
                 .iter()
                 .find(|p| p.id == printer)
                 .ok_or(Error::NotFound)?;
-            let estimate = if let Some(slicer) = &self.slicer {
+            let estimate = if let Some(slicer) = self.slicers.get(printer) {
                 slicer
                     .prepare(input, profile, &options, crate::slicer::OutputKind::Gcode)
                     .await

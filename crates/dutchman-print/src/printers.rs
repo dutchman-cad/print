@@ -25,8 +25,9 @@ struct Prepared {
 }
 pub struct Printers {
     configs: Vec<crate::config::Printer>,
-    clients: Vec<Arc<Client>>,
-    slicer: crate::slicer::Config,
+    clients: Vec<Option<Arc<Client>>>,
+    bambu: BTreeMap<String, Arc<crate::bambu::Client>>,
+    slicers: BTreeMap<String, crate::slicer::Config>,
     jobs: Mutex<BTreeMap<String, Prepared>>,
     store: Option<PathBuf>,
 }
@@ -47,18 +48,43 @@ fn ready(snapshot: &Snapshot) -> Result<(), Error> {
 }
 impl Printers {
     pub fn new(config: crate::config::Config) -> Result<Self, String> {
+        Self::build(config, false)
+    }
+    pub fn one_shot(config: crate::config::Config) -> Result<Self, String> {
+        Self::build(config, true)
+    }
+    fn build(config: crate::config::Config, oneshot: bool) -> Result<Self, String> {
         config.validate()?;
         let clients = config
             .printers
             .iter()
             .cloned()
-            .map(|p| Client::new(p).map(Arc::new))
+            .map(|p| {
+                if p.kind.as_deref() == Some("bambu") {
+                    Ok(None)
+                } else {
+                    Client::new(p).map(|c| Some(Arc::new(c)))
+                }
+            })
             .collect::<Result<_, _>>()?;
-        let slicer = config.slicer.ok_or("Set [slicer].")?;
+        let bambu = config
+            .printers
+            .iter()
+            .filter(|p| p.kind.as_deref() == Some("bambu"))
+            .map(|p| {
+                crate::bambu::Client::new(p.clone(), oneshot).map(|c| (p.id.clone(), Arc::new(c)))
+            })
+            .collect::<Result<_, _>>()?;
+        let slicers = config
+            .printers
+            .iter()
+            .map(|p| config.slicer_for(p).map(|s| (p.id.clone(), s.clone())))
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             configs: config.printers,
             clients,
-            slicer,
+            bambu,
+            slicers,
             jobs: Mutex::new(BTreeMap::new()),
             store: None,
         })
@@ -108,7 +134,7 @@ impl Printers {
             .iter()
             .position(|p| p.id == printer)
             .and_then(|i| self.clients.get(i))
-            .map(Arc::as_ref)
+            .and_then(Option::as_deref)
             .ok_or(Error::NotFound)
     }
     async fn review_info(&self, client: &Client) -> Result<Value, Error> {
@@ -161,6 +187,9 @@ impl Printers {
         Ok(snapshot)
     }
     async fn control(&self, printer: &str, action: &str, expected: JobState) -> Result<Job, Error> {
+        if self.bambu.contains_key(printer) {
+            return Err(crate::bambu::unsupported());
+        }
         let live = self.client(printer)?.snapshot().await?;
         let mut jobs = self.jobs.lock().await;
         let target = jobs
@@ -250,19 +279,42 @@ impl Printers {
     }
 }
 impl Backend for Printers {
+    fn check_control(&self, printer: &str) -> Result<(), Error> {
+        if self.bambu.contains_key(printer) {
+            Err(crate::bambu::unsupported())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn latches_terminal_reports(&self, printer: &str) -> bool {
+        self.bambu.contains_key(printer)
+    }
+    fn clear<'a>(&'a self, id: &'a str) -> Reply<'a, ()> {
+        Box::pin(async move {
+            if let Some(client) = self.bambu.get(id) {
+                client.acknowledge();
+            }
+            Ok(())
+        })
+    }
     fn printers(&self) -> Reply<'_, Vec<Printer>> {
         Box::pin(async {
             let mut tasks = tokio::task::JoinSet::new();
-            for (index, client) in self.clients.iter().cloned().enumerate() {
-                tasks.spawn(async move {
-                    (
-                        index,
-                        match client.snapshot().await {
-                            Ok(s) => s.printer,
-                            Err(error) => client.offline(&error),
-                        },
-                    )
-                });
+            for (index, config) in self.configs.iter().enumerate() {
+                if let Some(client) = self.bambu.get(&config.id).cloned() {
+                    tasks.spawn(async move { (index, client.snapshot().await) });
+                } else if let Some(client) = self.clients.get(index).and_then(Clone::clone) {
+                    tasks.spawn(async move {
+                        (
+                            index,
+                            match client.snapshot().await {
+                                Ok(s) => s.printer,
+                                Err(e) => client.offline(&e),
+                            },
+                        )
+                    });
+                }
             }
             let mut printers = BTreeMap::new();
             while let Some(result) = tasks.join_next().await {
@@ -270,16 +322,10 @@ impl Backend for Printers {
                     printers.insert(index, printer);
                 }
             }
-            Ok(self
-                .clients
-                .iter()
-                .enumerate()
-                .map(|(index, client)| {
-                    printers
-                        .remove(&index)
-                        .unwrap_or_else(|| client.offline(&Error::Unavailable))
-                })
-                .collect())
+            if printers.len() != self.configs.len() {
+                return Err(Error::Unavailable);
+            }
+            Ok(printers.into_values().collect())
         })
     }
     fn prepare<'a>(
@@ -312,13 +358,66 @@ impl Backend for Printers {
                     return Err(Error::Refused(format!("The {label} profile differs from this printer's configured profile. Review its configuration first.")));
                 }
             }
+            if let Some(client) = self.bambu.get(printer) {
+                let status = client.snapshot().await;
+                if status.state == crate::backend::PrinterState::Offline {
+                    return Err(Error::Unavailable);
+                }
+                let slicer = crate::slicer::Slicer::new(
+                    self.slicers.get(printer).ok_or(Error::NotFound)?.clone(),
+                )
+                .map_err(|_| {
+                    Error::Failed(
+                        "Cannot find OrcaSlicer. Set slicer.path to its executable.".into(),
+                    )
+                })?;
+                let output = slicer
+                    .prepare(path, profile, &options, crate::slicer::OutputKind::ThreeMf)
+                    .await
+                    .map_err(|_| {
+                        Error::Failed(
+                            "Cannot slice this job. Check the configured OrcaSlicer profiles."
+                                .into(),
+                        )
+                    })?;
+                let bytes = file_bytes(&output.path).await?;
+                let mut jobs = self.jobs.lock().await;
+                if jobs.len() >= 5000 || jobs.contains_key(id) {
+                    return Err(refuse("Job storage is full or this id is already in use."));
+                }
+                jobs.insert(
+                    id.into(),
+                    Prepared {
+                        job: Job {
+                            id: id.into(),
+                            printer: printer.into(),
+                            name: options.name.unwrap_or_else(|| "Print job".into()),
+                            state: JobState::Ready,
+                            estimate: output.estimate.clone(),
+                            progress: None,
+                            seconds_left: None,
+                        },
+                        path: output.path,
+                        digest: hash(&bytes),
+                        info: Value::Null,
+                        remote: None,
+                        attempted: false,
+                        filename: "sliced.3mf".into(),
+                        profiles: self.profiles(printer)?,
+                    },
+                );
+                return Ok(output.estimate);
+            }
             let client = self.client(printer)?;
             client.snapshot().await?;
             let info = self.review_info(client).await?;
             if info.pointer("/info/mmu").and_then(Value::as_bool) != Some(false) {
                 return Err(refuse("Material slot assignments are not supported yet. Use a commissioned single-material printer."));
             }
-            let slicer = crate::slicer::Slicer::new(self.slicer.clone()).map_err(|_| {
+            let slicer = crate::slicer::Slicer::new(
+                self.slicers.get(printer).ok_or(Error::NotFound)?.clone(),
+            )
+            .map_err(|_| {
                 Error::Failed("Cannot find PrusaSlicer. Set slicer.path to its executable.".into())
             })?;
             let output = slicer
@@ -369,6 +468,9 @@ impl Backend for Printers {
         Box::pin(async move {
             let mut jobs = self.jobs.lock().await;
             let target = jobs.get_mut(id).ok_or(Error::NotFound)?;
+            if self.bambu.contains_key(&target.job.printer) {
+                return Err(crate::bambu::unsupported());
+            }
             if target.attempted || target.job.state != JobState::Ready {
                 return Err(refuse("Start was already attempted. Read status and reconcile the intended file and job; do not repeat Start."));
             }
@@ -479,6 +581,9 @@ impl Backend for Printers {
         Box::pin(async move {
             let mut jobs = self.jobs.lock().await;
             let target = jobs.get_mut(id).ok_or(Error::NotFound)?;
+            if self.bambu.contains_key(&target.job.printer) {
+                return Err(crate::bambu::unsupported());
+            }
             if !target.attempted && target.job.state == JobState::Ready {
                 target.job.state = JobState::Cancelled;
                 return Ok(target.job.clone());

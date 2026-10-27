@@ -1,6 +1,7 @@
 //! Backend-neutral printing companion. See `docs/print.md`.
 
 pub mod backend;
+pub mod bambu;
 pub mod config;
 pub mod printers;
 pub mod prusalink;

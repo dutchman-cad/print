@@ -210,6 +210,7 @@ async fn simulated_backend_slices_when_enabled() {
             slice: true,
         },
         slicer: Some(config(&dir, "prusaslicer")),
+        slicers: Default::default(),
         printers: vec![printer()],
     };
     let backend = dutchman_print::simulated::Simulated::new(
@@ -333,5 +334,85 @@ async fn slicer_refuses_option_like_profiles_before_running() {
                 assert!(!dir.path().join("started").exists());
             }
         }
+    }
+}
+
+#[test]
+fn named_slicer_resolution_errors_and_shorthand() {
+    let mut cfg: dutchman_print::config::Config = toml::from_str(
+        "[backend]\nkind='simulated'\nslice=true\n[slicers.prusa]\nkind='prusaslicer'\n[slicers.orca]\nkind='orcaslicer'\n",
+    ).unwrap();
+    let mut p = printer();
+    p.kind = Some("prusalink".into());
+    assert_eq!(cfg.slicer_for(&p).unwrap().kind, "prusaslicer");
+    p.kind = Some("bambu".into());
+    assert_eq!(cfg.slicer_for(&p).unwrap().kind, "orcaslicer");
+    cfg.slicers
+        .insert("other".into(), cfg.slicers["orca"].clone());
+    assert!(cfg.slicer_for(&p).err().unwrap().contains("ambiguous"));
+    p.slicer = Some("orca".into());
+    assert_eq!(cfg.slicer_for(&p).unwrap().kind, "orcaslicer");
+    p.slicer = Some("prusa".into());
+    assert!(cfg
+        .slicer_for(&p)
+        .err()
+        .unwrap()
+        .contains("requires orcaslicer"));
+    p.slicer = Some("absent".into());
+    assert!(cfg.slicer_for(&p).err().unwrap().contains("unknown slicer"));
+    p.slicer = None;
+    cfg.slicers.remove("orca");
+    cfg.slicers.remove("other");
+    assert!(cfg
+        .slicer_for(&p)
+        .err()
+        .unwrap()
+        .contains("needs a slicer of kind orcaslicer"));
+    cfg.slicer = Some(cfg.slicers["prusa"].clone());
+    assert!(dutchman_print::simulated::Simulated::new(
+        cfg,
+        Arc::new(dutchman_print::simulated::SystemClock::default())
+    )
+    .err()
+    .unwrap()
+    .contains("not both"));
+}
+
+#[tokio::test]
+async fn simulated_mixed_slicers_prepare_independently() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut cfg: dutchman_print::config::Config =
+        toml::from_str("[backend]\nkind='simulated'\nslice=true\n").unwrap();
+    let mut inputs = Vec::new();
+    for (id, kind, slicer_kind) in [
+        ("mini", "prusalink", "prusaslicer"),
+        ("a1", "bambu", "orcaslicer"),
+    ] {
+        let dir = root.join(id);
+        std::fs::create_dir(&dir).unwrap();
+        inputs.push(input(&dir));
+        expected(&dir, slicer_kind);
+        cfg.slicers.insert(id.into(), config(&dir, slicer_kind));
+        let mut p = printer();
+        p.id = id.into();
+        p.kind = Some(kind.into());
+        cfg.printers.push(p);
+    }
+    let backend = dutchman_print::simulated::Simulated::new(
+        cfg,
+        Arc::new(dutchman_print::simulated::SystemClock::default()),
+    )
+    .unwrap();
+    for (id, input) in ["mini", "a1"].into_iter().zip(inputs) {
+        assert_eq!(
+            backend
+                .prepare(id, &input, id, options())
+                .await
+                .unwrap()
+                .seconds,
+            Some(123)
+        );
+        assert!(root.join(id).join("started").is_file());
     }
 }

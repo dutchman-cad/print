@@ -179,3 +179,9 @@ backend addresses. Clients branch on status codes rather than matching message t
 
 Capacity and storage limits may vary between implementations. Retry transient failures
 later; a machine action retry requires another confirmation and a fresh header value.
+
+Slicer selection belongs to the companion's private configuration: named
+`[slicers.<name>]` tables and each printer's optional `slicer` name determine preparation.
+The API does not accept a slicer override. Certificate enrollment uses the standalone
+`dutchman-print fingerprint <printer> [--json]` command described in
+[the companion guide](print.md#bambu-lab-lan-monitoring); it adds no HTTP route.

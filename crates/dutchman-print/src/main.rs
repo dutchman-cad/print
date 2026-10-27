@@ -35,6 +35,12 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Read a Bambu TLS certificate without MQTT login or changing config.
+    Fingerprint {
+        printer: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Prepare a 3MF and ask before starting it.
     Print {
         file: PathBuf,
@@ -112,6 +118,34 @@ async fn main() -> ExitCode {
 }
 async fn run(args: Args) -> Result<(), String> {
     let path = args.config.map(Ok).unwrap_or_else(config::default_path)?;
+    if let Command::Fingerprint { printer, json } = &args.command {
+        let config = config::Config::load_for_fingerprint(&path, printer)?;
+        let p = config
+            .printers
+            .iter()
+            .find(|p| &p.id == printer)
+            .ok_or("Choose a configured Bambu printer id.")?;
+        if config.backend.kind != "printers" || p.kind.as_deref() != Some("bambu") {
+            return Err(
+                "Fingerprint requires a configured Bambu printer in the printers backend.".into(),
+            );
+        }
+        let report = dutchman_print::bambu::fingerprint(p).await?;
+        if *json {
+            output(&report)?;
+        } else {
+            println!(
+                "SHA-256: {}\nSubject: {}\nIssuer: {}\nValid from: {}\nValid until: {}\n{}",
+                report.cert_sha256,
+                report.subject,
+                report.issuer,
+                report.not_before,
+                report.not_after,
+                report.instruction
+            );
+        }
+        return Ok(());
+    }
     let config = config::Config::load(&path)?;
     let data_dir = args
         .data_dir
@@ -359,7 +393,7 @@ async fn command(command: Command, backend: &dyn Backend, data: &Path) -> Result
                 dutchman_print::log_action("resume", &job);
                 output(&job).map_err(dutchman_print::backend::Error::Failed)?;
             }
-            Command::Printers { .. } | Command::Serve { .. } => {}
+            Command::Printers { .. } | Command::Serve { .. } | Command::Fingerprint { .. } => {}
         }
         Ok(())
     }
@@ -465,7 +499,11 @@ async fn real_commands(
     config_path: &Path,
 ) -> Result<(), String> {
     let state = state_path(data, config_path)?.with_extension("printers.json");
-    let backend = dutchman_print::printers::Printers::new(config)?;
+    let backend = if matches!(cmd, Command::Serve { .. }) {
+        dutchman_print::printers::Printers::new(config)?
+    } else {
+        dutchman_print::printers::Printers::one_shot(config)?
+    };
     if let Command::Printers { json } = cmd {
         if data.exists() {
             dutchman_serve::prepare_data_dir(data)

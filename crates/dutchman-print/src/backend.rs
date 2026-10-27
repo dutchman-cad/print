@@ -145,6 +145,15 @@ pub struct Job {
 
 /// Errors must be safe to show to callers, without credentials or backend addresses.
 pub trait Backend: Send + Sync {
+    /// Reject unavailable control before applying readiness checks.
+    fn check_control(&self, _printer: &str) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Whether clear acknowledges a terminal-report latch, rather than a persistent live state.
+    fn latches_terminal_reports(&self, _printer: &str) -> bool {
+        false
+    }
     /// Backend bookkeeping after the shared safety policy accepts bed acknowledgement.
     fn clear<'a>(&'a self, _printer: &'a str) -> Reply<'a, ()> {
         Box::pin(async { Ok(()) })

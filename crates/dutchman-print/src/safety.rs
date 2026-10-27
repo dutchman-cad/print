@@ -16,6 +16,8 @@ struct State {
     cleared: HashMap<String, bool>,
     reviews: HashMap<String, Review>,
     #[serde(default)]
+    terminal_seen: HashMap<String, bool>,
+    #[serde(default)]
     observed: HashMap<String, (Option<String>, Option<String>)>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -119,7 +121,15 @@ impl Safety {
         for printer in printers {
             let observation = (printer.job_id.clone(), printer.detail.clone());
             let terminal_changed = printer.needs_clearing == Some(true)
-                && state.observed.get(&printer.id) != Some(&observation);
+                && (state.observed.get(&printer.id) != Some(&observation)
+                    || !state
+                        .terminal_seen
+                        .get(&printer.id)
+                        .copied()
+                        .unwrap_or(false));
+            state
+                .terminal_seen
+                .insert(printer.id.clone(), printer.needs_clearing == Some(true));
             state.observed.insert(printer.id.clone(), observation);
             let cleared = state.cleared.entry(printer.id.clone()).or_insert(false);
             if printer.state != PrinterState::Idle || terminal_changed {
@@ -157,6 +167,9 @@ impl Backend for Safety {
                 )));
             }
             self.inner.clear(id).await?;
+            if self.inner.latches_terminal_reports(id) {
+                state.terminal_seen.insert(id.into(), false);
+            }
             state.cleared.insert(id.into(), true);
             self.checkpoint(&state).await
         })
@@ -186,6 +199,7 @@ impl Backend for Safety {
         Box::pin(async move {
             let mut state = self.state.lock().await;
             let job = self.inner.job(id).await?;
+            self.inner.check_control(&job.printer)?;
             if job.state != JobState::Ready {
                 return Err(Error::Refused(
                     "Only a ready job can be started. Read status to reconcile it.".into(),
@@ -239,6 +253,7 @@ impl Backend for Safety {
             }
             let mut state = self.state.lock().await;
             let before = self.inner.job(id).await?;
+            self.inner.check_control(&before.printer)?;
             if before.state == JobState::Cancelled {
                 return Ok(before);
             }
@@ -251,6 +266,7 @@ impl Backend for Safety {
     }
     fn pause<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {
+            self.inner.check_control(printer)?;
             let mut state = self.state.lock().await;
             let p = self.fresh(&mut state, printer).await?;
             if p.state != PrinterState::Printing {
@@ -263,6 +279,7 @@ impl Backend for Safety {
     }
     fn resume<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {
+            self.inner.check_control(printer)?;
             let mut state = self.state.lock().await;
             let p = self.fresh(&mut state, printer).await?;
             if p.state != PrinterState::Paused || p.detail.as_deref().is_some_and(|s| s != "PAUSED")

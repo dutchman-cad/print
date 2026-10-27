@@ -1,6 +1,6 @@
 //! Printer settings. Secrets are never serializable or included in diagnostics.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +14,8 @@ pub const MAX_PRINTERS: usize = 64;
 pub struct Config {
     pub backend: Backend,
     pub slicer: Option<crate::slicer::Config>,
+    #[serde(default)]
+    pub slicers: BTreeMap<String, crate::slicer::Config>,
     #[serde(default)]
     pub printers: Vec<Printer>,
 }
@@ -30,7 +32,14 @@ pub struct Backend {
 #[serde(deny_unknown_fields)]
 pub struct Printer {
     pub kind: Option<String>,
+    pub slicer: Option<String>,
     pub url: Option<String>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub serial: Option<String>,
+    pub access_code: Option<String>,
+    pub ca_file: Option<PathBuf>,
+    pub cert_sha256: Option<String>,
     pub api_key: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
@@ -45,6 +54,15 @@ pub struct Printer {
 impl Config {
     /// Reads only the selected file, refusing exposed secrets before reading its contents.
     pub fn load(path: &Path) -> Result<Self, String> {
+        Self::load_mode(path, None)
+    }
+
+    /// Enrollment permits absent trust only for the named Bambu printer.
+    pub fn load_for_fingerprint(path: &Path, printer: &str) -> Result<Self, String> {
+        Self::load_mode(path, Some(printer))
+    }
+
+    fn load_mode(path: &Path, enrollment: Option<&str>) -> Result<Self, String> {
         let file = std::fs::File::open(path)
             .map_err(|err| format!("Cannot open config {}: {err}", path.display()))?;
         let metadata = file
@@ -74,11 +92,15 @@ impl Config {
         let text = std::str::from_utf8(&bytes).map_err(|_| "Config must be UTF-8 TOML.")?;
         let config: Self = toml::from_str(text)
             .map_err(|_| "Cannot read config TOML. Check the printer fields in docs/print.md.")?;
-        config.validate()?;
+        config.validate_mode(enrollment)?;
         Ok(config)
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
+        self.validate_mode(None)
+    }
+
+    fn validate_mode(&self, enrollment: Option<&str>) -> Result<(), String> {
         if self.printers.len() > MAX_PRINTERS {
             return Err("Use at most 64 printers in the config.".into());
         }
@@ -88,24 +110,38 @@ impl Config {
                 self.backend.kind
             ));
         }
+        if self.slicer.is_some() && !self.slicers.is_empty() {
+            return Err(
+                "Use either [slicer] shorthand or [slicers.<name>] tables, not both.".into(),
+            );
+        }
+        if self.slicers.len() > 64 {
+            return Err("Use at most 64 slicers.".into());
+        }
+        for slicer in self.slicers.values() {
+            slicer.validate()?;
+        }
         if let Some(slicer) = &self.slicer {
             slicer.validate()?;
         }
-        if self.backend.slice && self.slicer.is_none() {
-            return Err("Set [slicer] when backend.slice is true.".into());
-        }
-        if self.backend.kind == "printers"
-            && self.slicer.as_ref().is_none_or(|s| s.kind != "prusaslicer")
-        {
-            return Err("PrusaLink requires [slicer] kind = prusaslicer.".into());
+        if self.backend.slice && self.slicer.is_none() && self.slicers.is_empty() {
+            return Err("Set [slicers.<name>] or [slicer] when backend.slice is true.".into());
         }
         let mut ids = HashSet::new();
         for printer in &self.printers {
             if self.backend.kind == "printers" {
-                if printer.kind.as_deref() != Some("prusalink") {
-                    return Err("Set each printer kind to prusalink.".into());
+                match printer.kind.as_deref() {
+                    Some("prusalink") => {
+                        crate::prusalink::validate(printer)?;
+                    }
+                    Some("bambu") => {
+                        crate::bambu::validate_enrollment(
+                            printer,
+                            enrollment == Some(printer.id.as_str()),
+                        )?;
+                    }
+                    _ => return Err("Set each printer kind to prusalink or bambu.".into()),
                 }
-                crate::prusalink::validate(printer)?;
                 if [
                     &printer.printer_profile,
                     &printer.print_profile,
@@ -115,10 +151,12 @@ impl Config {
                 .any(|p| p.is_none())
                 {
                     return Err(
-                        "Set printer, print, and filament profiles for each PrusaLink printer."
-                            .into(),
+                        "Set printer, print, and filament profiles for each printer.".into(),
                     );
                 }
+            }
+            if self.backend.kind == "printers" || self.backend.slice {
+                self.slicer_for(printer)?;
             }
             for name in [
                 &printer.printer_profile,
@@ -151,6 +189,43 @@ impl Config {
             }
         }
         Ok(())
+    }
+    /// Resolves an explicit name or the sole compatible slicer.
+    pub fn slicer_for(&self, printer: &Printer) -> Result<&crate::slicer::Config, String> {
+        let kind = match printer.kind.as_deref() {
+            Some("prusalink") => Some("prusaslicer"),
+            Some("bambu") => Some("orcaslicer"),
+            _ => None,
+        };
+        let selected = if let Some(name) = &printer.slicer {
+            self.slicers.get(name).ok_or_else(|| format!(
+                "Printer {} names an unknown slicer. Add [slicers.<name>] or change its slicer name.", printer.id
+            ))?
+        } else {
+            let mut candidates = self
+                .slicer
+                .iter()
+                .chain(self.slicers.values())
+                .filter(|s| kind.is_none_or(|k| s.kind == k));
+            let first = candidates.next().ok_or_else(|| format!(
+                "Printer {} needs a slicer of kind {}. Add [slicers.<name>] and select it with slicer.", printer.id, kind.unwrap_or("configured")
+            ))?;
+            if candidates.next().is_some() {
+                return Err(format!(
+                    "Printer {} has ambiguous slicer choices. Set its slicer to a configured name.",
+                    printer.id
+                ));
+            }
+            first
+        };
+        if kind.is_some_and(|k| selected.kind != k) {
+            return Err(format!(
+                "Printer {} requires {}. Choose a slicer of that kind.",
+                printer.id,
+                kind.unwrap_or_default()
+            ));
+        }
+        Ok(selected)
     }
 }
 

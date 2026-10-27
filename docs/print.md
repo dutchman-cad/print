@@ -3,7 +3,7 @@
 Dutchman Print is a local print companion for SolidCraft and a standalone command line.
 A backend prepares 3MF files, estimates jobs, and controls printers. The included
 `simulated` backend is a demo: it contacts no printers and can optionally run a local slicer.
-The `printers` backend supports individually configured local PrusaLink printers.
+The `printers` backend supports individually configured local PrusaLink and Bambu printers.
 
 Build `dutchman-print` from this checkout with Rust 1.88 or newer:
 
@@ -80,7 +80,15 @@ plain text without control characters and cannot start with `-`. This applies to
 CLI flags, and both API upload forms; refusal says "Profile names can't start with '-'."
 Job names are metadata only; uploaded files and slicer outputs use companion-built paths.
 Unknown slicer kinds produce an error naming the kind.
-`slice = true` requires `[slicer]`; without it the simulator keeps its size-based estimates.
+Configure slicers with `[slicers.<name>]` tables, each containing `kind`, optional `path`,
+optional `datadir`, and `timeout_seconds`. Set each printer's `slicer = "<name>"` to choose
+one. Without a name, Dutchman selects the only slicer of the required kind: PrusaLink needs
+`prusaslicer`, Bambu needs `orcaslicer`. Missing or ambiguous choices are refused.
+The simulator with `slice = true` uses the same per-printer selection; a simulated printer
+without a kind can use the only configured slicer, or select one explicitly.
+`[slicer]` remains a single-slicer shorthand; it cannot be combined with named slicers,
+and printers using it omit `slicer`. Without `slice = true`, the simulator keeps its
+size-based estimates.
 
 An explicit `path` takes precedence and disables executable discovery. Otherwise Dutchman
 searches each `PATH` directory in order: `prusa-slicer-console`, `prusa-slicer`, then
@@ -421,3 +429,102 @@ Standalone CLI commands save jobs and safety checks in the private data folder, 
 from the running service. Use the service API to control service jobs. The CLI records bed
 consumption and its attempted Start before sending it, so a restart cannot silently retry it.
 The service starts with no bed clearance after a restart.
+
+## Bambu Lab LAN monitoring
+
+Bambu printers support status monitoring and local preparation with OrcaSlicer. Upload,
+Start, pause, resume, and cancel are not supported yet, including cancellation of a prepared
+Bambu job. Preparation produces a sliced 3MF containing plate G-code and returns its
+estimates; it sends no file to the printer. No account or cloud connection is used.
+
+Enable LAN mode using Bambu's [LAN setup instructions](https://wiki.bambulab.com/en/knowledge-sharing/enable-lan-mode).
+Find the LAN access code in the printer's LAN/network settings. Find the serial number on
+the printer's identification label or its device information screen; enter the printer
+serial, not its display name. Menus depend on model and firmware. Bambu's
+[Developer Mode announcement](https://blog.bambulab.com/updates-and-third-party-integration-with-bambu-connect/)
+explains that newer authorization firmware may require manually enabling Developer Mode
+to expose MQTT. Availability depends on model and firmware. Monitoring permission does
+not establish control permission.
+
+```toml
+[backend]
+kind = "printers"
+
+[slicers.prusa]
+kind = "prusaslicer"
+# path = "/path/to/prusa-slicer"
+
+[slicers.orca]
+kind = "orcaslicer"
+# path = "/path/to/orca-slicer"
+# datadir = "/path/to/OrcaSlicer"
+timeout_seconds = 600
+
+[[printers]]
+kind = "prusalink"
+slicer = "prusa"
+id = "mini"
+name = "Workbench MINI"
+model = "Original Prusa MINI+"
+url = "http://mini.local"
+api_key = "REPLACE_WITH_PRUSALINK_API_KEY"
+printer_profile = "Original Prusa MINI & MINI+"
+print_profile = "0.20mm QUALITY @MINI"
+filament_profile = "Generic PLA @MINI"
+
+[[printers]]
+kind = "bambu"
+slicer = "orca"
+id = "bambu"
+name = "Workbench Bambu"
+model = "Bambu Lab A1"
+host = "printer.local"
+# port = 8883 # Optional MQTT TLS port; defaults to 8883.
+serial = "REPLACE_WITH_PRINTER_SERIAL"
+access_code = "REPLACE_WITH_LAN_ACCESS_CODE"
+ca_file = "/path/to/trusted-bambu-ca.pem"
+# Alternatively remove ca_file and set cert_sha256 to 64 hexadecimal digits.
+printer_profile = "Bambu Lab A1 0.4 nozzle"
+print_profile = "0.20mm Standard @BBL A1"
+filament_profile = "Generic PLA @BBL A1"
+```
+
+Use the exact preset names installed in each slicer. This single config prepares both
+the MINI through PrusaSlicer and the A1 through OrcaSlicer. Keep the config private (`chmod 600`
+on Unix). The access code never appears in reports or connection diagnostics.
+
+Connections use MQTT over TLS. The optional `port` defaults to 8883 and must be between
+1 and 65535. Set exactly one trust option: a PEM CA file
+obtained through a trusted distribution, or `cert_sha256`, the SHA-256 fingerprint of the
+printer's DER certificate, obtained and checked independently. Fingerprints contain 64
+hexadecimal digits without colons. CA validation checks the configured serial as the
+certificate name, even when connecting by IP. Address-based SNI is suppressed. Pinning
+checks the exact certificate and its TLS handshake signature. A replacement certificate
+requires an explicit new trust decision. Monitoring always verifies configured trust.
+No vendor CA is bundled: this avoids assuming permission to redistribute a CA from community sources.
+
+To read a certificate before enrolling its pin, run
+`dutchman-print --config config.toml fingerprint bambu [--json]` (omit the brackets).
+It connects once to that printer's configured TLS port, sends no MQTT login or access
+code, and prints SHA-256, subject, issuer, and validity dates. Compare the fingerprint
+with what the printer shows, if anything, and check it independently before pasting it
+as `cert_sha256`. This observation alone does not establish trust. The command never
+writes config. It permits missing trust for the selected printer so initial enrollment
+is possible; normal monitoring still requires exactly one trust option. JSON fields are
+`cert_sha256`, `subject`, `issuer`, `not_before`, `not_after`, and `instruction`.
+
+The service keeps one connection per configured printer once status is first requested.
+Standalone commands read a state and disconnect. Reports merge changed fields, preserve
+missing estimates, convert remaining minutes to seconds, and retain the original state in
+`detail`. IDLE/FINISH map to idle, PREPARE/RUNNING to printing, PAUSE to paused, and
+FAILED or unknown states to error. Nonzero reported print errors also block readiness.
+No report for 30 seconds means offline. A finished or failed report requires another bed
+check even if the printer has already returned to idle. Idle never establishes success.
+
+After a connection drops, telemetry is discarded and reconnects back off from one to 60
+seconds. Each connection requests one complete report after subscribing; full-state
+requests are spaced at least five minutes apart across reconnects to protect P1 printers.
+Status reads wait at most four seconds, so an early read during reconnect pacing can be
+offline. Only a fresh report establishes availability again. These wire fields and units
+follow the survey's community evidence; compatibility with every model and firmware has
+not been established. No discovery, FTPS, AMS assignment, or cloud login is implemented.

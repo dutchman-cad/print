@@ -1,6 +1,9 @@
 //! Handwritten protocol fixtures served only on a test-owned loopback socket.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
+#[path = "helpers/slicer.rs"]
+mod slicer_fixture;
+
 use axum::{
     body::{Body, Bytes},
     extract::{Request, State},
@@ -241,28 +244,19 @@ impl Fake {
     }
 }
 
-// Match the slicer's canonical input and output paths without normalizing away
-// differences in argv. The fake slicer still compares every argument exactly.
 fn slicer_input(dir: &Path) -> PathBuf {
-    let input = dir.join("input.3mf");
-    std::fs::write(&input, b"synthetic input").unwrap();
-    let canonical_input = input.canonicalize().unwrap();
-    let folder = canonical_input.parent().unwrap();
-    let args = vec![
-        "--export-gcode".to_string(),
-        "--no-binary-gcode".into(),
-        format!("--output={}", folder.join("sliced.gcode").display()),
-        "--printer-profile=Machine".into(),
-        "--print-profile=Draft".into(),
-        "--material-profile=PLA".into(),
-        canonical_input.to_str().unwrap().into(),
-    ];
-    std::fs::write(
-        dir.join("expected.json"),
-        serde_json::to_vec(&args).unwrap(),
-    )
-    .unwrap();
-    input
+    slicer_fixture::input(dir, |input| {
+        let folder = input.parent().unwrap();
+        vec![
+            "--export-gcode".to_string(),
+            "--no-binary-gcode".into(),
+            format!("--output={}", folder.join("sliced.gcode").display()),
+            "--printer-profile=Machine".into(),
+            "--print-profile=Draft".into(),
+            "--material-profile=PLA".into(),
+            input.to_str().unwrap().into(),
+        ]
+    })
 }
 
 #[tokio::test]
@@ -898,4 +892,114 @@ async fn a_new_external_terminal_report_requires_clearance_once() {
     assert_eq!(b.printers().await.unwrap()[0].needs_clearing, Some(false));
     fake.shared.machine.lock().await.id = 81;
     assert_eq!(b.printers().await.unwrap()[0].needs_clearing, Some(true));
+}
+
+#[allow(dead_code, clippy::panic)]
+#[path = "helpers/bambu.rs"]
+mod bambu_fake;
+
+#[tokio::test]
+async fn mixed_fleet_prepares_with_each_printers_slicer() {
+    let prusa = Fake::new().await;
+    let bambu = bambu_fake::Fake::new().await;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mini_dir = root.join("mini");
+    let a1_dir = root.join("a1");
+    std::fs::create_dir(&mini_dir).unwrap();
+    std::fs::create_dir(&a1_dir).unwrap();
+    let mini_input = slicer_input(&mini_dir);
+    let mut config = prusa.config();
+    config
+        .slicers
+        .insert("prusa".into(), config.slicer.take().unwrap());
+    let mut a1 = config.printers[0].clone();
+    a1.id = "a1".into();
+    a1.kind = Some("bambu".into());
+    a1.url = None;
+    a1.api_key = None;
+    a1.host = Some("127.0.0.1".into());
+    a1.port = Some(bambu.port);
+    a1.serial = Some("TESTSERIAL".into());
+    a1.access_code = Some("test-access".into());
+    a1.cert_sha256 = Some(dutchman_print::safety::hash(bambu.cert.as_ref()));
+    config.printers.push(a1);
+    let mut orca = config.slicers["prusa"].clone();
+    orca.kind = "orcaslicer".into();
+    orca.datadir = Some(a1_dir.join("presets"));
+    config.slicers.insert("orca".into(), orca);
+    for (category, name) in [
+        ("machine", "Machine"),
+        ("process", "Draft"),
+        ("filament", "PLA"),
+    ] {
+        let dir = a1_dir.join("presets/user/default").join(category);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("preset.json"),
+            serde_json::json!({"name": name}).to_string(),
+        )
+        .unwrap();
+    }
+    let a1_input = slicer_fixture::input(&a1_dir, |input| {
+        vec![
+            format!("--datadir={}", a1_dir.join("presets").display()),
+            format!(
+                "--load-filaments={}",
+                a1_dir
+                    .join("presets/user/default/filament/preset.json")
+                    .display()
+            ),
+            format!(
+                "--load-settings={};{}",
+                a1_dir
+                    .join("presets/user/default/machine/preset.json")
+                    .display(),
+                a1_dir
+                    .join("presets/user/default/process/preset.json")
+                    .display()
+            ),
+            "--slice=0".into(),
+            "--export-3mf=sliced.3mf".into(),
+            format!("--outputdir={}", a1_dir.display()),
+            input.display().to_string(),
+        ]
+    });
+    let orca = config.slicers.remove("orca").unwrap();
+    assert!(Printers::new({
+        // Rebuild below from the same mixed settings after each resolution refusal.
+        let mut bad: Config = toml::from_str("[backend]\nkind='printers'\n").unwrap();
+        bad.printers = config.printers.clone();
+        bad.slicers = config.slicers.clone();
+        bad
+    })
+    .err()
+    .unwrap()
+    .contains("needs a slicer of kind orcaslicer"));
+    config.slicers.insert("orca".into(), orca.clone());
+    config.slicers.insert("other-orca".into(), orca);
+    let mut bad: Config = toml::from_str("[backend]\nkind='printers'\n").unwrap();
+    bad.printers = config.printers.clone();
+    bad.slicers = config.slicers.clone();
+    assert!(Printers::new(bad).err().unwrap().contains("ambiguous"));
+    config.printers[1].slicer = Some("orca".into());
+    let backend = Printers::new(config).unwrap();
+    assert_eq!(
+        backend
+            .prepare("mini", &mini_input, "test", Options::default())
+            .await
+            .unwrap()
+            .seconds,
+        Some(123)
+    );
+    assert_eq!(
+        backend
+            .prepare("a1", &a1_input, "a1", Options::default())
+            .await
+            .unwrap()
+            .seconds,
+        Some(123)
+    );
+    assert!(mini_dir.join("sliced.gcode").is_file());
+    assert!(a1_dir.join("sliced.3mf").is_file());
 }
