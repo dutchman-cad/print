@@ -15,6 +15,7 @@ cargo build --locked -p dutchman-print
 
 It is not released yet; testing uses simulated printers. Put the executable beside
 `dutchman` or on `PATH` to use `dutchman printers` and `dutchman print`.
+Before relying on a printer, work through the [hardware checklist](hardware-checklist.md).
 
 ## Config
 
