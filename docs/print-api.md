@@ -87,7 +87,7 @@ storage and removed on failure.
 | `name` | string | Required |
 | `model` | string | Required |
 | `state` | string | Required: `idle`, `printing`, `paused`, `attention`, `busy`, `error`, or `offline` |
-| `job_id` | string | Optional; active job ID |
+| `job_id` | string | Optional; active job ID, or the live file path for Duet |
 | `job_name` | string | Optional; active job name |
 | `job_path` | string | Optional; backend relative live file path, currently OctoPrint |
 | `progress` | number | Optional; fraction from 0 to 1 |
@@ -183,6 +183,30 @@ commissioned behaviour and unchanged machine configuration. Completed, cancelled
 failed executions remain distinct; idle alone cannot establish completion. See
 [Moonraker configuration and checks](print.md#moonraker-klipper).
 
+Duet (RepRapFirmware standalone) uses the same routes, server-issued challenges,
+reviewed-byte checks, and bed-clear policy. Status comes from the `rr_model` object model:
+`idle` is idle; `processing`, `pausing`, `resuming`, `cancelling`, and `changingTool` are
+printing; `paused` is paused; `busy`, `starting`, `updating`, and `simulating` are busy;
+`halted` is error; `off` and `disconnected` are offline. Other values report error and block
+Start. `detail` holds the known `state.status`. `job_id` is the live file path (for example
+`0:/gcodes/part.gcode`) and `job_name` its file name; there is no separate execution ID.
+`progress` is file position divided by file size, a byte fraction rather than elapsed time,
+and `seconds_left` is `job.timesLeft.file` when reported. Temperatures use the current tool's
+heater and the configured bed heater. Polling withdraws clearance when the status, the live
+file, or the last processed file changes.
+The object model has no nozzle diameter, so the sliced `nozzle_diameter` must match the
+printer's configured `nozzle_diameter` during preparation, challenge review, and before
+upload; a missing value is refused. Start uploads a uniquely named file with a CRC-32, checks
+`err` and the listed size, deletes failed or uncertain uploads before returning an error, saves
+the attempt, and sends `M32` once. Pause (`M25`), resume (`M24`), and cancel require the live
+file this companion started. Cancel and Stop send `M0`, which cancels only a paused job, so a
+running job is first paused with `M25` and that pause confirmed for up to 10 seconds; an
+unconfirmed pause does not send `M0`. Waits otherwise match Moonraker. Login uses `rr_connect`
+with a session key; an expired session is renewed, but G-code refused with 401 is not resent.
+Standalone firmware does not report how a file ended: a companion cancellation yields
+`cancelled`, a halt `failed`, and other endings `ended`. See
+[Duet configuration and checks](print.md#duet-reprapfirmware-standalone).
+
 Printer commands are serialized separately for each printer. Uploads and command outcome
 waits on one printer do not block another printer's status, confirmation review, or Stop.
 Stop can also overtake its own printer's pending Start, pause, or resume outcome wait;
@@ -216,7 +240,8 @@ A prepared job is `ready`; start moves it to `printing`. Pause moves a printing 
 ready, printing, or paused jobs and yields `cancelled`. Backend failures may yield `failed`.
 `ended` is terminal: the execution ended, but its outcome is unknown. PrusaLink uses it when a tracked execution disappears from idle
 telemetry without an observed terminal result; observed FINISHED and STOPPED remain
-`done` and `cancelled`. BUSY cannot revive a terminal job.
+`done` and `cancelled`. Duet uses it for every ending not caused by this companion's
+cancellation or a halt, since standalone firmware does not report the outcome. BUSY cannot revive a terminal job.
 Incompatible actions return 409. Printer pause and resume target that printer's active job.
 Jobs may expire; subsequent reads return 404. Dutchman Print retains jobs for one hour and
 persists service jobs in its private data folder. Startup reloads tracked jobs and reconciles
@@ -320,7 +345,7 @@ start/stop and 10 seconds for pause/resume. Pending is announced on stderr befor
 unconfirmed outcome is returned. Waiting never resends a command. Read status after
 an uncertain outcome before confirming another action.
 
-Uploads to PrusaLink, Bambu FTPS, OctoPrint, and Moonraker use a 30-second transport
+Uploads to PrusaLink, Bambu FTPS, OctoPrint, Moonraker, and Duet use a 30-second transport
 idle timeout, reset by byte progress, rather than a fixed total deadline. Once the whole body has
 been written, the printer's reply gets 60 seconds, since storing the file or draining socket
 buffers moves no bytes. Failed or
@@ -341,7 +366,8 @@ outcome. External jobs are not added to the prepared-job list.
 
 PrusaLink addresses the live job ID; OctoPrint cancels only the same live origin/file path;
 Moonraker requires the same history execution and filename; Bambu requires the same
-subtask name and positive start time. OctoPrint cannot distinguish another execution of
+subtask name and positive start time; Duet requires the same live file path and pauses a
+running job before sending `M0`. OctoPrint cannot distinguish another execution of
 the same file. Stop waits up to 25 seconds, sends once, and returns 409 when unconfirmed.
 The same per-printer command locking and pending-wait preemption apply as for cancel.
 

@@ -74,6 +74,10 @@ impl Printers {
                 .await?;
             return self.printer(printer).await;
         }
+        if let Some(client) = self.duet.get(printer) {
+            self.stop_duet(client, identity, name).await?;
+            return self.printer(printer).await;
+        }
         let mut baseline = None;
         let mut file_path = None;
         if let Some(client) = self.octoprint.get(printer) {
@@ -246,6 +250,11 @@ impl Printers {
                 }
                 client.delete(&staged).await
             } else if let Some(client) = self.moonraker.get(&target.job.printer) {
+                if staged != target.filename {
+                    return Err(Error::Unavailable);
+                }
+                client.delete(&staged).await
+            } else if let Some(client) = self.duet.get(&target.job.printer) {
                 if staged != target.filename {
                     return Err(Error::Unavailable);
                 }

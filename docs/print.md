@@ -3,7 +3,8 @@
 Dutchman Print is a local print companion for SolidCraft and a standalone command line.
 A backend prepares 3MF files, estimates jobs, and controls printers. The included
 `simulated` backend is a demo: it contacts no printers and can optionally run a local slicer.
-The `printers` backend supports individually configured local PrusaLink, OctoPrint, Moonraker (Klipper), and Bambu printers.
+The `printers` backend supports individually configured local PrusaLink, OctoPrint, Moonraker (Klipper),
+Duet (RepRapFirmware standalone), and Bambu printers.
 
 Build `dutchman-print` from this checkout with Rust 1.88 or newer:
 
@@ -84,7 +85,7 @@ Configure slicers with `[slicers.<name>]` tables, each containing `kind`, option
 optional `datadir`, and `timeout_seconds`. Set each printer's `slicer = "<name>"` to choose
 one. Without a name, Dutchman selects the only slicer of the required kind: PrusaLink needs
 `prusaslicer`, Bambu needs `orcaslicer`. Missing or ambiguous choices are refused.
-OctoPrint and Moonraker accept either kind; select a named slicer when more than one is configured.
+OctoPrint, Moonraker, and Duet accept either kind; select a named slicer when more than one is configured.
 The simulator with `slice = true` uses the same per-printer selection; a simulated printer
 without a kind can use the only configured slicer, or select one explicitly.
 `[slicer]` remains a single-slicer shorthand; it cannot be combined with named slicers,
@@ -874,6 +875,116 @@ and [job history](https://moonraker.readthedocs.io/en/latest/external_api/histor
 Testing uses synthetic responses on test-owned loopback servers. Physical printer and
 macro commissioning remains an installation step.
 
+## Duet (RepRapFirmware standalone)
+
+This backend uses the standalone RepRapFirmware HTTP interface (`rr_` requests) of a Duet
+board running without a single-board computer. Duet with an attached SBC has a different API
+and is not supported. Configure the address explicitly; there is no discovery. HTTP is the
+board's own interface; HTTPS is accepted only through a gateway you configure, which must
+present a certificate trusted by the system, for the configured hostname. Redirects and
+certificate exceptions are refused. Keep HTTP on a trusted local network.
+
+```toml
+[backend]
+kind = "printers"
+
+[slicer]
+kind = "prusaslicer" # or "orcaslicer"; use named slicers for multiple choices
+
+[[printers]]
+kind = "duet"
+id = "duet"
+name = "Workbench Duet"
+model = "Commissioned Duet printer"
+url = "http://duet.local"
+password = "REPLACE_WITH_THE_MACHINE_PASSWORD" # omit when none is set
+nozzle_diameter = 0.4 # millimetres; the installed nozzle
+printer_profile = "Commissioned machine"
+print_profile = "Reviewed print settings"
+filament_profile = "Loaded material"
+```
+
+`password` is the machine password set with `M551`. Omitting it sends none; the firmware
+then assumes its default. It is sent only to the login request and never appears in
+reports, logs, or errors. Each login requests a session key (RepRapFirmware 3.5 and later)
+and sends it as `X-Session-Key`. Older firmware associates the session with this computer's
+address instead, so other clients on the same computer share it. The reported session
+timeout is honoured: an idle session logs in again first. A request refused with 401 logs
+in again; reads and uploads are then sent once more, but G-code is never resent: the
+command reports that the session expired and needs fresh status before another action.
+A refused password reports an authentication failure; a board with no free sessions
+reports that in `detail` as an offline state. Close other clients or wait for their
+sessions to expire. See [HTTP requests](https://github.com/Duet3D/RepRapFirmware/wiki/HTTP-requests).
+
+The object model does not report a nozzle diameter. Set `nozzle_diameter` to the installed
+nozzle after checking it, in millimetres, greater than 0 and at most 10. Only Duet
+printers accept it. Preparation, challenge review, and upload refuse a missing value, and the sliced
+`nozzle_diameter` must match it; mismatches name both values, with no override. This checks
+configuration, not the physical nozzle. Commission the profiles for the actual model, build
+volume, tooling, material, and plate. Only one tool with one extruder and one heater is
+supported for preparation and control.
+
+Status reads the [object model](https://github.com/Duet3D/RepRapFirmware/wiki/Object-Model-Documentation)
+with `rr_model` keys `state`, `job`, `heat`, and `tools`, within four seconds. The legacy
+`rr_status` response is not used. `state.status` maps as follows; `detail` keeps the known
+value:
+
+| `state.status` | State |
+|---|---|
+| `idle` | idle |
+| `processing`, `pausing`, `resuming`, `cancelling`, `changingTool` | printing |
+| `paused` | paused |
+| `busy`, `starting`, `updating`, `simulating` | busy |
+| `halted` | error |
+| `off`, `disconnected` | offline |
+| anything else | error, with an unknown-state `detail` |
+
+Only idle permits Start. `job_id` is the live file path, such as
+`0:/gcodes/part.gcode`, and `job_name` its file name. Progress is
+`job.filePosition / job.file.size`: the fraction of file bytes read, not of elapsed print
+time. `seconds_left` comes from `job.timesLeft.file` when the firmware reports it. The
+nozzle temperature is the first heater of the tool numbered `state.currentTool`, found by
+tool number rather than list position; it is omitted when no tool is selected. The bed
+temperature uses the first configured entry of `heat.bedHeaters`.
+
+Preparation slices locally to text G-code and reads board name, firmware version, machine
+name, axis limits, and tool configuration without uploading. Changes to any of them, or to
+the input, G-code, or profiles, require new preparation and review. Acknowledge the bed
+through a clear challenge and the API clear route in the running server, then request a
+separate Start challenge. Clearance follows the shared policy; polling also withdraws it
+when the status, the live file, or `job.lastFileName` changes. Activity between polls that
+leaves all three unchanged cannot be detected.
+
+Start checks fresh idle status and the review, then lists `0:/gcodes` with `rr_filelist`
+and refuses an existing staging name. It uploads the unique file with `POST /rr_upload`,
+raw bytes, `Content-Length`, and a CRC-32, under the shared 30-second transport idle
+timeout. The reply must report `err` 0 and the listing must show the reviewed size. Failed
+or uncertain uploads and failed size checks delete the staged file with `rr_delete` and
+confirm through the listing that it is gone before returning an error; Start is never sent.
+If cleanup cannot be confirmed, inspect Duet storage and remove the file before preparing
+again. After a final idle and review check, the attempt is saved durably and
+`M32 "0:/gcodes/<file>"` is sent once through `rr_gcode`. A lost reply is reconciled from
+status and never causes a second Start. See the [G-code reference](https://docs.duet3d.com/User_manual/Reference/Gcodes).
+
+Pause sends `M25` and resume `M24`, only for the live file this companion started. Cancel
+and printer Stop use `M0`, which cancels only a paused job: a running job is first paused
+with `M25`, so the machine's `pause.g` runs before `cancel.g` (or `stop.g`). Each command is
+sent once. Start and cancel wait up to 25 seconds for matching status, pause and resume up
+to 10 seconds, and the pause before a cancel up to 10 seconds; if that pause is not
+confirmed, `M0` is not sent. Pending is announced on stderr; expiry leaves an unconfirmed
+outcome to reconcile from fresh status.
+
+Standalone firmware does not report whether a file completed or was cancelled. A tracked
+job becomes `cancelled` when this companion cancelled it and the printer is idle again,
+`failed` when the printer halts, and otherwise `ended` (outcome unknown) once the printer
+is idle after the job was seen running, or reports the job's unique file as the last one
+processed. Its staged file is then deleted once the printer is idle; external files are
+never removed.
+
+Testing uses synthetic responses on test-owned loopback servers. Session handling, path
+spelling in `job.file.fileName`, delete replies for missing files, and macro behaviour still
+need checking on a real board before relying on control.
+
 ## Stop a printer and clean staged files
 
 Run `dutchman-print --config config.toml stop <printer>` to review the current live job's
@@ -892,6 +1003,10 @@ After a terminal outcome, only the recorded unique file staged by Dutchman is de
 and only after fresh status establishes it is no longer live. Uploaded ready jobs are
 also cleaned when cancelled before Start or forgotten. A cleanup failure is reported in
 job `detail` while preserving its outcome; inspect printer storage before removing a file.
+
+Duet Stop addresses the live file path: a running job is paused with `M25`, the pause is
+confirmed, and then `M0` is sent. Stop is confirmed when the printer is idle with that file
+reported as the last one processed.
 
 Bambu commands use the existing monitoring MQTT connection and match replies by sequence
 number. Reconnect never replays a command. Upload is refused when telemetry reports no SD
