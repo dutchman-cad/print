@@ -10,7 +10,7 @@ Not released yet. Tested against simulated printers.
 
 | Printer or software | `kind` | Status | Control |
 | --- | --- | --- | --- |
-| Simulated printers | `simulated` | Built in, for trying the API | Start, pause, resume, cancel |
+| Simulated printers | `simulated` | Built in, for trying the API | Start, pause, resume, cancel, Stop |
 | Prusa printers with PrusaLink | `prusalink` | Simulated only | Start, pause, resume, cancel, Stop |
 | OctoPrint | `octoprint` | Simulated only | Start, pause, resume, cancel, Stop |
 | Klipper with Moonraker | `moonraker` | Simulated only | Start, pause, resume, cancel, Stop |

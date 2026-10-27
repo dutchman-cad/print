@@ -325,6 +325,40 @@ impl Backend for Simulated {
             Ok(target.job.clone())
         })
     }
+    fn stop<'a>(
+        &'a self,
+        printer: &'a str,
+        identity: &'a str,
+        name: &'a str,
+        _path: Option<&'a str>,
+    ) -> Reply<'a, Printer> {
+        Box::pin(async move {
+            {
+                let mut jobs = self.jobs()?;
+                let target = jobs
+                    .values_mut()
+                    .find(|r| {
+                        r.job.printer == printer
+                            && matches!(r.job.state, JobState::Printing | JobState::Paused)
+                    })
+                    .filter(|r| r.job.id == identity && r.job.name == name)
+                    .ok_or_else(|| {
+                        Error::Refused(
+                            "The live job changed. Read fresh status and confirm Stop again."
+                                .into(),
+                        )
+                    })?;
+                target.job.state = JobState::Cancelled;
+                target.since = None;
+                target.job.seconds_left = None;
+            }
+            self.printers()
+                .await?
+                .into_iter()
+                .find(|p| p.id == printer)
+                .ok_or(Error::NotFound)
+        })
+    }
     fn pause<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
         Box::pin(async move { self.change(printer, true) })
     }
