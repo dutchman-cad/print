@@ -189,6 +189,46 @@ async fn ready(app: &Router) -> Value {
 }
 
 #[tokio::test]
+async fn simulator_printer_stop_ends_only_the_confirmed_live_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let app = router(
+        simulation(clock.clone()),
+        settings(dir.path(), clock.clone()),
+    );
+    let token = || dutchman_print::new_job_id().unwrap().repeat(2);
+    // Stop needs a live job to confirm against.
+    let (status, _, _) = send(
+        &app,
+        Request::post("/api/v1/confirmations")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"action":"stop","printer":"demo"}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let job = ready(&app).await;
+    let id = job["id"].as_str().unwrap();
+    let start = format!("/api/v1/jobs/{id}/start");
+    accepted(&app, confirmed(&app, &start, &token()).await, 200).await;
+    clock.advance(5);
+    let stopped = accepted(
+        &app,
+        confirmed(&app, "/api/v1/printers/demo/stop", &token()).await,
+        200,
+    )
+    .await;
+    assert_eq!(stopped["state"], "idle");
+    assert!(stopped.get("job_id").is_none_or(Value::is_null));
+    let job = accepted(&app, get(&format!("/api/v1/jobs/{id}")), 200).await;
+    assert_eq!(job["state"], "cancelled");
+    let printers = accepted(&app, get("/api/v1/printers"), 200).await;
+    assert_eq!(printers[0]["needs_clearing"], true);
+}
+
+#[tokio::test]
 async fn simulator_lifecycle_uses_clock_without_sleeping() {
     let clock = Arc::new(TestClock::default());
     let backend = simulation(clock.clone());
