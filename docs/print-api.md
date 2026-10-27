@@ -148,6 +148,33 @@ Physical firmware, material, tooling, and plate changes not
 reported by OctoPrint require operator review before confirmation. See the
 [OctoPrint configuration and checks](print.md#octoprint).
 
+Moonraker (Klipper) uses the same routes, server-issued challenges, reviewed-byte checks,
+and bed-clear policy. The running server holds clearance and polls the latest history entry.
+A changed execution ID or fractional start timestamp, or an observed `print_stats` state or
+filename change, withdraws clearance. Timestamps are finite floating-point Unix seconds and
+retain fractions. Jobs are checkpointed after changes, including reconciled outcomes.
+The sliced G-code's `nozzle_diameter` must match Klipper's
+`configfile.settings.extruder.nozzle_diameter` during preparation, challenge review, and
+before upload. Unknown or ambiguous values are refused; mismatches name both values, with
+no override. This checks configuration rather than physical nozzle identity.
+Failed or uncertain uploads and failed stored-file validation delete the staged remote
+file before returning an error and never send Start. Unconfirmed cleanup requires inspection
+and removal in Moonraker before preparing again.
+Accepted commands poll once sent for up to 25 seconds for start/cancel and 10 seconds for
+pause/resume. Pending is announced on stderr; expiry returns 409 with an unconfirmed outcome
+and requires fresh status. Commands are never resent by this wait.
+Its `detail` contains a known `print_stats` state or a safe Klippy readiness explanation;
+startup and disconnected Klippy report offline; shutdown, unknown, and contradictory states
+block actions. Raw backend messages are not returned. `job_id`, when available, is the
+Moonraker history execution ID linked by file metadata; it may identify the last terminal
+job while the printer is idle. Progress is a fraction and live `seconds_left` is omitted.
+Start stages text G-code with automatic printing disabled, verifies metadata, then starts
+once. A lost reply requires reconciliation and never causes an automatic retry. Controls
+require the same tracked filename and live execution ID. Resume additionally requires
+commissioned behaviour and unchanged machine configuration. Completed, cancelled, and
+failed executions remain distinct; idle alone cannot establish completion. See
+[Moonraker configuration and checks](print.md#moonraker-klipper).
+
 ## Job JSON and states
 
 ```json

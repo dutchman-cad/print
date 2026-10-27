@@ -420,7 +420,7 @@ impl Backend for Safety {
             if p.state != PrinterState::Paused
                 || p.detail
                     .as_deref()
-                    .is_some_and(|s| !matches!(s, "PAUSED" | "PAUSE" | "Paused"))
+                    .is_some_and(|s| !matches!(s, "PAUSED" | "PAUSE" | "Paused" | "paused"))
             {
                 return Err(Error::Refused("Printer readiness is unknown or attention is required. Read fresh status before resuming.".into()));
             }
