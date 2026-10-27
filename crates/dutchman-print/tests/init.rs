@@ -82,6 +82,7 @@ fn every_kind_writes_a_private_config_that_loads_without_contacting_anything() {
                 "0.4",
             ],
         ),
+        ("duet-sbc", vec!["--url", &url, "--nozzle-diameter", "0.4"]),
         (
             "repetier",
             vec![

@@ -39,6 +39,7 @@ Choose `simulated` in step 2 to try Print without a printer.
 | OctoPrint | `octoprint` | Simulated only | Start, pause, resume, cancel, Stop |
 | Klipper with Moonraker | `moonraker` | Simulated only | Start, pause, resume, cancel, Stop |
 | Duet (RepRapFirmware, standalone) | `duet` | Simulated only | Start, pause, resume, cancel, Stop |
+| Duet with SBC (Duet Software Framework) | `duet-sbc` | Simulated only | Start, pause, resume, cancel, Stop |
 | Snapmaker U1 | `snapmaker-u1` | Simulated only | Start, pause, resume, cancel, Stop (single-tool jobs) |
 | Elegoo resin printers (SDCP) | `elegoo-sdcp`, `profile = "resin"` | Simulated only | Monitoring and Stop; Print can't start resin jobs, which come from a resin slicer |
 | Elegoo Centauri Carbon | `elegoo-sdcp`, `profile = "centauri"` | Simulated only | Monitoring only |

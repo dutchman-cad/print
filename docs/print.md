@@ -4,7 +4,7 @@ Dutchman Print is a local print companion for SolidCraft and a standalone comman
 A backend prepares 3MF files, estimates jobs, and controls printers. The included
 `simulated` backend is a demo: it contacts no printers and can optionally run a local slicer.
 The `printers` backend supports individually configured local PrusaLink, OctoPrint, Moonraker (Klipper),
-Snapmaker U1, Duet (RepRapFirmware standalone), Repetier-Server, and Bambu printers, and monitors Elegoo printers
+Snapmaker U1, Duet (standalone or with Duet Software Framework), Repetier-Server, and Bambu printers, and monitors Elegoo printers
 that speak SDCP and Snapmaker 2.0, J1, and Artisan printers.
 
 Build `dutchman-print` from this checkout with Rust 1.88 or newer:
@@ -184,15 +184,15 @@ dutchman-print init --kind bambu --host 192.168.1.40 --serial SERIAL --access-co
 
 | Flag | Answer |
 |---|---|
-| `--kind` | `simulated`, `prusalink`, `octoprint`, `moonraker`, `snapmaker-u1`, `duet`, `repetier`, `bambu`, `elegoo-sdcp`, `snapmaker-2`, or `snapmaker-j1` |
-| `--url` | Address for PrusaLink, OctoPrint, Moonraker, Snapmaker U1, Duet, and Repetier-Server; `http://` is added when left out |
+| `--kind` | `simulated`, `prusalink`, `octoprint`, `moonraker`, `snapmaker-u1`, `duet`, `duet-sbc`, `repetier`, `bambu`, `elegoo-sdcp`, `snapmaker-2`, or `snapmaker-j1` |
+| `--url` | Address for PrusaLink, OctoPrint, Moonraker, Snapmaker U1, Duet (either kind), and Repetier-Server; `http://` is added when left out |
 | `--host`, `--port` | Address for Bambu, Elegoo, Snapmaker 2.0, and J1; the port only when it is not the usual one |
 | `--api-key` | PrusaLink, OctoPrint, Repetier-Server, and Moonraker or Snapmaker U1 (optional there) |
-| `--username`, `--password` | PrusaLink login instead of an API key; `--password` is also the optional Duet machine password |
+| `--username`, `--password` | PrusaLink login instead of an API key; `--password` is also the optional Duet machine password, for either Duet kind |
 | `--serial`, `--access-code` | Bambu serial number and LAN access code |
 | `--cert-sha256` or `--ca-file` | Bambu trust; leave both out to read the fingerprint later |
 | `--profile` | Elegoo `centauri` or `resin` |
-| `--nozzle-diameter` | Duet or Repetier-Server installed nozzle, in millimetres |
+| `--nozzle-diameter` | Duet (either kind) or Repetier-Server installed nozzle, in millimetres |
 | `--slug` | Repetier-Server printer slug, from the server's printer settings |
 | `--slicer` | `prusaslicer` (default) or `orcaslicer`; PrusaLink needs PrusaSlicer and Bambu needs OrcaSlicer |
 | `--printer-profile`, `--print-profile`, `--filament-profile` | Preset names; they default to the MINI or A1 examples on this page |
@@ -988,9 +988,9 @@ confirming each start. Testing uses a simulated U1 on a test-owned loopback serv
 Controls: `start`, `pause`, `resume`, `cancel`, `stop`, and `clear`.
 
 This backend uses the standalone RepRapFirmware HTTP interface (`rr_` requests) of a Duet
-board running without a single-board computer. Duet with an attached SBC has a different API
-and is not supported. Configure the address explicitly; there is no discovery. HTTP is the
-board's own interface; HTTPS is accepted only through a gateway you configure, which must
+board running without a single-board computer. For an attached SBC running Duet Software
+Framework, use the [SBC variant](#duet-with-sbc-duet-software-framework). Configure the
+address explicitly; there is no discovery. HTTP is the board's own interface; HTTPS is accepted only through a gateway you configure, which must
 present a certificate trusted by the system, for the configured hostname. Redirects and
 certificate exceptions are refused. Keep HTTP on a trusted local network.
 
@@ -1094,6 +1094,41 @@ never removed.
 Testing uses synthetic responses on test-owned loopback servers. Session handling, path
 spelling in `job.file.fileName`, delete replies for missing files, and macro behaviour still
 need checking on a real board before relying on control.
+
+### Duet with SBC (Duet Software Framework)
+
+Use the configuration above with `kind = "duet-sbc"` and `url` pointing to DuetWebServer
+on the SBC. Base paths are preserved. The same slicers, profiles, single-tool restriction,
+`nozzle_diameter`, confirmations, bed clearance, status mapping, waits, Stop, and cleanup
+rules apply. This variant has simulated coverage only; see the
+[SBC hardware checks](hardware-checklist.md#duet-with-sbc-duet-software-framework).
+
+The [DSF REST documentation](https://github.com/Duet3D/DuetSoftwareFramework/wiki/REST-API)
+defines these transport differences:
+
+- Login uses `GET /machine/connect`, with optional `password` in the query. The returned
+  `sessionKey` is sent as `X-Session-Key`. After eight idle seconds, login is renewed.
+  A 403 renews authentication for a read or refused upload once; G-code is never resent.
+  A wrong password is an authentication failure. Disconnect uses
+  `GET /machine/disconnect` on release when the runtime remains available; otherwise
+  authentication expires on the server.
+- `GET /machine/model` returns the full shared object model. Each status or machine
+  review uses one bounded full-model read, with the same fields as standalone Duet.
+- `GET /machine/directory/0:/gcodes` checks for an existing staging name. Upload sends raw
+  bytes with `PUT /machine/file/0:/gcodes/<file>` and requires HTTP 201. DSF documents no
+  CRC-32 upload parameter. Both the directory size and
+  `GET /machine/fileinfo/0:/gcodes/<file>` size must match the reviewed bytes.
+- Cleanup uses `DELETE /machine/file/0:/gcodes/<file>` (204, or 404 if already absent),
+  followed by a directory read confirming absence. Failed or uncertain uploads follow
+  the same cleanup rule and never send Start.
+- G-code uses `POST /machine/code?async=true` with a `text/plain` body. A 200 with an empty reply
+  proceeds to the shared telemetry wait. Nonempty replies are treated conservatively as
+  uncertain and are never shown or retried. Start is `M32`, pause `M25`, resume `M24`,
+  and cancel or Stop `M0` after a confirmed pause.
+
+The shared tracking policy reports `ended` for an ending without a confirmed companion
+cancellation or halt; idle alone never establishes successful completion. Physical nozzle,
+material, plate, and macro behaviour still require checks on the actual machine.
 
 ## Repetier-Server
 
