@@ -153,6 +153,7 @@ impl Config {
                     Some("moonraker" | "snapmaker-u1") => crate::moonraker::validate(printer)?,
                     Some("duet") => crate::duet::validate(printer)?,
                     Some("elegoo-sdcp") => crate::elegoo_sdcp::validate(printer)?,
+                    Some("snapmaker-2" | "snapmaker-j1") => crate::snapmaker::validate(printer)?,
                     Some("bambu") => {
                         crate::bambu::validate_enrollment(
                             printer,
@@ -160,7 +161,7 @@ impl Config {
                         )?;
                     }
                     _ => return Err(
-                        "Set each printer kind to prusalink, octoprint, moonraker, snapmaker-u1, duet, bambu, or elegoo-sdcp."
+                        "Set each printer kind to prusalink, octoprint, moonraker, snapmaker-u1, snapmaker-2, snapmaker-j1, duet, bambu, or elegoo-sdcp."
                             .into(),
                     ),
                 }
@@ -173,7 +174,7 @@ impl Config {
                         "Set profile and mainboard_id only for Elegoo SDCP printers.".into(),
                     );
                 }
-                if !sdcp
+                if !sliceless(printer)
                     && [
                         &printer.printer_profile,
                         &printer.print_profile,
@@ -187,10 +188,8 @@ impl Config {
                     );
                 }
             }
-            // Print never slices for Elegoo SDCP printers, so they take no slicer.
-            if (self.backend.kind == "printers" || self.backend.slice)
-                && printer.kind.as_deref() != Some("elegoo-sdcp")
-            {
+            // Print never slices for monitoring-only kinds, so they take no slicer.
+            if (self.backend.kind == "printers" || self.backend.slice) && !sliceless(printer) {
                 self.slicer_for(printer)?;
             }
             for name in [
@@ -262,6 +261,13 @@ impl Config {
         }
         Ok(selected)
     }
+}
+
+/// Kinds Print never slices or sends jobs to: Elegoo SDCP and the monitoring-only Snapmaker
+/// kinds.
+pub(crate) fn sliceless(printer: &Printer) -> bool {
+    printer.kind.as_deref() == Some("elegoo-sdcp")
+        || crate::snapmaker::is_kind(printer.kind.as_deref())
 }
 
 /// The user's platform config folder; this does not read any files.

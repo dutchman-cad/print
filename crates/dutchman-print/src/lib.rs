@@ -15,6 +15,7 @@ pub mod safety;
 mod server;
 pub mod simulated;
 pub mod slicer;
+pub mod snapmaker;
 pub mod upload;
 
 pub use server::{router, ServerConfig, StorageConfig};

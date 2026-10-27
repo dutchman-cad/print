@@ -18,6 +18,8 @@ Not released yet. Tested against simulated printers.
 | Snapmaker U1 | `snapmaker-u1` | Simulated only | Start, pause, resume, cancel, Stop (single-tool jobs) |
 | Elegoo resin printers (SDCP) | `elegoo-sdcp`, `profile = "resin"` | Simulated only | Monitoring and Stop; Print can't start resin jobs, which come from a resin slicer |
 | Elegoo Centauri Carbon | `elegoo-sdcp`, `profile = "centauri"` | Simulated only | Monitoring only |
+| Snapmaker 2.0 (A150, A250, A350) | `snapmaker-2` | Simulated only | Monitoring only; the connection is approved on the touchscreen |
+| Snapmaker J1 and Artisan (SACP) | `snapmaker-j1` | Simulated only | Monitoring only: installed modules and firmware, never print state |
 | Bambu Lab in LAN mode | `bambu` | Simulated only | Monitoring; control is experimental and off unless `lan_control = true` |
 
 Every machine action needs a confirmation the server issues for that printer and job, and

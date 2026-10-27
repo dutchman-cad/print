@@ -236,6 +236,25 @@ supports printer Stop only; `pause` and `resume` challenges and routes are refus
 they act on and return a tracked job, and Print never starts resin jobs. See
 [Elegoo (SDCP)](print.md#elegoo-sdcp).
 
+Snapmaker 2.0 (`kind = "snapmaker-2"`) and Snapmaker J1 and Artisan (`kind = "snapmaker-j1"`)
+printers are monitoring only and report status only through the printer routes. Preparation,
+every confirmation challenge except `clear`, and every action route are refused with a
+message that Snapmaker has not published the control contract, and nothing beyond the
+documented status requests is sent; they never have tracked jobs and never report
+`printing`, `paused`, `job_id`, `job_name`, `progress`, `seconds_left`, or temperatures. A
+Snapmaker 2.0 is `offline` until its connection is approved on the touchscreen, and again if
+approval does not arrive within 60 seconds or the printer stops accepting the connection;
+`detail` then says to approve on the touchscreen and read status again. Once connected, its
+`status` value `IDLE` is `idle`; any other value is `error`, with the value (sanitised, at
+most 32 characters) first in `detail`; a `headType` that names a laser or CNC head turns
+`idle` into `attention`. The connection token is never part of any response. A J1 or Artisan
+is `busy` while a printing module (ID 0 or 13) is installed, because the vendor has not
+published its print state, and `attention` otherwise, since the machine is not a printer
+right now; `detail` names the modules and firmware versions. A module-info reply with a
+nonzero result, or one that cannot be read, is `error`. Both kinds are `offline` without a
+reply in the last 30 seconds. See
+[Snapmaker 2.0 and J1/Artisan](print.md#snapmaker-20-and-j1artisan).
+
 Printer commands are serialized separately for each printer. Uploads and command outcome
 waits on one printer do not block another printer's status, confirmation review, or Stop.
 Stop can also overtake its own printer's pending Start, pause, or resume outcome wait;
