@@ -192,7 +192,8 @@ dutchman-print init --kind bambu --host 192.168.1.40 --serial SERIAL --access-co
 | `--serial`, `--access-code` | Bambu serial number and LAN access code |
 | `--cert-sha256` or `--ca-file` | Bambu trust; leave both out to read the fingerprint later |
 | `--profile` | Elegoo `centauri` or `resin` |
-| `--nozzle-diameter` | Duet (either kind) or Repetier-Server installed nozzle, in millimetres |
+| `--nozzle-diameter` | PrusaLink fallback, Duet (either kind), or Repetier-Server installed nozzle, in millimetres |
+| `--storage` | PrusaLink storage path name, such as `local` or `usb`; omit for automatic selection |
 | `--slug` | Repetier-Server printer slug, from the server's printer settings |
 | `--slicer` | `prusaslicer` (default) or `orcaslicer`; PrusaLink needs PrusaSlicer and Bambu needs OrcaSlicer |
 | `--printer-profile`, `--print-profile`, `--filament-profile` | Preset names; they default to the MINI or A1 examples on this page |
@@ -450,6 +451,10 @@ resolved settings and output for inspection. Orca's effective settings are expor
 
 ## PrusaLink
 
+Embedded PrusaLink runs in MINI/MINI+, MK4, XL, and CORE One firmware. Pi-hosted
+PrusaLink runs on a Raspberry Pi connected to older printers such as MK3S/MK3S+ and
+MK2.5S. Both use `kind = "prusalink"`; configure the address of the printer or Pi.
+
 Controls: `start`, `pause`, `resume`, `cancel`, `stop`, and `clear`.
 
 Configure each printer explicitly. Dutchman does no network discovery. Use its local HTTP
@@ -477,6 +482,36 @@ print_profile = "0.20mm QUALITY @MINI"
 filament_profile = "Generic PLA @MINI"
 ```
 
+For an MK3S attached to a Raspberry Pi, use the same backend and slicer tables above,
+with this printer entry instead. Use the login created during PrusaLink setup:
+
+```toml
+[[printers]]
+kind = "prusalink"
+id = "mk3s"
+name = "Workbench MK3S"
+model = "Original Prusa i3 MK3S"
+url = "http://prusalink.local"
+username = "REPLACE_WITH_YOUR_PRUSALINK_USERNAME"
+password = "REPLACE_WITH_YOUR_PRUSALINK_PASSWORD"
+nozzle_diameter = 0.4 # physically check the installed nozzle
+# storage = "local" # needed only when automatic selection is ambiguous
+printer_profile = "Original Prusa i3 MK3S & MK3S+"
+print_profile = "0.20mm QUALITY @MK3"
+filament_profile = "Generic PLA"
+```
+
+`GET /api/v1/storage` determines the upload target. Automatic selection requires exactly
+one available, writable storage. When several are writable, set `storage` to the path name
+without slashes (`local`, for example), rather than the translated display name. An override
+must still be available and writable. Missing or insufficient reported free space blocks
+upload; free space never resolves an ambiguous choice. No storage name is assumed.
+
+`init` accepts `--storage` and `--nozzle-diameter` and asks optional questions for both.
+For a Pi, for example: `dutchman-print init --kind prusalink --url http://prusalink.local
+--username workshop --password PASSWORD --nozzle-diameter 0.4 --storage local` (on one line).
+Select the installed MK3S presets rather than accepting the MINI preset defaults.
+
 Use either `api_key` (`X-Api-Key`) or both `username` and `password` (HTTP Digest), never
 both forms. For MK4 and XL, Prusa documents `maker` as the default Digest username and
 the API key as its password. Pi-hosted i3 installations use their PrusaLink login.
@@ -499,10 +534,19 @@ against the configured presets before confirmation; Dutchman cannot detect an un
 physical change. This backend is intended for commissioned single-material setups.
 
 Preparation reads status and machine information, then slices locally to text G-code.
-Missing serial, firmware, or nozzle information blocks preparation. The resolved profile's
+Pi-hosted PrusaLink uses text G-code. Dutchman also keeps text output for embedded printers;
+it never uploads `.bgcode`, even where newer firmware supports it. An explicit false or
+invalid `upload-by-put` capability is refused; legacy upload APIs are not used.
+Missing serial or firmware blocks preparation. If the printer omits its nozzle diameter,
+set `nozzle_diameter` in private config to the physically installed size; without either
+value preparation is refused. A reported diameter takes precedence over config, and an
+invalid reported value is refused. Printer type and capability fields may differ between
+families; the complete information and version responses are bound to the reviewed job.
+The resolved profile's
 `nozzle_diameter` is read from PrusaSlicer's output G-code comments in the first and last
 256 KiB. Missing, conflicting, or multiple-nozzle settings are refused. Before upload the
-profile diameter must match `/api/v1/info` `nozzle_diameter`; a mismatch names both diameters.
+profile diameter must match `/api/v1/info` `nozzle_diameter` or its configured fallback;
+a mismatch names both diameters.
 Fit a matching nozzle or slice with the matching profile. No mismatch override is offered.
 Before upload and again before Start, Dutchman requires fresh `IDLE` or `READY` status,
 with no job or transfer reported. `BUSY`, `ATTENTION`, terminal, unknown, and unavailable

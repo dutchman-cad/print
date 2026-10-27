@@ -44,6 +44,7 @@ struct Machine {
     file: Vec<u8>,
     records: Vec<Recorded>,
     digest: bool,
+    username: String,
     upload_code: u16,
     start_code: u16,
     lost: bool,
@@ -85,7 +86,7 @@ fn md5(text: &str) -> String {
         .map(|b| format!("{b:02x}"))
         .collect()
 }
-fn digest_ok(header: Option<&str>, method: &Method, path: &str) -> bool {
+fn digest_ok(header: Option<&str>, method: &Method, path: &str, username: &str) -> bool {
     let Some(header) = header.and_then(|v| v.strip_prefix("Digest ")) else {
         return false;
     };
@@ -97,9 +98,9 @@ fn digest_ok(header: Option<&str>, method: &Method, path: &str) -> bool {
     let Some(cnonce) = fields.get("cnonce") else {
         return false;
     };
-    let ha1 = md5("maker:test realm:secret");
+    let ha1 = md5(&format!("{username}:test realm:secret"));
     let ha2 = md5(&format!("{method}:{path}"));
-    fields.get("username") == Some(&"maker")
+    fields.get("username") == Some(&username)
         && fields.get("uri") == Some(&path)
         && fields.get("qop") == Some(&"auth")
         && fields
@@ -149,6 +150,7 @@ async fn handle(
                 .and_then(|v| v.to_str().ok()),
             &parts.method,
             &path,
+            &m.username,
         )
     } else {
         parts
@@ -236,6 +238,7 @@ impl Fake {
                 file: Vec::new(),
                 records: Vec::new(),
                 digest: false,
+                username: "maker".into(),
                 upload_code: 201,
                 start_code: 204,
                 lost: false,
@@ -1761,4 +1764,217 @@ async fn api_reports_configured_controls() {
     let f = Fake::new().await;
     let (_dir, app) = controls::app(f.config());
     controls::listed(&app, controls::ALL).await;
+}
+
+// Pi responses use the same public v1 endpoints, with local storage and a user login.
+async fn pi() -> (Fake, Config) {
+    let fake = Fake::new().await;
+    {
+        let mut m = fake.shared.machine.lock().await;
+        m.digest = true;
+        m.username = "workshop".into();
+        m.info = json!({"serial":"synthetic-mk3s", "mmu":false});
+        m.version = json!({"api":"1.0.0", "version":"0.7.0", "printer":"1.3.1",
+            "text":"Synthetic Pi", "firmware":"3.10.1", "capabilities":{"upload-by-put":true}});
+        m.storage = json!({"storage_list":[{"path":"/local", "type":"LOCAL",
+            "available":true, "read_only":false, "free_space":1000000}]});
+    }
+    let mut config = fake.config();
+    let p = &mut config.printers[0];
+    p.api_key = None;
+    p.username = Some("workshop".into());
+    p.password = Some("secret".into());
+    (fake, config)
+}
+
+#[tokio::test]
+async fn pi_digest_local_storage_text_and_controls() {
+    let (fake, mut config) = pi().await;
+    config.printers[0].nozzle_diameter = Some(0.4);
+    let dir = tempfile::tempdir().unwrap();
+    let input = slicer_input(dir.path());
+    let b = Safety::new(Arc::new(Printers::new(config).unwrap()));
+    b.prepare("pi", &input, "test", Options::default())
+        .await
+        .unwrap();
+    assert!(b.start("pi").await.is_err()); // A clear bed still needs acknowledgement.
+    b.clear("test").await.unwrap();
+    assert_eq!(b.start("pi").await.unwrap().state, JobState::Printing);
+    assert_eq!(b.pause("test").await.unwrap().state, JobState::Paused);
+    assert_eq!(b.resume("test").await.unwrap().state, JobState::Printing);
+    assert_eq!(b.cancel("pi").await.unwrap().state, JobState::Cancelled);
+    let m = fake.shared.machine.lock().await;
+    let upload = m
+        .records
+        .iter()
+        .find(|r| r.method == Method::PUT && r.path.starts_with("/api/v1/files/"))
+        .unwrap();
+    assert!(upload.path.starts_with("/api/v1/files/local/"));
+    assert!(upload.path.ends_with(".gcode"));
+    assert!(upload.body.is_ascii() && !upload.body.starts_with(b"GCDE"));
+    assert_eq!(upload.headers["print-after-upload"], "?0");
+    assert!(m
+        .records
+        .iter()
+        .any(|r| r.method == Method::DELETE && r.path.starts_with("/api/v1/files/local/")));
+    assert!(!m
+        .records
+        .iter()
+        .any(|r| r.headers.contains_key("x-api-key")));
+    let first_read = m
+        .records
+        .iter()
+        .position(|r| r.path == "/api/v1/status")
+        .unwrap();
+    let first_upload = m
+        .records
+        .iter()
+        .position(|r| r.method == Method::PUT)
+        .unwrap();
+    assert!(first_read < first_upload);
+}
+
+#[tokio::test]
+async fn pi_missing_nozzle_needs_config_and_reported_nozzle_takes_precedence() {
+    for (configured, reported, accepted) in [
+        (None, None, false),
+        (Some(0.4), None, true),
+        (Some(0.4), Some(0.6), false),
+        (Some(0.6), Some(0.4), true),
+        (Some(0.4), Some(0.0), false),
+    ] {
+        let (fake, mut config) = pi().await;
+        config.printers[0].nozzle_diameter = configured;
+        if let Some(d) = reported {
+            fake.shared.machine.lock().await.info["nozzle_diameter"] = json!(d);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let input = slicer_input(dir.path());
+        let b = Printers::new(config).unwrap();
+        let result = b.prepare("pi", &input, "test", Options::default()).await;
+        assert_eq!(result.is_ok(), accepted, "{result:?}");
+        if configured.is_none() {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("Set nozzle_diameter"));
+        }
+        assert_eq!(fake.count(Method::PUT).await, 0);
+    }
+}
+
+#[tokio::test]
+async fn storage_selection_refuses_ambiguity_and_checks_override() {
+    for (selected, accepted) in [
+        (None, false),
+        (Some("local"), true),
+        (Some("missing"), false),
+        (Some("sdcard"), false),
+    ] {
+        let (fake, mut config) = pi().await;
+        config.printers[0].nozzle_diameter = Some(0.4);
+        config.printers[0].storage = selected.map(str::to_owned);
+        fake.shared.machine.lock().await.storage["storage_list"]
+            .as_array_mut()
+            .unwrap()
+            .extend([
+                json!({"path":"/usb", "available":true,"read_only":false,"free_space":1000000}),
+                json!({"path":"/sdcard", "available":true,"read_only":true,"free_space":1000000}),
+            ]);
+        let dir = tempfile::tempdir().unwrap();
+        let input = slicer_input(dir.path());
+        let b = Safety::new(Arc::new(Printers::new(config).unwrap()));
+        b.prepare("pi", &input, "test", Options::default())
+            .await
+            .unwrap();
+        b.clear("test").await.unwrap();
+        let result = b.start("pi").await;
+        assert_eq!(result.is_ok(), accepted, "{result:?}");
+        assert_eq!(fake.count(Method::PUT).await, usize::from(accepted));
+    }
+}
+
+#[tokio::test]
+async fn pi_review_still_requires_identity_mmu_and_supported_uploads() {
+    for field in ["serial", "firmware", "mmu", "upload-by-put"] {
+        let (fake, mut config) = pi().await;
+        config.printers[0].nozzle_diameter = Some(0.4);
+        {
+            let mut m = fake.shared.machine.lock().await;
+            match field {
+                "serial" => {
+                    m.info.as_object_mut().unwrap().remove("serial");
+                }
+                "firmware" => {
+                    m.version.as_object_mut().unwrap().remove("firmware");
+                }
+                "mmu" => {
+                    m.info.as_object_mut().unwrap().remove("mmu");
+                }
+                _ => {
+                    m.version["capabilities"]["upload-by-put"] = json!(false);
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let input = slicer_input(dir.path());
+        let b = Printers::new(config).unwrap();
+        assert!(
+            b.prepare("pi", &input, "test", Options::default())
+                .await
+                .is_err(),
+            "{field}"
+        );
+        assert_eq!(fake.count(Method::PUT).await, 0);
+    }
+}
+
+#[tokio::test]
+async fn pi_changed_identity_or_nozzle_blocks_start() {
+    for field in ["printer", "serial", "mmu", "nozzle_diameter"] {
+        let (fake, mut config) = pi().await;
+        config.printers[0].nozzle_diameter = Some(0.4);
+        let dir = tempfile::tempdir().unwrap();
+        let input = slicer_input(dir.path());
+        let b = Safety::new(Arc::new(Printers::new(config).unwrap()));
+        b.prepare("pi", &input, "test", Options::default())
+            .await
+            .unwrap();
+        b.clear("test").await.unwrap();
+        {
+            let mut m = fake.shared.machine.lock().await;
+            match field {
+                "printer" => {
+                    m.version["printer"] = json!("different-type");
+                }
+                "serial" => {
+                    m.info["serial"] = json!("different-printer");
+                }
+                "mmu" => {
+                    m.info["mmu"] = json!(true);
+                }
+                _ => {
+                    m.info["nozzle_diameter"] = json!(0.6);
+                }
+            }
+        }
+        assert!(b.start("pi").await.is_err(), "{field}");
+        assert_eq!(fake.count(Method::PUT).await, 0);
+        assert_eq!(fake.count(Method::POST).await, 0);
+    }
+}
+
+#[tokio::test]
+async fn pi_binary_output_is_refused() {
+    let (fake, mut config) = pi().await;
+    config.printers[0].nozzle_diameter = Some(0.4);
+    let dir = tempfile::tempdir().unwrap();
+    let input = slicer_input(dir.path());
+    std::fs::write(dir.path().join("mode"), b"binary").unwrap();
+    let b = Printers::new(config).unwrap();
+    assert!(b
+        .prepare("pi", &input, "test", Options::default())
+        .await
+        .is_err());
+    assert_eq!(fake.count(Method::PUT).await, 0);
 }

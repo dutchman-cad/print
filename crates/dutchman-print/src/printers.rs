@@ -409,22 +409,38 @@ impl Printers {
             .ok_or(Error::NotFound)
     }
     async fn review_info(&self, client: &Client) -> Result<Value, Error> {
-        let info = client.json("/api/v1/info").await?;
+        let mut info = client.json("/api/v1/info").await?;
         let version = client.json("/api/version").await?;
         if info
             .get("serial")
             .and_then(Value::as_str)
             .is_none_or(str::is_empty)
-            || info
-                .get("nozzle_diameter")
-                .and_then(Value::as_f64)
-                .is_none_or(|v| v <= 0.0)
             || version
                 .get("firmware")
                 .and_then(Value::as_str)
                 .is_none_or(str::is_empty)
         {
-            return Err(refuse("Machine identity, firmware, or nozzle information is missing. Readiness cannot be reviewed for this firmware yet."));
+            return Err(refuse("Printer serial or firmware is missing. Check PrusaLink setup and update its firmware before preparing again."));
+        }
+        // Only an absent value can use the commissioned fallback; invalid telemetry is refused.
+        if info.get("nozzle_diameter").is_none_or(Value::is_null) {
+            if let Some(diameter) = client.nozzle_diameter() {
+                let object = info.as_object_mut().ok_or(Error::Unavailable)?;
+                object.insert("nozzle_diameter".into(), serde_json::json!(diameter));
+            }
+        }
+        if info
+            .get("nozzle_diameter")
+            .and_then(Value::as_f64)
+            .is_none_or(|d| !d.is_finite() || d <= 0.0 || d > 10.0)
+        {
+            return Err(refuse("Printer nozzle diameter is unknown or invalid. Set nozzle_diameter to the installed size when the printer does not report it."));
+        }
+        if version
+            .pointer("/capabilities/upload-by-put")
+            .is_some_and(|v| v.as_bool() != Some(true))
+        {
+            return Err(refuse("Printer does not support the required PUT upload API. Update PrusaLink before preparing again."));
         }
         Ok(serde_json::json!({"info":info,"version":version}))
     }
@@ -1424,35 +1440,7 @@ impl Printers {
             ));
         }
         let storage = client.json("/api/v1/storage").await?;
-        let entry = storage
-            .get("storage_list")
-            .and_then(Value::as_array)
-            .and_then(|list| {
-                list.iter().find(|s| {
-                    s.get("available").and_then(Value::as_bool) == Some(true)
-                        && s.get("read_only").and_then(Value::as_bool) == Some(false)
-                        && s.get("free_space")
-                            .and_then(Value::as_u64)
-                            .is_some_and(|free| free >= bytes.len() as u64)
-                })
-            })
-            .ok_or_else(|| {
-                refuse(
-                    "No writable storage with enough reported free space. Check printer storage.",
-                )
-            })?;
-        let storage = entry
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim_matches('/');
-        if storage.is_empty()
-            || !storage
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-        {
-            return Err(refuse("Printer storage path is not supported yet."));
-        }
+        let storage = client.storage(&storage, bytes.len() as u64)?;
         let path = format!("/api/v1/files/{storage}/{}", target.filename);
         ready(&client.snapshot().await?)?;
         let staged = async {
