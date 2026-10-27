@@ -12,10 +12,16 @@ const STATUS_TIMEOUT: Duration = Duration::from_secs(4);
 trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for T {}
 
+struct Observed {
+    identity: String,
+    dates: std::collections::BTreeMap<String, f64>,
+}
 pub struct Client {
     config: crate::config::Printer,
     uri: Uri,
     tls: Arc<rustls::ClientConfig>,
+    observation: tokio::sync::Mutex<Option<Observed>>,
+    changed: std::sync::atomic::AtomicBool,
 }
 pub struct Snapshot {
     pub printer: Printer,
@@ -99,6 +105,8 @@ impl Client {
             config,
             uri,
             tls: Arc::new(tls),
+            observation: tokio::sync::Mutex::new(None),
+            changed: std::sync::atomic::AtomicBool::new(false),
         })
     }
     pub async fn request(
@@ -248,10 +256,95 @@ impl Client {
         }
         Ok(())
     }
-    pub async fn snapshot(&self) -> Result<Snapshot, Error> {
-        tokio::time::timeout(STATUS_TIMEOUT, self.snapshot_in())
-            .await
+    pub fn acknowledge(&self) {
+        self.changed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub async fn delete(&self, filename: &str) -> Result<(), Error> {
+        let (code, _) = self
+            .request(
+                Method::DELETE,
+                &format!("/api/files/local/{filename}"),
+                Bytes::new(),
+                "application/json",
+                false,
+            )
+            .await?;
+        if !matches!(code, StatusCode::NO_CONTENT | StatusCode::NOT_FOUND) {
+            return Err(Error::Unavailable);
+        }
+        Ok(())
+    }
+    async fn observe(&self, snapshot: &mut Snapshot) -> Result<(), Error> {
+        let files = self.json("/api/files?recursive=true").await?;
+        let roots = files
+            .get("files")
+            .and_then(Value::as_array)
+            .ok_or(Error::Unavailable)?;
+        if roots.len() > 5000 {
+            return Err(Error::Unavailable);
+        }
+        let mut pending: Vec<_> = roots.iter().map(|v| (v, 0)).collect();
+        let mut dates = std::collections::BTreeMap::new();
+        let mut count = 0;
+        while let Some((file, depth)) = pending.pop() {
+            count += 1;
+            if count > 5000 || depth > 32 || pending.len() > 5000 {
+                return Err(Error::Unavailable);
+            }
+            if let Some(children) = file.get("children").and_then(Value::as_array) {
+                pending.extend(children.iter().map(|v| (v, depth + 1)));
+            }
+            if let Some(date) = history_date(&history(file)) {
+                let path = file
+                    .get("path")
+                    .or_else(|| file.get("name"))
+                    .and_then(Value::as_str)
+                    .ok_or(Error::Unavailable)?;
+                let origin = file
+                    .get("origin")
+                    .and_then(Value::as_str)
+                    .ok_or(Error::Unavailable)?;
+                dates.insert(format!("{origin}/{path}"), date);
+            }
+        }
+        let identity = crate::safety::hash(
+            serde_json::to_string(&json!([
+                snapshot.printer.state,
+                snapshot.printer.detail,
+                snapshot.job.pointer("/job/file").map(|f| json!([
+                    f.get("origin"),
+                    f.get("path"),
+                    f.get("name")
+                ]))
+            ]))
             .map_err(|_| Error::Unavailable)?
+            .as_bytes(),
+        );
+        let mut previous = self.observation.lock().await;
+        if let Some(old) = previous.as_ref() {
+            if old.identity != identity
+                || dates
+                    .iter()
+                    .any(|(path, date)| old.dates.get(path).is_none_or(|old| date > old))
+            {
+                self.changed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        *previous = Some(Observed { identity, dates });
+        snapshot.printer.needs_clearing =
+            Some(self.changed.load(std::sync::atomic::Ordering::SeqCst));
+        Ok(())
+    }
+    pub async fn snapshot(&self) -> Result<Snapshot, Error> {
+        tokio::time::timeout(STATUS_TIMEOUT, async {
+            let mut snapshot = self.snapshot_in().await?;
+            self.observe(&mut snapshot).await?;
+            Ok(snapshot)
+        })
+        .await
+        .map_err(|_| Error::Unavailable)?
     }
     async fn snapshot_in(&self) -> Result<Snapshot, Error> {
         let connection = self.json("/api/connection").await?;

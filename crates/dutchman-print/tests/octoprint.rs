@@ -19,6 +19,7 @@ use dutchman_print::{
 };
 use serde_json::{json, Value};
 use std::{
+    future::Future as _,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -49,6 +50,10 @@ struct Machine {
     slow: bool,
     oversized: bool,
     delay: bool,
+    transition: Option<(String, usize)>,
+    external_history: Value,
+    upload_lost: bool,
+    delete_fails: bool,
 }
 struct Shared {
     machine: Mutex<Machine>,
@@ -119,7 +124,26 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
             let flags = m.flags.clone().unwrap_or_else(|| json!({"operational":!matches!(m.state.as_str(),"Offline"|"Offline after error"|"Opening serial connection"),"printing":matches!(m.state.as_str(),"Printing"|"Printing from SD"),"paused":m.state=="Paused","pausing":m.state=="Pausing","cancelling":m.state=="Cancelling","error":m.state=="Error","ready":m.state=="Operational","closedOrError":matches!(m.state.as_str(),"Offline"|"Offline after error")}));
             axum::Json(json!({"state":{"text":m.state,"flags":flags},"temperature":{"tool0":{"actual":201.5},"bed":{"actual":59.0}}})).into_response()
         }
-        ("GET", "/api/job") => axum::Json(json!({"state":m.state,"job":{"file":file(&m)},"progress":m.progress})).into_response(),
+        ("GET", "/api/job") => {
+            if let Some((state, remaining)) = m.transition.take() {
+                if remaining == 0 {
+                    m.state = state;
+                    if m.state == "Operational" { m.history = json!({"date":1793059200.875,"success":false}); }
+                } else { m.transition = Some((state, remaining - 1)); }
+            }
+            axum::Json(json!({"state":m.state,"job":{"file":file(&m)},"progress":m.progress})).into_response()
+        },
+        ("GET", "/api/files") => {
+            let mut files = vec![json!({"name":"external.gcode","path":"folder/external.gcode","origin":"local","prints":{"last":m.external_history}})];
+            if m.name.is_some() { files.push(file(&m)); }
+            axum::Json(json!({"files":files})).into_response()
+        },
+        ("DELETE", p) if p.starts_with("/api/files/local/") => {
+            if m.delete_fails { return StatusCode::CONFLICT.into_response(); }
+            m.name = None;
+            m.bytes.clear();
+            StatusCode::NO_CONTENT.into_response()
+        },
         ("GET", "/api/version") => axum::Json(json!({"api":"0.1","server":"synthetic"})).into_response(),
         ("GET", "/api/printerprofiles") => axum::Json(json!({"profiles":{"test":m.profile}})).into_response(),
         ("POST", "/api/files/local") => {
@@ -128,6 +152,7 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
             m.name = Some(name.into());
             let data = text.split("Content-Type: application/octet-stream\r\n\r\n").nth(1).unwrap();
             m.bytes = data.split("\r\n--").next().unwrap().as_bytes().to_vec();
+            if m.upload_lost { return Response::new(Body::new(Broken)); }
             axum::response::Response::builder().status(201).header("Content-Type","application/json")
                 .body(Body::from(json!({"done":!m.incomplete,"effectiveSelect":false,"effectivePrint":false}).to_string())).unwrap()
         }
@@ -154,15 +179,7 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
                     _ => unreachable!(),
                 };
                 m.state = transition.into();
-                let shared = shared.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
-                    let mut m = shared.machine.lock().await;
-                    m.state = final_state.into();
-                    if final_state == "Operational" {
-                        m.history = json!({"date":1793059200.875,"success":false});
-                    }
-                });
+                m.transition = Some((final_state.into(), 1));
                 return StatusCode::NO_CONTENT.into_response();
             }
             match value["command"].as_str().unwrap() {
@@ -204,6 +221,10 @@ impl Fake {
                 slow: false,
                 oversized: false,
                 delay: false,
+                transition: None,
+                external_history: Value::Null,
+                upload_lost: false,
+                delete_fails: false,
             }),
             entered: Notify::new(),
             release: Notify::new(),
@@ -448,14 +469,17 @@ async fn stop_during_pending_start_cancels_only_the_confirmed_job() {
         async move { b.start("one").await }
     });
     f.shared.entered.notified().await;
-    let cancel = tokio::spawn({
-        let b = b.clone();
-        async move { b.cancel("one").await }
-    });
-    tokio::task::yield_now().await;
+    let cancel = b.cancel("one");
+    tokio::pin!(cancel);
+    // Poll until cancellation has registered the stop and is waiting on Start's lock.
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(cancel.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
     f.shared.release.notify_one();
     let _ = start.await.unwrap();
-    assert_eq!(cancel.await.unwrap().unwrap().state, JobState::Cancelled);
+    assert_eq!(cancel.await.unwrap().state, JobState::Cancelled);
     assert_eq!(
         f.commands().await,
         vec![json!({"command":"start"}), json!({"command":"cancel"})]
@@ -467,8 +491,8 @@ async fn stale_history_and_failed_outcomes_remain_distinct() {
     let f = Fake::new().await;
     let dir = tempfile::tempdir().unwrap();
     let b = f.backend(dir.path()).await;
-    b.clear("test").await.unwrap();
     f.shared.machine.lock().await.history = json!({"date":1793059200.125,"success":true});
+    b.clear("test").await.unwrap();
     b.start("one").await.unwrap();
     f.shared.machine.lock().await.state = "Operational".into();
     assert_eq!(b.job("one").await.unwrap().state, JobState::Printing);
@@ -559,7 +583,7 @@ async fn lost_start_checkpoint_survives_restart_without_repeating_start() {
     f.shared.machine.lock().await.lost = true;
     assert!(raw.start("one").await.is_err());
     let restored = Printers::new(f.config()).unwrap();
-    restored.restore(&path).await.unwrap();
+    restored.restore_jobs(&path).await.unwrap();
     assert_eq!(restored.job("one").await.unwrap().state, JobState::Printing);
     assert!(restored.start("one").await.is_err());
     assert_eq!(f.commands().await.len(), 1);
@@ -611,11 +635,21 @@ async fn api_machine_routes_require_fresh_confirmation_before_backend_commands()
     use tower::ServiceExt as _;
     let f = Fake::new().await;
     let dir = tempfile::tempdir().unwrap();
-    let b = f.backend(dir.path()).await;
+    let raw = Arc::new(Printers::new(f.config()).unwrap());
+    let safety = Safety::new(raw.clone());
+    safety
+        .prepare("one", &input(dir.path()), "test", Options::default())
+        .await
+        .unwrap();
     let mut settings = dutchman_print::ServerConfig::default();
     settings.storage.data_dir = dir.path().join("api");
     settings.storage.min_free = 0;
-    let app = dutchman_print::router(b, settings);
+    std::fs::create_dir_all(&settings.storage.data_dir).unwrap();
+    safety
+        .save(&settings.storage.data_dir.join("safety.json"))
+        .await
+        .unwrap();
+    let app = dutchman_print::router(raw, settings);
     for path in [
         "/api/v1/jobs/one/start",
         "/api/v1/jobs/one/cancel",
@@ -636,23 +670,42 @@ async fn api_machine_routes_require_fresh_confirmation_before_backend_commands()
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
-    let token = "a".repeat(64);
-    for expected in [StatusCode::NO_CONTENT, StatusCode::FORBIDDEN] {
-        let response = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/printers/test/clear")
-                    .header("Plugin-Confirmation", &token)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), expected);
-    }
-    assert!(f.commands().await.is_empty());
+    let issue_start = || {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/confirmations")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                json!({"action":"start","printer":"test","job":"one"}).to_string(),
+            ))
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone().oneshot(issue_start()).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+    api_action(&app, "clear", None, 1).await;
+    f.shared.machine.lock().await.profile["extruder"]["nozzleDiameter"] = json!(0.6);
+    let response = app.clone().oneshot(issue_start()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("0.4") && text.contains("0.6"));
+    f.shared.machine.lock().await.profile["extruder"]["nozzleDiameter"] = json!(0.4);
+    f.shared.machine.lock().await.flags = Some(json!({"operational":true}));
+    assert_eq!(
+        app.clone().oneshot(issue_start()).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+    f.shared.machine.lock().await.flags = None;
+    api_action(&app, "clear", None, 6).await;
+    api_action(&app, "start", Some("one"), 2).await;
+    api_action(&app, "pause", None, 3).await;
+    api_action(&app, "resume", None, 4).await;
+    api_action(&app, "cancel", Some("one"), 5).await;
+    assert_eq!(f.commands().await.len(), 4);
 }
 
 #[tokio::test]
@@ -686,14 +739,17 @@ async fn stop_during_upload_is_applied_after_the_matching_start() {
         async move { b.start("one").await }
     });
     f.shared.entered.notified().await;
-    let cancel = tokio::spawn({
-        let b = b.clone();
-        async move { b.cancel("one").await }
-    });
-    tokio::task::yield_now().await;
+    let cancel = b.cancel("one");
+    tokio::pin!(cancel);
+    // Poll until cancellation has registered the stop and is waiting on Start's lock.
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(cancel.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
     f.shared.release.notify_one();
     let _ = start.await.unwrap();
-    assert_eq!(cancel.await.unwrap().unwrap().state, JobState::Cancelled);
+    assert_eq!(cancel.await.unwrap().state, JobState::Cancelled);
     assert_eq!(
         f.commands().await,
         vec![json!({"command":"start"}), json!({"command":"cancel"})]
@@ -748,7 +804,7 @@ async fn orcaslicer_selection_exports_text_gcode_for_octoprint() {
     b.clear("test").await.unwrap();
     b.start("one").await.unwrap();
     let m = f.shared.machine.lock().await;
-    assert!(m.bytes.starts_with(b"; model printing time"));
+    assert!(m.bytes.starts_with(b"; nozzle_diameter"));
     assert!(!m.bytes.contains(&0));
     assert!(m.name.as_ref().unwrap().ends_with(".gcode"));
 }
@@ -841,8 +897,8 @@ async fn fractional_history_orders_results_within_the_same_second() {
         let f = Fake::new().await;
         let dir = tempfile::tempdir().unwrap();
         let b = f.backend(dir.path()).await;
-        b.clear("test").await.unwrap();
         f.shared.machine.lock().await.history = json!({"date":1793059200.5,"success":true});
+        b.clear("test").await.unwrap();
         b.start("one").await.unwrap();
         f.shared.machine.lock().await.state = "Operational".into();
         for date in [
@@ -887,4 +943,222 @@ async fn flags_precede_text_but_inconsistent_text_cannot_authorize_start() {
         assert_eq!(snapshot.printer.state, expected, "{key}");
         assert!(dutchman_print::octoprint::ready(&snapshot).is_err());
     }
+}
+
+async fn api_action(app: &Router, action: &str, job: Option<&str>, token: u64) {
+    use tower::ServiceExt as _;
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/confirmations")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    json!({"action":action,"printer":"test","job":job}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let code = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        code,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let challenge: Value = serde_json::from_slice(&bytes).unwrap();
+    let route = match job {
+        Some(job) => format!("/api/v1/jobs/{job}/{action}"),
+        None => format!("/api/v1/printers/test/{action}"),
+    };
+    let request = || {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(&route)
+            .header("Content-Type", "application/json")
+            .header("Plugin-Confirmation", format!("{token:064x}"))
+            .body(Body::from(
+                json!({"confirmation":challenge["id"]}).to_string(),
+            ))
+            .unwrap()
+    };
+    let response = app.clone().oneshot(request()).await.unwrap();
+    let code = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        code,
+        if action == "clear" {
+            StatusCode::NO_CONTENT
+        } else {
+            StatusCode::OK
+        },
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(
+        app.clone().oneshot(request()).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn history_on_any_file_or_polled_activity_withdraws_clearance() {
+    for mode in ["history", "identity", "state"] {
+        let f = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let b = f.backend(dir.path()).await;
+        b.clear("test").await.unwrap();
+        assert_eq!(b.printer("test").await.unwrap().needs_clearing, Some(false));
+        {
+            let mut m = f.shared.machine.lock().await;
+            match mode {
+                "history" => m.external_history = json!({"date":1793059200.75,"success":true}),
+                "identity" => m.name = Some("external.gcode".into()),
+                _ => m.state = "Printing".into(),
+            }
+        }
+        b.printer("test").await.unwrap();
+        f.shared.machine.lock().await.state = "Operational".into();
+        assert_eq!(b.printer("test").await.unwrap().needs_clearing, Some(true));
+        assert!(b.start("one").await.is_err());
+        assert!(f.commands().await.is_empty());
+        b.clear("test").await.unwrap();
+        assert_eq!(b.printer("test").await.unwrap().needs_clearing, Some(false));
+    }
+}
+
+#[tokio::test]
+async fn failed_or_uncertain_upload_is_deleted_before_returning() {
+    for mode in ["incomplete", "lost", "size", "cleanup"] {
+        let f = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let b = f.backend(dir.path()).await;
+        b.clear("test").await.unwrap();
+        {
+            let mut m = f.shared.machine.lock().await;
+            m.incomplete = mode == "incomplete" || mode == "cleanup";
+            m.upload_lost = mode == "lost";
+            m.bad_size = mode == "size";
+            m.delete_fails = mode == "cleanup";
+        }
+        let error = b.start("one").await.unwrap_err().to_string();
+        let m = f.shared.machine.lock().await;
+        assert!(m
+            .records
+            .iter()
+            .any(|(method, path, _)| *method == Method::DELETE
+                && path.starts_with("/api/files/local/")));
+        assert_eq!(m.name.is_none(), mode != "cleanup");
+        if mode == "cleanup" {
+            assert!(error.contains("cleanup is unconfirmed"));
+        }
+        drop(m);
+        assert!(f.commands().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn octoprint_nozzle_must_match_sliced_gcode_without_override() {
+    {
+        let f = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = input(dir.path());
+        std::fs::write(dir.path().join("mode"), "missing").unwrap();
+        let raw = Printers::new(f.config()).unwrap();
+        assert!(raw
+            .prepare("one", &path, "test", Options::default())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("nozzle diameter is missing"));
+        assert!(f.commands().await.is_empty());
+    }
+    for nozzle in [json!(0.6), Value::Null] {
+        let f = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = input(dir.path());
+        f.shared.machine.lock().await.profile["extruder"]["nozzleDiameter"] = nozzle.clone();
+        let raw = Printers::new(f.config()).unwrap();
+        let error = raw
+            .prepare("one", &path, "test", Options::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nozzle"));
+        if !nozzle.is_null() {
+            assert!(error.contains("0.4") && error.contains("0.6"));
+        }
+        assert!(f.commands().await.is_empty());
+    }
+    let f = Fake::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let b = f.backend(dir.path()).await;
+    b.clear("test").await.unwrap();
+    f.shared.machine.lock().await.profile["extruder"]["nozzleDiameter"] = json!(0.6);
+    let error = b.start("one").await.unwrap_err().to_string();
+    assert!(error.contains("0.4") && error.contains("0.6"));
+    assert!(!f
+        .shared
+        .machine
+        .lock()
+        .await
+        .records
+        .iter()
+        .any(|(method, path, _)| *method == Method::POST && path == "/api/files/local"));
+}
+
+#[tokio::test]
+async fn background_polling_remembers_activity_after_return_to_idle() {
+    let f = Fake::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let b = Arc::new(
+        Safety::new(Arc::new(Printers::new(f.config()).unwrap())).timing(
+            Arc::new(dutchman_print::simulated::SystemClock::default()),
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(60),
+        ),
+    );
+    b.prepare("one", &input(dir.path()), "test", Options::default())
+        .await
+        .unwrap();
+    b.clear("test").await.unwrap();
+    let before = {
+        let mut m = f.shared.machine.lock().await;
+        m.state = "Printing".into();
+        m.records
+            .iter()
+            .filter(|(_, path, _)| path == "/api/files")
+            .count()
+    };
+    b.monitor();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let seen = f
+                .shared
+                .machine
+                .lock()
+                .await
+                .records
+                .iter()
+                .filter(|(_, path, _)| path == "/api/files")
+                .count();
+            if seen > before {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    f.shared.machine.lock().await.state = "Operational".into();
+    assert_eq!(b.printer("test").await.unwrap().needs_clearing, Some(true));
+    assert!(b.start("one").await.is_err());
+    assert!(f.commands().await.is_empty());
 }

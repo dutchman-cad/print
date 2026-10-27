@@ -511,7 +511,7 @@ Create a key in your local OctoPrint installation. Prefer a user-approved applic
 from [Application Keys](https://docs.octoprint.org/en/main/bundledplugins/appkeys.html), or
 generate a personal key in your user settings using the API key controls in the change-password
 dialog, described in [API authentication](https://docs.octoprint.org/en/main/api/general.html#authorization).
-The key needs status, version, printer-profile read, file-list, upload, select, print, pause,
+The key needs status, version, printer-profile read, file-list, upload, delete, select, print, pause,
 and cancel permissions. Permission failures are reported as authentication failures; inspect
 the key's permissions in OctoPrint. Dutchman sends it only as `X-Api-Key`, never in a URL.
 No cloud account or application registration is required. Keep the config private.
@@ -535,14 +535,31 @@ SD/file transfers report offline with their phase in detail, since API v1 has no
 Starting still requires complete flags and consistent Operational readiness. Progress, remaining time,
 temperatures, and selected file name are reported when available. Missing values stay absent.
 
-Before starting, acknowledge the checked bed with `clear workbench --yes` or the confirmed
-API clear route. Dutchman checks input and G-code bytes, configured profiles, the active
+Before starting, acknowledge the checked bed through a `clear` challenge and the confirmed
+API clear route. Clearance belongs to the running server and expires under the shared
+polling policy; a separate command line invocation cannot retain it. While clearance is held,
+polling reads the recursive file list as well as status. A newer `prints.last.date` on any
+file, or a job or state change seen by polling, withdraws clearance even if the printer is
+idle again. Activity between polls with no retained history or identity change remains
+unobservable. Clear and Start each require their own server-issued challenge and fresh
+`Plugin-Confirmation` header.
+
+The sliced `nozzle_diameter` setting in the G-code comments must match the selected
+OctoPrint printer profile's `extruder.nozzleDiameter`, during preparation, challenge review,
+and before upload. Missing or ambiguous diameters are refused; mismatches name both values.
+There is no override. Check the physical nozzle too: the profile describes configuration,
+not a sensor reading.
+
+Before starting, Dutchman checks input and G-code bytes, configured profiles, the active
 OctoPrint connection and printer profile, and server version against preparation. It checks
 fresh readiness before upload and again before start. It stages a uniquely named local file
 using [file operations](https://docs.octoprint.org/en/main/api/files.html), with select and print
 disabled, refusing an existing name. Uploads are capped at 200 MiB with a deadline of 30 seconds
 plus one second per 32 KiB. It requires a completed upload and validates the stored name,
-origin, machine-code type, and size. It selects without printing, reads the selected file
+origin, machine-code type, and size. Failed or uncertain uploads, including failed stored-file
+validation, trigger deletion of the staged remote file before the error is returned. If
+deletion cannot be confirmed, inspect OctoPrint storage and remove it before preparing again.
+These failures never send Start. It selects without printing, reads the selected file
 back, and only then sends the explicit job start command once. A conflict or lost reply
 requires status reconciliation; an attempted start is never repeated automatically.
 

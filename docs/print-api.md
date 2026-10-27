@@ -115,13 +115,23 @@ Start automatically. A cancellation requested while Start is pending remains pen
 the same live job is cancelled and fresh telemetry confirms the outcome.
 
 OctoPrint uses the same routes, confirmation header, reviewed-byte checks, and bed-clear
-policy. Its `detail` retains a known connection state or a safe availability reason;
+policy. Clearance is held only by the running server; clear and start use separate challenges.
+Polling reads the recursive OctoPrint file list: a newer `prints.last.date` on any file,
+or an observed job/state change, withdraws clearance even after a return to idle.
+Its `detail` retains a known connection state or a safe availability reason;
 authentication failure is separate from machine failure. A reachable host with a disconnected
 serial printer is `offline`; `Offline after error` is `error`. Summary states prefer
 printer flags over display text. Starting, Resuming, SD printing, Pausing, Cancelling, and
 Finishing map to `printing`; Finishing alone cannot establish completion. Connection/detection
 and file-transfer phases map to `offline`, with the phase in `detail` (v1 has no busy state).
 Unknown or contradictory readiness blocks start/resume.
+OctoPrint checks the sliced G-code's `nozzle_diameter` against the selected printer profile's
+`extruder.nozzleDiameter` during preparation, challenge review, and before upload. Missing or
+ambiguous diameters block the action; a mismatch names both values, with no override. This
+checks the configured profile and cannot establish which physical nozzle is installed.
+A failed or uncertain upload or failed stored-file validation triggers `DELETE` on the staged
+remote file before returning an error; Start is never sent. Unconfirmed cleanup requires
+inspection and removal in OctoPrint before preparing again.
 For OctoPrint, optional `job_id` identifies the selected file as `origin/name`, not an
 execution identifier. Pause/resume/cancel require that file still be live and match the
 companion's attempted start. External reprints of the exact staged file are indistinguishable;
