@@ -470,6 +470,8 @@ impl Telemetry {
         };
         let state = if !live {
             PrinterState::Offline
+        } else if detail == "PAUSE" && !self.hms_detail().is_empty() {
+            PrinterState::Attention
         } else if self.serious_hms() || self.active_error() {
             PrinterState::Error
         } else {
@@ -631,6 +633,7 @@ impl Client {
         name: &str,
         expected: &str,
         identity: Option<&str>,
+        guard: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Result<(), Error> {
         self.check_control()?;
         // Seeded from the clock in milliseconds, so it never reaches u64::MAX.
@@ -671,6 +674,8 @@ impl Client {
                         sent = true;
                         client.publish(format!("device/{serial}/request"), QoS::AtLeastOnce, false, payload.to_string()).await.map_err(|_| Error::Unavailable)?;
                     }
+                    // Keep Stop serialized through its outcome; other commands allow Stop to overtake their wait.
+                    Event::Outgoing(rumqttc::Outgoing::Publish(_)) if sent && expected != "FAILED" => { guard.take(); }
                     Event::Incoming(Incoming::Publish(p)) if sent && !p.retain && p.topic == format!("device/{serial}/report") => {
                         let value: Value = serde_json::from_slice(&p.payload).unwrap_or(Value::Null);
                         if value.pointer("/print/sequence_id").and_then(Value::as_str) == Some(&sequence)
@@ -683,7 +688,7 @@ impl Client {
                             && telemetry.printer(&self.config, self.fresh).job_id.as_deref().is_some_and(|id| identity.is_none_or(|expected| id == expected))
                             && (expected == "FAILED" || (!telemetry.active_error() && telemetry.fields.get("print_error").and_then(Value::as_u64).is_some()))
                             && telemetry.fields.get("subtask_name").and_then(Value::as_str) == Some(name)
-                            && telemetry.fields.get("gcode_state").and_then(Value::as_str).is_some_and(|s| s == expected || (expected == "RUNNING" && s == "PREPARE")) {
+                            && telemetry.fields.get("gcode_state").and_then(Value::as_str).is_some_and(|s| s == expected || s == "FAILED" || (expected == "RUNNING" && s == "PREPARE")) {
                             telemetry.terminal |= self.state.borrow().terminal;
                             self.state.send_replace(telemetry);
                             return Ok(());
@@ -693,7 +698,14 @@ impl Client {
                 }
             }
         };
-        tokio::time::timeout(DEADLINE, operation).await.map_err(|_| Error::Refused("Command is not confirmed. Check authorization and read status to reconcile the job. Start will not be repeated.".into()))?
+        eprintln!("Bambu command is pending. Waiting for fresh status; do not repeat the command.");
+        let deadline =
+            Duration::from_secs(if matches!(command.as_str(), "project_file" | "stop") {
+                25
+            } else {
+                10
+            });
+        tokio::time::timeout(deadline, operation).await.map_err(|_| Error::Refused("Command is not confirmed. Check authorization and read status to reconcile the job. Start will not be repeated.".into()))?
     }
 
     pub fn new(config: crate::config::Printer, oneshot: bool) -> Result<Self, String> {

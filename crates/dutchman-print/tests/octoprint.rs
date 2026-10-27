@@ -43,6 +43,8 @@ struct Machine {
     profile: Value,
     block: bool,
     block_upload: bool,
+    hold_start: bool,
+    hold_controls: bool,
     start_conflict: bool,
     missing: bool,
     progress: Value,
@@ -59,6 +61,7 @@ struct Shared {
     machine: Mutex<Machine>,
     entered: Notify,
     release: Notify,
+    polled: Notify,
 }
 struct Fake {
     shared: Arc<Shared>,
@@ -125,6 +128,7 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
             axum::Json(json!({"state":{"text":m.state,"flags":flags},"temperature":{"tool0":{"actual":201.5},"bed":{"actual":59.0}}})).into_response()
         }
         ("GET", "/api/job") => {
+            if m.hold_start && m.state == "Starting" { shared.polled.notify_one(); }
             if let Some((state, remaining)) = m.transition.take() {
                 if remaining == 0 {
                     m.state = state;
@@ -170,6 +174,7 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
         ("POST", "/api/job") => {
             if m.conflict || m.start_conflict {return StatusCode::CONFLICT.into_response();}
             let value: Value = serde_json::from_slice(&body).unwrap();
+            if m.hold_controls && value["command"] == "pause" { shared.polled.notify_one(); return StatusCode::NO_CONTENT.into_response(); }
             if m.delay {
                 let (transition, final_state) = match value["command"].as_str().unwrap() {
                     "start" => ("Starting", "Printing"),
@@ -183,7 +188,7 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
                 return StatusCode::NO_CONTENT.into_response();
             }
             match value["command"].as_str().unwrap() {
-                "start" => {m.state = "Printing".into(); if m.lost {return Response::new(Body::new(Broken));}},
+                "start" => {m.state = if m.hold_start { "Starting" } else { "Printing" }.into(); if m.lost {return Response::new(Body::new(Broken));}},
                 "pause" => match value["action"].as_str().unwrap() {"pause" => m.state="Paused".into(), "resume" => m.state="Printing".into(), _ => unreachable!()},
                 "cancel" => {m.state="Operational".into(); m.history=json!({"date":1793059200.875,"success":false});},
                 _ => unreachable!(),
@@ -214,6 +219,8 @@ impl Fake {
                 profile: json!({"id":"test","model":"Test model","volume":{"width":180,"depth":180,"height":180},"extruder":{"count":1,"nozzleDiameter":0.4},"heatedBed":true}),
                 block: false,
                 block_upload: false,
+                hold_start: false,
+                hold_controls: false,
                 start_conflict: false,
                 missing: false,
                 progress: json!({"completion":25.0,"printTimeLeft":60}),
@@ -228,6 +235,7 @@ impl Fake {
             }),
             entered: Notify::new(),
             release: Notify::new(),
+            polled: Notify::new(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/proxy/", listener.local_addr().unwrap());
@@ -294,19 +302,19 @@ async fn states_serial_connection_authentication_and_optional_values() {
         ("Resuming", PrinterState::Printing),
         ("Finishing", PrinterState::Printing),
         ("Printing from SD", PrinterState::Printing),
-        ("Sending file to SD", PrinterState::Offline),
-        ("Starting to send file to SD", PrinterState::Offline),
-        ("Transferring file to SD", PrinterState::Offline),
-        ("Transferring file to printer", PrinterState::Offline),
-        ("Connecting", PrinterState::Offline),
-        ("Detecting", PrinterState::Offline),
-        ("Detecting serial port", PrinterState::Offline),
-        ("Detecting baudrate", PrinterState::Offline),
+        ("Sending file to SD", PrinterState::Busy),
+        ("Starting to send file to SD", PrinterState::Busy),
+        ("Transferring file to SD", PrinterState::Busy),
+        ("Transferring file to printer", PrinterState::Busy),
+        ("Connecting", PrinterState::Busy),
+        ("Detecting", PrinterState::Busy),
+        ("Detecting serial port", PrinterState::Busy),
+        ("Detecting baudrate", PrinterState::Busy),
         ("Paused", PrinterState::Paused),
         ("Error", PrinterState::Error),
         ("Offline", PrinterState::Offline),
         ("Offline after error", PrinterState::Error),
-        ("Opening serial connection", PrinterState::Offline),
+        ("Opening serial connection", PrinterState::Busy),
         ("Future", PrinterState::Offline),
     ] {
         f.shared.machine.lock().await.state = state.into();
@@ -478,8 +486,9 @@ async fn stop_during_pending_start_cancels_only_the_confirmed_job() {
             .is_pending()
     );
     f.shared.release.notify_one();
-    let _ = start.await.unwrap();
-    assert_eq!(cancel.await.unwrap().state, JobState::Cancelled);
+    let (started, cancelled) = tokio::join!(start, cancel);
+    assert_eq!(started.unwrap().unwrap().state, JobState::Cancelled);
+    assert_eq!(cancelled.unwrap().state, JobState::Cancelled);
     assert_eq!(
         f.commands().await,
         vec![json!({"command":"start"}), json!({"command":"cancel"})]
@@ -748,8 +757,9 @@ async fn stop_during_upload_is_applied_after_the_matching_start() {
             .is_pending()
     );
     f.shared.release.notify_one();
-    let _ = start.await.unwrap();
-    assert_eq!(cancel.await.unwrap().state, JobState::Cancelled);
+    let (started, cancelled) = tokio::join!(start, cancel);
+    assert_eq!(started.unwrap().unwrap().state, JobState::Cancelled);
+    assert_eq!(cancelled.unwrap().state, JobState::Cancelled);
     assert_eq!(
         f.commands().await,
         vec![json!({"command":"start"}), json!({"command":"cancel"})]
@@ -1121,7 +1131,7 @@ async fn background_polling_remembers_activity_after_return_to_idle() {
     let b = Arc::new(
         Safety::new(Arc::new(Printers::new(f.config()).unwrap())).timing(
             Arc::new(dutchman_print::simulated::SystemClock::default()),
-            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(60),
         ),
     );
@@ -1161,4 +1171,150 @@ async fn background_polling_remembers_activity_after_return_to_idle() {
     assert_eq!(b.printer("test").await.unwrap().needs_clearing, Some(true));
     assert!(b.start("one").await.is_err());
     assert!(f.commands().await.is_empty());
+}
+
+#[tokio::test]
+async fn independent_printers_and_stop_during_start_poll() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+    for pending in [false, true] {
+        let a = Fake::new().await;
+        let b = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = input(dir.path());
+        let mut config = a.config();
+        let mut other = b.config().printers.remove(0);
+        other.id = "other".into();
+        config.printers.push(other);
+        let backend = Arc::new(Safety::new(Arc::new(Printers::new(config).unwrap())));
+        backend
+            .prepare("one", &path, "test", Options::default())
+            .await
+            .unwrap();
+        backend
+            .prepare("two", &path, "other", Options::default())
+            .await
+            .unwrap();
+        backend.clear("other").await.unwrap();
+        backend.start("two").await.unwrap();
+        backend.clear("test").await.unwrap();
+        {
+            let mut m = a.shared.machine.lock().await;
+            if pending {
+                m.hold_start = true;
+            } else {
+                m.block_upload = true;
+            }
+        }
+        let start = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.start("one").await }
+        });
+        timeout(Duration::from_secs(5), async {
+            if pending {
+                a.shared.polled.notified().await;
+            } else {
+                a.shared.entered.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!start.is_finished());
+        timeout(Duration::from_secs(2), async {
+            assert_eq!(
+                backend.printer("other").await.unwrap().state,
+                PrinterState::Printing
+            );
+            assert_eq!(backend.job("two").await.unwrap().state, JobState::Printing);
+            backend
+                .review_action("cancel", "other", Some("two"))
+                .await
+                .unwrap();
+            assert_eq!(
+                backend.cancel("two").await.unwrap().state,
+                JobState::Cancelled
+            );
+        })
+        .await
+        .unwrap();
+        if pending {
+            assert_eq!(
+                timeout(Duration::from_secs(2), backend.cancel("one"))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                JobState::Cancelled
+            );
+            assert_eq!(
+                timeout(Duration::from_secs(2), start)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                JobState::Cancelled
+            );
+            assert_eq!(backend.job("one").await.unwrap().state, JobState::Cancelled);
+        } else {
+            a.shared.release.notify_one();
+            assert_eq!(
+                timeout(Duration::from_secs(5), start)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                JobState::Printing
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn stop_overtakes_pause_and_resume_polls() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+    for resume in [false, true] {
+        let f = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let backend = f.backend(dir.path()).await;
+        backend.clear("test").await.unwrap();
+        backend.start("one").await.unwrap();
+        if resume {
+            backend.pause("test").await.unwrap();
+        }
+        f.shared.machine.lock().await.hold_controls = true;
+        let command = tokio::spawn({
+            let backend = backend.clone();
+            async move {
+                if resume {
+                    backend.resume("test").await
+                } else {
+                    backend.pause("test").await
+                }
+            }
+        });
+        timeout(Duration::from_secs(5), f.shared.polled.notified())
+            .await
+            .unwrap();
+        assert!(!command.is_finished());
+        assert_eq!(
+            timeout(Duration::from_secs(2), backend.cancel("one"))
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Cancelled
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(2), command)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Cancelled
+        );
+    }
 }

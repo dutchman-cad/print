@@ -6,7 +6,7 @@ mod slicer_fixture;
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     Router,
@@ -28,6 +28,7 @@ use tokio::sync::{Mutex, Notify};
 
 #[derive(Clone)]
 struct Recorded {
+    peer: std::net::SocketAddr,
     method: Method,
     path: String,
     headers: HeaderMap,
@@ -53,11 +54,17 @@ struct Machine {
     slow: bool,
     block_upload: bool,
     block_start: bool,
+    hold_start: bool,
+    hold_controls: bool,
+    transition: Option<(String, usize)>,
+    delayed: bool,
+    stale: Option<Method>,
 }
 struct Shared {
     machine: Mutex<Machine>,
     entered: Notify,
     release: Notify,
+    polled: Notify,
 }
 struct Fake {
     shared: Arc<Shared>,
@@ -92,9 +99,17 @@ fn digest_ok(header: Option<&str>, method: &Method, path: &str) -> bool {
     fields.get("username") == Some(&"maker")
         && fields.get("uri") == Some(&path)
         && fields.get("qop") == Some(&"auth")
-        && fields.get("nc") == Some(&"00000001")
+        && fields
+            .get("nc")
+            .is_some_and(|nc| u32::from_str_radix(nc, 16).is_ok_and(|n| n > 0))
         && fields.get("response").copied()
-            == Some(md5(&format!("{ha1}:test-nonce:00000001:{cnonce}:auth:{ha2}")).as_str())
+            == Some(
+                md5(&format!(
+                    "{ha1}:test-nonce:{}:{cnonce}:auth:{ha2}",
+                    fields["nc"]
+                ))
+                .as_str(),
+            )
 }
 struct Broken;
 impl hyper::body::Body for Broken {
@@ -107,12 +122,17 @@ impl hyper::body::Body for Broken {
         std::task::Poll::Ready(Some(Err(std::io::Error::other("lost reply"))))
     }
 }
-async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response {
+async fn handle(
+    State(shared): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    request: Request,
+) -> Response {
     let (parts, body) = request.into_parts();
     let path = parts.uri.path().to_owned();
     let bytes = axum::body::to_bytes(body, 200 << 20).await.unwrap();
     let mut m = shared.machine.lock().await;
     m.records.push(Recorded {
+        peer,
         method: parts.method.clone(),
         path: path.clone(),
         headers: parts.headers.clone(),
@@ -136,6 +156,17 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
     if !authenticated {
         return (StatusCode::UNAUTHORIZED, [("www-authenticate", "Digest realm=\"test realm\", nonce=\"test-nonce\", qop=\"auth,auth-int\", algorithm=MD5")]).into_response();
     }
+    if m.stale.as_ref() == Some(&parts.method) {
+        m.stale = None;
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(
+                "www-authenticate",
+                "Digest realm=\"test realm\", nonce=\"test-nonce\", qop=\"auth\", stale=true",
+            )],
+        )
+            .into_response();
+    }
     if m.slow && path == "/api/v1/status" {
         drop(m);
         tokio::time::sleep(std::time::Duration::from_secs(6)).await;
@@ -143,6 +174,11 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
     }
     match (parts.method.as_str(), path.as_str()) {
         ("GET", "/api/v1/status") => {
+            if m.hold_start && m.state == "PAUSED" { shared.polled.notify_one(); }
+            if let Some((state, remaining)) = m.transition.take() {
+                if remaining == 0 { m.state = state; }
+                else { m.transition = Some((state, remaining - 1)); }
+            }
             if m.missing { return axum::Json(json!({})).into_response(); }
             let mut value = json!({"printer":{"state":m.state,"temp_nozzle":205.0,"temp_bed":60.0}});
             if matches!(m.state.as_str(), "PRINTING" | "PAUSED" | "FINISHED" | "STOPPED" | "ATTENTION" | "ERROR") && !m.name.is_empty() {
@@ -160,20 +196,27 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
             m.name = path.rsplit('/').next().unwrap().into(); m.file = bytes.to_vec();
             StatusCode::CREATED.into_response()
         }
+        ("DELETE", _) if path.starts_with("/api/v1/files/") => { m.file.clear(); StatusCode::NO_CONTENT.into_response() }
         ("GET", _) if path.starts_with("/api/v1/files/") => axum::Json(json!({"name":m.name,"size":m.file.len() + usize::from(m.bad_size),"type": if m.bad_type { "FIRMWARE" } else { "PRINT_FILE" }})).into_response(),
         ("POST", _) if path.starts_with("/api/v1/files/") => {
             if m.block_start { drop(m); shared.entered.notify_one(); shared.release.notified().await; m = shared.machine.lock().await; }
             if m.start_code != 204 { return StatusCode::from_u16(m.start_code).unwrap().into_response(); }
-            m.state = "PRINTING".into(); m.id += 1;
+            m.state = if m.hold_start { "PAUSED" } else { "PRINTING" }.into(); m.id += 1;
             if m.lost { return Response::builder().status(200).body(Body::new(Broken)).unwrap(); }
             StatusCode::NO_CONTENT.into_response()
         }
         ("PUT" | "DELETE", _) if path.starts_with("/api/v1/job/") => {
+            if m.hold_controls && parts.method == Method::PUT { shared.polled.notify_one(); return StatusCode::NO_CONTENT.into_response(); }
             let live = format!("/api/v1/job/{}", m.id);
             if path == format!("{live}/pause") { m.state = "PAUSED".into(); }
             else if path == format!("{live}/resume") { m.state = "PRINTING".into(); }
             else if path == live && parts.method == Method::DELETE { m.state = "STOPPED".into(); }
             else { return StatusCode::NOT_FOUND.into_response(); }
+            if m.delayed {
+                let next = m.state.clone();
+                m.state = if next == "PRINTING" { "PAUSED" } else { "PRINTING" }.into();
+                m.transition = Some((next, 2));
+            }
             StatusCode::NO_CONTENT.into_response()
         }
         _ => StatusCode::NOT_FOUND.into_response(),
@@ -199,18 +242,29 @@ impl Fake {
                 slow: false,
                 block_upload: false,
                 block_start: false,
+                hold_start: false,
+                hold_controls: false,
+                delayed: false,
+                stale: None,
+                transition: None,
                 info: json!({"serial":"synthetic-1","nozzle_diameter":0.4,"mmu":false}),
                 version: json!({"firmware":"test-1"}),
                 storage: json!({"storage_list":[{"path":"/test-disk","available":true,"read_only":false,"free_space":1000000}]}),
             }),
             entered: Notify::new(),
             release: Notify::new(),
+            polled: Notify::new(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let app = Router::new().fallback(handle).with_state(shared.clone());
         let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
         Self { shared, url, task }
     }
@@ -290,9 +344,9 @@ async fn every_documented_state_and_optional_telemetry() {
         ("FINISHED", PrinterState::Idle),
         ("STOPPED", PrinterState::Idle),
         ("PRINTING", PrinterState::Printing),
-        ("BUSY", PrinterState::Printing),
+        ("BUSY", PrinterState::Busy),
         ("PAUSED", PrinterState::Paused),
-        ("ATTENTION", PrinterState::Paused),
+        ("ATTENTION", PrinterState::Attention),
         ("ERROR", PrinterState::Error),
         ("FUTURE", PrinterState::Error),
     ] {
@@ -521,7 +575,7 @@ async fn replacement_job_and_old_terminal_outcome_never_control_a_new_job() {
         m.id = 99;
         m.state = "FINISHED".into();
     }
-    assert_eq!(b.job("one").await.unwrap().state, JobState::Paused);
+    assert_eq!(b.job("one").await.unwrap().state, JobState::Ended);
     fake.shared.machine.lock().await.state = "PAUSED".into();
     assert!(b.resume("test").await.is_err());
     assert!(b.cancel("one").await.is_err());
@@ -677,7 +731,7 @@ async fn terminal_outcomes_are_distinct_and_idle_does_not_mean_done() {
         ("FINISHED", JobState::Done),
         ("STOPPED", JobState::Cancelled),
         ("ERROR", JobState::Failed),
-        ("IDLE", JobState::Printing),
+        ("IDLE", JobState::Ended),
     ] {
         let fake = Fake::new().await;
         let dir = tempfile::tempdir().unwrap();
@@ -1157,4 +1211,361 @@ async fn server_restart_reconciles_tracked_prusalink_job_before_cancel() {
         .unwrap();
     assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
     assert_eq!(fake.shared.machine.lock().await.state, "STOPPED");
+}
+
+#[tokio::test]
+async fn vanished_execution_ends_and_terminal_outcomes_stay_terminal() {
+    for terminal in [None, Some("FINISHED"), Some("STOPPED")] {
+        let fake = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let b = fake.backend(dir.path()).await;
+        b.clear("test").await.unwrap();
+        b.start("one").await.unwrap();
+        if let Some(state) = terminal {
+            fake.shared.machine.lock().await.state = state.into();
+            b.printers().await.unwrap();
+        }
+        fake.shared.machine.lock().await.state = "IDLE".into();
+        let expected = match terminal {
+            Some("FINISHED") => JobState::Done,
+            Some("STOPPED") => JobState::Cancelled,
+            _ => JobState::Ended,
+        };
+        assert_eq!(b.job("one").await.unwrap().state, expected);
+        fake.shared.machine.lock().await.state = "BUSY".into();
+        assert_eq!(b.job("one").await.unwrap().state, expected);
+    }
+}
+
+#[tokio::test]
+async fn attention_and_busy_refuse_movement_and_attention_allows_cancel() {
+    for (state, expected) in [
+        ("ATTENTION", PrinterState::Attention),
+        ("BUSY", PrinterState::Busy),
+    ] {
+        let fake = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let b = fake.backend(dir.path()).await;
+        b.clear("test").await.unwrap();
+        b.start("one").await.unwrap();
+        b.pause("test").await.unwrap();
+        fake.shared.machine.lock().await.state = state.into();
+        assert_eq!(b.printer("test").await.unwrap().state, expected);
+        assert!(b.pause("test").await.is_err());
+        assert!(b.resume("test").await.is_err());
+        assert!(b.clear("test").await.is_err());
+        assert!(b.start("one").await.is_err());
+        assert_eq!(b.job("one").await.unwrap().state, JobState::Paused);
+        if state == "ATTENTION" {
+            assert_eq!(b.cancel("one").await.unwrap().state, JobState::Cancelled);
+        }
+    }
+}
+
+#[tokio::test]
+async fn delayed_commands_poll_without_resending() {
+    let fake = Fake::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let b = fake.backend(dir.path()).await;
+    b.clear("test").await.unwrap();
+    b.start("one").await.unwrap();
+    fake.shared.machine.lock().await.delayed = true;
+    assert_eq!(b.pause("test").await.unwrap().state, JobState::Paused);
+    assert_eq!(b.resume("test").await.unwrap().state, JobState::Printing);
+    assert_eq!(b.cancel("one").await.unwrap().state, JobState::Cancelled);
+    let m = fake.shared.machine.lock().await;
+    for suffix in ["/pause", "/resume", "/41"] {
+        assert_eq!(
+            m.records
+                .iter()
+                .filter(|r| r.method != Method::GET && r.path.ends_with(suffix))
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn digest_reuses_connection_and_challenge_and_increments_nonce_count() {
+    let fake = Fake::new().await;
+    fake.shared.machine.lock().await.digest = true;
+    let mut config = fake.config().printers.remove(0);
+    config.api_key = None;
+    config.username = Some("maker".into());
+    config.password = Some("secret".into());
+    let client = Client::new(config).unwrap();
+    for _ in 0..4 {
+        client.snapshot().await.unwrap();
+    }
+    let m = fake.shared.machine.lock().await;
+    assert_eq!(
+        m.records
+            .iter()
+            .map(|r| r.peer)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        1
+    );
+    assert_eq!(
+        m.records
+            .iter()
+            .filter(|r| !r.headers.contains_key("authorization"))
+            .count(),
+        1
+    );
+    let counts: Vec<_> = m
+        .records
+        .iter()
+        .filter_map(|r| r.headers.get("authorization"))
+        .map(|v| {
+            v.to_str()
+                .unwrap()
+                .split(", ")
+                .find(|s| s.starts_with("nc="))
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        counts,
+        ["nc=00000001", "nc=00000002", "nc=00000003", "nc=00000004"]
+    );
+}
+
+#[tokio::test]
+async fn failed_upload_and_validation_delete_without_start() {
+    for mode in ["rejected", "size", "type"] {
+        let fake = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let b = fake.backend(dir.path()).await;
+        b.clear("test").await.unwrap();
+        {
+            let mut m = fake.shared.machine.lock().await;
+            match mode {
+                "rejected" => m.upload_code = 500,
+                "size" => m.bad_size = true,
+                _ => m.bad_type = true,
+            }
+        }
+        assert!(b.start("one").await.is_err());
+        assert_eq!(fake.count(Method::DELETE).await, 1);
+        assert_eq!(fake.count(Method::POST).await, 0);
+    }
+}
+
+#[tokio::test]
+async fn stale_digest_retries_only_reads() {
+    let fake = Fake::new().await;
+    fake.shared.machine.lock().await.digest = true;
+    let mut config = fake.config().printers.remove(0);
+    config.api_key = None;
+    config.username = Some("maker".into());
+    config.password = Some("secret".into());
+    let client = Client::new(config).unwrap();
+    client.snapshot().await.unwrap();
+    fake.shared.machine.lock().await.stale = Some(Method::GET);
+    client.snapshot().await.unwrap();
+    fake.shared.machine.lock().await.stale = Some(Method::PUT);
+    assert!(client
+        .request(Method::PUT, "/api/v1/job/40/pause", Bytes::new(), false)
+        .await
+        .is_err());
+    let m = fake.shared.machine.lock().await;
+    assert_eq!(
+        m.records.iter().filter(|r| r.method == Method::PUT).count(),
+        1
+    );
+    assert_eq!(
+        m.records.iter().filter(|r| r.method == Method::GET).count(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn stalled_upload_is_deleted_and_never_started() {
+    let fake = Fake::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let b = fake.backend(dir.path()).await;
+    b.clear("test").await.unwrap();
+    fake.shared.machine.lock().await.block_upload = true;
+    // The body fits the socket buffers, so the stall is the printer never replying.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(75), b.start("one"))
+        .await
+        .unwrap();
+    assert!(result.is_err());
+    assert_eq!(fake.count(Method::DELETE).await, 1);
+    assert_eq!(fake.count(Method::POST).await, 0);
+    fake.shared.release.notify_one();
+}
+
+#[tokio::test]
+async fn status_remains_bounded_while_an_upload_holds_the_job_lock() {
+    let fake = Fake::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let input = slicer_input(dir.path());
+    let backend = Arc::new(Printers::new(fake.config()).unwrap());
+    backend
+        .prepare("one", &input, "test", Options::default())
+        .await
+        .unwrap();
+    fake.shared.machine.lock().await.block_upload = true;
+    let start = {
+        let backend = backend.clone();
+        tokio::spawn(async move { backend.start("one").await })
+    };
+    fake.shared.entered.notified().await;
+    let reads = async { tokio::join!(backend.printer("test"), backend.printers()) };
+    let (single, fleet) = tokio::time::timeout(std::time::Duration::from_secs(6), reads)
+        .await
+        .unwrap();
+    assert_eq!(single.unwrap().state, PrinterState::Offline);
+    assert_eq!(fleet.unwrap()[0].state, PrinterState::Offline);
+    fake.shared.release.notify_one();
+    assert_eq!(start.await.unwrap().unwrap().state, JobState::Printing);
+}
+
+#[tokio::test]
+async fn independent_printers_and_stop_during_start_poll() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+    for pending in [false, true] {
+        let a = Fake::new().await;
+        let b = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = slicer_input(dir.path());
+        let mut config = a.config();
+        let mut other = b.config().printers.remove(0);
+        other.id = "other".into();
+        config.printers.push(other);
+        let backend = Arc::new(Safety::new(Arc::new(Printers::new(config).unwrap())));
+        backend
+            .prepare("one", &path, "test", Options::default())
+            .await
+            .unwrap();
+        backend
+            .prepare("two", &path, "other", Options::default())
+            .await
+            .unwrap();
+        backend.clear("other").await.unwrap();
+        backend.start("two").await.unwrap();
+        backend.clear("test").await.unwrap();
+        {
+            let mut m = a.shared.machine.lock().await;
+            if pending {
+                m.hold_start = true;
+            } else {
+                m.block_upload = true;
+            }
+        }
+        let start = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.start("one").await }
+        });
+        timeout(Duration::from_secs(5), async {
+            if pending {
+                a.shared.polled.notified().await;
+            } else {
+                a.shared.entered.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!start.is_finished());
+        timeout(Duration::from_secs(2), async {
+            assert_eq!(
+                backend.printer("other").await.unwrap().state,
+                PrinterState::Printing
+            );
+            assert_eq!(backend.job("two").await.unwrap().state, JobState::Printing);
+            backend
+                .review_action("cancel", "other", Some("two"))
+                .await
+                .unwrap();
+            assert_eq!(
+                backend.cancel("two").await.unwrap().state,
+                JobState::Cancelled
+            );
+        })
+        .await
+        .unwrap();
+        if pending {
+            assert_eq!(
+                timeout(Duration::from_secs(2), backend.cancel("one"))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                JobState::Cancelled
+            );
+            assert_eq!(
+                timeout(Duration::from_secs(2), start)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                JobState::Cancelled
+            );
+            assert_eq!(backend.job("one").await.unwrap().state, JobState::Cancelled);
+        } else {
+            a.shared.release.notify_one();
+            assert_eq!(
+                timeout(Duration::from_secs(5), start)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                JobState::Printing
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn stop_overtakes_pause_and_resume_polls() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+    for resume in [false, true] {
+        let f = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let backend = f.backend(dir.path()).await;
+        backend.clear("test").await.unwrap();
+        backend.start("one").await.unwrap();
+        if resume {
+            backend.pause("test").await.unwrap();
+        }
+        f.shared.machine.lock().await.hold_controls = true;
+        let command = tokio::spawn({
+            let backend = backend.clone();
+            async move {
+                if resume {
+                    backend.resume("test").await
+                } else {
+                    backend.pause("test").await
+                }
+            }
+        });
+        timeout(Duration::from_secs(5), f.shared.polled.notified())
+            .await
+            .unwrap();
+        assert!(!command.is_finished());
+        assert_eq!(
+            timeout(Duration::from_secs(2), backend.cancel("one"))
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Cancelled
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(2), command)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Cancelled
+        );
+    }
 }

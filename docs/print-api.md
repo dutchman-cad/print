@@ -85,7 +85,7 @@ storage and removed on failure.
 | `id` | string | Required |
 | `name` | string | Required |
 | `model` | string | Required |
-| `state` | string | Required: `idle`, `printing`, `paused`, `error`, or `offline` |
+| `state` | string | Required: `idle`, `printing`, `paused`, `attention`, `busy`, `error`, or `offline` |
 | `job_id` | string | Optional; active job ID |
 | `job_name` | string | Optional; active job name |
 | `progress` | number | Optional; fraction from 0 to 1 |
@@ -108,6 +108,12 @@ change cannot be detected; clearance is not proof that no physical activity occu
 PrusaLink `READY` is the operator's printer-side bed-clear signal and substitutes for the
 remote acknowledgement; `IDLE` still requires one. Restarting never restores remote clearance.
 
+`attention` means the printer is waiting for a person; `detail` explains why when known.
+`busy` means a non-print operation is running. PrusaLink ATTENTION and BUSY map to these
+states, and Bambu PAUSE with an HMS alert maps to attention. Pause requires printing;
+resume requires paused. Start, clear, and resume are refused in attention and busy.
+Cancel remains available for a matching tracked execution in attention.
+
 Start and resume require fresh telemetry. Missing, stale, contradictory, or unknown
 readiness blocks movement. Prepared file changes require a new preparation and review.
 Commands with uncertain results require status reconciliation; clients must never repeat
@@ -123,7 +129,7 @@ authentication failure is separate from machine failure. A reachable host with a
 serial printer is `offline`; `Offline after error` is `error`. Summary states prefer
 printer flags over display text. Starting, Resuming, SD printing, Pausing, Cancelling, and
 Finishing map to `printing`; Finishing alone cannot establish completion. Connection/detection
-and file-transfer phases map to `offline`, with the phase in `detail` (v1 has no busy state).
+and file-transfer phases map to `busy`, with the phase in `detail`.
 Unknown or contradictory readiness blocks start/resume.
 OctoPrint checks the sliced G-code's `nozzle_diameter` against the selected printer profile's
 `extruder.nozzleDiameter` during preparation, challenge review, and before upload. Missing or
@@ -164,7 +170,7 @@ Accepted commands poll once sent for up to 25 seconds for start/cancel and 10 se
 pause/resume. Pending is announced on stderr; expiry returns 409 with an unconfirmed outcome
 and requires fresh status. Commands are never resent by this wait.
 Its `detail` contains a known `print_stats` state or a safe Klippy readiness explanation;
-startup and disconnected Klippy report offline; shutdown, unknown, and contradictory states
+Klippy startup reports busy and disconnected Klippy reports offline; shutdown, unknown, and contradictory states
 block actions. Raw backend messages are not returned. `job_id`, when available, is the
 Moonraker history execution ID linked by file metadata; it may identify the last terminal
 job while the printer is idle. Progress is a fraction and live `seconds_left` is omitted.
@@ -174,6 +180,13 @@ require the same tracked filename and live execution ID. Resume additionally req
 commissioned behaviour and unchanged machine configuration. Completed, cancelled, and
 failed executions remain distinct; idle alone cannot establish completion. See
 [Moonraker configuration and checks](print.md#moonraker-klipper).
+
+Printer commands are serialized separately for each printer. Uploads and command outcome
+waits on one printer do not block another printer's status, confirmation review, or Stop.
+Stop can also overtake its own printer's pending Start, pause, or resume outcome wait;
+the earlier request reconciles to the confirmed cancellation without resending a command.
+Start attempts are durably recorded before sending Start. Late status results cannot
+replace a newer cancellation or restore a forgotten job.
 
 ## Job JSON and states
 
@@ -186,7 +199,7 @@ failed executions remain distinct; idle alone cannot establish completion. See
 | `id` | string | Required |
 | `printer` | string | Required; printer ID |
 | `name` | string | Required |
-| `state` | string | Required: `ready`, `printing`, `paused`, `done`, `cancelled`, or `failed` |
+| `state` | string | Required: `ready`, `printing`, `paused`, `done`, `cancelled`, `failed`, or `ended` |
 | `estimate` | object | Required; may be empty |
 | `progress` | number or null | Required; fraction from 0 to 1, null when unavailable |
 | `seconds_left` | nonnegative integer or null | Required; null when unavailable |
@@ -198,6 +211,9 @@ Estimate fields are optional and omitted when unavailable: `seconds` (nonnegativ
 A prepared job is `ready`; start moves it to `printing`. Pause moves a printing job to
 `paused`, and resume moves it back to `printing`. Completion yields `done`. Cancel accepts
 ready, printing, or paused jobs and yields `cancelled`. Backend failures may yield `failed`.
+`ended` is terminal: the execution ended, but its outcome is unknown. PrusaLink uses it when a tracked execution disappears from idle
+telemetry without an observed terminal result; observed FINISHED and STOPPED remain
+`done` and `cancelled`. BUSY cannot revive a terminal job.
 Incompatible actions return 409. Printer pause and resume target that printer's active job.
 Jobs may expire; subsequent reads return 404. Dutchman Print retains jobs for one hour and
 persists service jobs in its private data folder. Startup reloads tracked jobs and reconciles
@@ -293,3 +309,16 @@ Before upload, sliced `nozzle_diameter` and any specified `nozzle_type` must mat
 installed nozzle; each `filament_type` must match its mapped AMS `tray_type` or the
 single-filament external `vt_tray.tray_type`. Unknown values and mismatches are refused
 with no override. These checks also apply to command line actions.
+
+PrusaLink and Bambu commands wait for matching telemetry for up to 25 seconds for
+start/stop and 10 seconds for pause/resume. Pending is announced on stderr before an
+unconfirmed outcome is returned. Waiting never resends a command. Read status after
+an uncertain outcome before confirming another action.
+
+Uploads to PrusaLink, Bambu FTPS, OctoPrint, and Moonraker use a 30-second transport
+idle timeout, reset by byte progress, rather than a fixed total deadline. Once the whole body has
+been written, the printer's reply gets 60 seconds, since storing the file or draining socket
+buffers moves no bytes. Failed or
+uncertain PrusaLink and Bambu uploads attempt deletion of the staged remote file before
+returning an error and never send Start. Unconfirmed cleanup requires inspection and
+removal in the printer's storage before preparing again.

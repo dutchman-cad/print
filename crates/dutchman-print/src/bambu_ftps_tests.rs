@@ -29,6 +29,7 @@ async fn upload_reuses_tls12_and_tls13_control_session_and_checks_size() {
             .unwrap_err()
             .to_string()
             .contains("size differs"));
+        assert_eq!(fake.deleted.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -120,4 +121,35 @@ async fn rejects_filename_injection_and_empty_bytes_before_connecting() {
     ));
     assert!(passive_port("227 (127,0,0,1,0,0)").is_err());
     assert!(passive_port("227 (127,0,0,1,1,256)").is_err());
+}
+
+#[tokio::test]
+async fn slow_progress_succeeds_and_missing_completion_deletes_file() {
+    let fake = Fake::new(false, false, 4).await;
+    let result = upload_with_idle(
+        &fake.config,
+        "test.gcode.3mf",
+        &vec![1; 16 << 20],
+        Duration::from_millis(500),
+        Duration::from_millis(1000),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "{result:?}; received {} bytes",
+        fake.received.load(Ordering::SeqCst)
+    );
+    assert_eq!(fake.received.load(Ordering::SeqCst), 16 << 20);
+    assert_eq!(fake.deleted.load(Ordering::SeqCst), 0);
+    let fake = Fake::new(false, false, 3).await;
+    assert!(upload_with_idle(
+        &fake.config,
+        "test.gcode.3mf",
+        b"test",
+        Duration::from_millis(200),
+        Duration::from_millis(400),
+    )
+    .await
+    .is_err());
+    assert_eq!(fake.deleted.load(Ordering::SeqCst), 1);
 }

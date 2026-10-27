@@ -7,6 +7,7 @@ pub mod confirmation;
 pub mod moonraker;
 pub mod octoprint;
 pub mod printers;
+mod progress;
 pub mod prusalink;
 pub mod safety;
 mod server;

@@ -39,6 +39,8 @@ pub struct Machine {
     pub mcu_version: String,
     pub identity: String,
     pub block: Option<String>,
+    pub hold_start: bool,
+    pub hold_controls: bool,
     pub stale_history: bool,
     pub history_time: f64,
     pub delay_reads: usize,
@@ -49,6 +51,7 @@ pub struct Shared {
     pub machine: Mutex<Machine>,
     pub entered: Notify,
     pub release: Notify,
+    pub polled: Notify,
 }
 pub struct Fake {
     pub shared: Arc<Shared>,
@@ -112,6 +115,9 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
             json!({"jobs":if m.id.is_some(){vec![json!({"job_id":m.id,"start_time":m.history_time})]}else{vec![]}})
         }
         ("GET", "/printer/objects/query") => {
+            if m.hold_start && m.state == "paused" {
+                shared.polled.notify_one();
+            }
             if m.delay_reads > 0 {
                 m.delay_reads -= 1;
             } else if let Some(state) = m.pending_state.take() {
@@ -181,7 +187,7 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
             if m.delay_reads > 0 {
                 m.pending_state = Some("printing".into());
             } else {
-                m.state = "printing".into();
+                m.state = if m.hold_start { "paused" } else { "printing" }.into();
             }
             if !m.stale_history {
                 m.id = Some("000001".into());
@@ -193,6 +199,10 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
             json!("ok")
         }
         ("POST", "/printer/print/pause") => {
+            if m.hold_controls {
+                shared.polled.notify_one();
+                return axum::Json(json!({"result":"ok"})).into_response();
+            }
             if m.delay_reads > 0 {
                 m.pending_state = Some("paused".into());
             } else {
@@ -201,6 +211,10 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
             json!("ok")
         }
         ("POST", "/printer/print/resume") => {
+            if m.hold_controls {
+                shared.polled.notify_one();
+                return axum::Json(json!({"result":"ok"})).into_response();
+            }
             if m.delay_reads > 0 {
                 m.pending_state = Some("printing".into());
             } else {
@@ -253,6 +267,8 @@ impl Fake {
                 mcu_version: "synthetic".into(),
                 identity: "synthetic".into(),
                 block: None,
+                hold_start: false,
+                hold_controls: false,
                 stale_history: false,
                 history_time: 200.25,
                 delay_reads: 0,
@@ -261,6 +277,7 @@ impl Fake {
             }),
             entered: Notify::new(),
             release: Notify::new(),
+            polled: Notify::new(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/proxy/", listener.local_addr().unwrap());

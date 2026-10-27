@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, Buf
 use tokio::net::TcpStream;
 use tokio_rustls::{client::TlsStream, TlsConnector};
 
-type Control = BufReader<TlsStream<TcpStream>>;
+type Control = BufReader<crate::progress::Stream<TlsStream<TcpStream>>>;
 
 fn refused(message: &str) -> Error {
     Error::Refused(message.into())
@@ -99,6 +99,23 @@ pub(super) async fn upload(
     filename: &str,
     bytes: &[u8],
 ) -> Result<(), Error> {
+    upload_with_idle(
+        config,
+        filename,
+        bytes,
+        Duration::from_secs(30),
+        crate::progress::REPLY,
+    )
+    .await
+}
+
+async fn upload_with_idle(
+    config: &crate::config::Printer,
+    filename: &str,
+    bytes: &[u8],
+    idle: Duration,
+    reply_budget: Duration,
+) -> Result<(), Error> {
     // A basename cannot inject FTP commands, traverse storage, or alter URL semantics.
     if filename.is_empty()
         || filename.len() > 128
@@ -114,6 +131,8 @@ pub(super) async fn upload(
             "Use a sliced .gcode.3mf basename and at most 200 MiB of prepared bytes.",
         ));
     }
+    let mut staged = false;
+    let (progress, updates) = crate::progress::channel();
     let operation = async {
         let host = config.host.as_deref().ok_or(Error::Unavailable)?;
         let serial = ServerName::try_from(config.serial.clone().unwrap_or_default())
@@ -128,7 +147,7 @@ pub(super) async fn upload(
         let socket = connector.connect(serial.clone(), socket).await.map_err(|_| {
             refused("FTPS TLS identity could not be verified. Check this printer's CA or fingerprint.")
         })?;
-        let mut control = BufReader::new(socket);
+        let mut control = BufReader::new(crate::progress::Stream::new(socket, progress.clone()));
         accepted(reply(&mut control).await?.0, &[220])?;
         let user = command(&mut control, "USER bblp").await?.0;
         accepted(user, &[230, 331])?;
@@ -148,11 +167,12 @@ pub(super) async fn upload(
         let data = TcpStream::connect((peer, passive_port(&text)?))
             .await
             .map_err(|_| Error::Unavailable)?;
+        staged = true;
         accepted(
             command(&mut control, &format!("STOR {filename}")).await?.0,
             &[125, 150],
         )?;
-        let mut data = connector
+        let data = connector
             .connect(serial, data)
             .await
             .map_err(|_| refused("FTPS data TLS could not be verified. No print was started."))?;
@@ -161,12 +181,15 @@ pub(super) async fn upload(
                 "FTPS data TLS did not resume the control session. No file bytes were sent.",
             ));
         }
+        let mut data = crate::progress::Stream::new(data, progress.clone());
         data.write_all(bytes)
             .await
             .map_err(|_| Error::Unavailable)?;
+        data.flush().await.map_err(|_| Error::Unavailable)?;
         data.shutdown().await.map_err(|_| Error::Unavailable)?;
-        drop(data);
+        // Keep the data socket alive until the server confirms receipt of all bytes.
         accepted(reply(&mut control).await?.0, &[226])?;
+        drop(data);
         let (code, size) = command(&mut control, &format!("SIZE {filename}")).await?;
         accepted(code, &[213])?;
         if size.get(4..).and_then(|s| s.trim().parse::<u64>().ok()) != Some(bytes.len() as u64) {
@@ -177,14 +200,61 @@ pub(super) async fn upload(
         accepted(command(&mut control, "QUIT").await?.0, &[221])?;
         Ok(())
     };
-    tokio::time::timeout(
-        Duration::from_secs(30 + bytes.len() as u64 / (32 * 1024)),
-        operation,
+    let result =
+        crate::progress::timeout(idle, reply_budget, updates, bytes.len() as u64, operation)
+            .await
+            .map_err(|_| refused("FTPS upload stopped making progress. No print was started."))
+            .and_then(|result| result);
+    if let Err(error) = result {
+        if !staged {
+            return Err(error);
+        }
+        if tokio::time::timeout(Duration::from_secs(15), delete(config, filename))
+            .await
+            .is_ok_and(|r| r.is_ok())
+        {
+            return Err(error);
+        }
+        return Err(refused("FTPS upload failed and cleanup is not confirmed. Inspect storage and remove the staged file before preparing again. No print was started."));
+    }
+    Ok(())
+}
+
+async fn delete(config: &crate::config::Printer, filename: &str) -> Result<(), Error> {
+    let host = config.host.as_deref().ok_or(Error::Unavailable)?;
+    let serial = ServerName::try_from(config.serial.clone().unwrap_or_default())
+        .map_err(|_| Error::Unavailable)?;
+    let connector = TlsConnector::from(Arc::new(super::tls(config).map_err(Error::Refused)?));
+    let socket = TcpStream::connect((host, config.ftps_port.unwrap_or(990)))
+        .await
+        .map_err(|_| Error::Unavailable)?;
+    let socket = connector
+        .connect(serial, socket)
+        .await
+        .map_err(|_| Error::Unavailable)?;
+    let (progress, _) = crate::progress::channel();
+    let mut control = BufReader::new(crate::progress::Stream::new(socket, progress));
+    accepted(reply(&mut control).await?.0, &[220])?;
+    let user = command(&mut control, "USER bblp").await?.0;
+    accepted(user, &[230, 331])?;
+    if user == 331 {
+        accepted(
+            command(
+                &mut control,
+                &format!(
+                    "PASS {}",
+                    config.access_code.as_deref().ok_or(Error::Authentication)?
+                ),
+            )
+            .await?
+            .0,
+            &[230],
+        )?;
+    }
+    accepted(
+        command(&mut control, &format!("DELE {filename}")).await?.0,
+        &[250],
     )
-    .await
-    .map_err(|_| {
-        refused("FTPS upload timed out. Read status and inspect storage before retrying.")
-    })?
 }
 
 #[cfg(test)]

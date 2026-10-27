@@ -118,11 +118,13 @@ impl Client {
         upload: bool,
     ) -> Result<(StatusCode, Bytes), Error> {
         let deadline = if upload {
-            Duration::from_secs(30 + body.len() as u64 / (32 * 1024))
+            Duration::from_secs(30)
         } else {
             STATUS_TIMEOUT
         };
-        tokio::time::timeout(deadline, async {
+        let (progress, updates) = crate::progress::channel();
+        let size = body.len() as u64;
+        let operation = async {
             let host = self
                 .uri
                 .host()
@@ -147,10 +149,11 @@ impl Client {
             } else {
                 Box::new(socket)
             };
-            let (mut sender, connection) =
-                hyper::client::conn::http1::handshake(TokioIo::new(stream))
-                    .await
-                    .map_err(|_| Error::Unavailable)?;
+            let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(
+                crate::progress::Stream::new(stream, progress),
+            ))
+            .await
+            .map_err(|_| Error::Unavailable)?;
             struct Driver(tokio::task::JoinHandle<()>);
             impl Drop for Driver {
                 fn drop(&mut self) {
@@ -191,9 +194,16 @@ impl Client {
                 .map_err(|_| Error::Unavailable)?
                 .to_bytes();
             Ok((code, bytes))
-        })
-        .await
-        .map_err(|_| Error::Unavailable)?
+        };
+        if upload {
+            crate::progress::timeout(deadline, crate::progress::REPLY, updates, size, operation)
+                .await
+                .map_err(|_| Error::Unavailable)?
+        } else {
+            tokio::time::timeout(deadline, operation)
+                .await
+                .map_err(|_| Error::Unavailable)?
+        }
     }
     pub async fn json(&self, path: &str) -> Result<Value, Error> {
         let (code, bytes) = self
@@ -370,6 +380,8 @@ impl Client {
         {
             printer.state = if matches!(connection_state, "Error" | "Offline after error") {
                 PrinterState::Error
+            } else if connecting(connection_state) {
+                PrinterState::Busy
             } else {
                 PrinterState::Offline
             };
@@ -625,15 +637,13 @@ fn summary(flags: Option<&Value>, text: &str) -> PrinterState {
     if connecting(text)
         || matches!(
             text,
-            "Offline"
-                | "Sending file to SD"
+            "Sending file to SD"
                 | "Starting to send file to SD"
                 | "Transferring file to SD"
                 | "Transferring file to printer"
         )
     {
-        // API v1 has no busy state. Keep the reason in detail and block readiness.
-        return PrinterState::Offline;
+        return PrinterState::Busy;
     }
     if flags.is_some() {
         return if flag("operational") == Some(true) && flag("ready") == Some(true) {
