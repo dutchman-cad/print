@@ -16,6 +16,8 @@ Not released yet. Tested against simulated printers.
 | Klipper with Moonraker | `moonraker` | Simulated only | Start, pause, resume, cancel, Stop |
 | Duet (RepRapFirmware, standalone) | `duet` | Simulated only | Start, pause, resume, cancel, Stop |
 | Snapmaker U1 | `snapmaker-u1` | Simulated only | Start, pause, resume, cancel, Stop (single-tool jobs) |
+| Elegoo resin printers (SDCP) | `elegoo-sdcp`, `profile = "resin"` | Simulated only | Monitoring and Stop; Print can't start resin jobs, which come from a resin slicer |
+| Elegoo Centauri Carbon | `elegoo-sdcp`, `profile = "centauri"` | Simulated only | Monitoring only |
 | Bambu Lab in LAN mode | `bambu` | Simulated only | Monitoring; control is experimental and off unless `lan_control = true` |
 
 Every machine action needs a confirmation the server issues for that printer and job, and

@@ -87,7 +87,7 @@ storage and removed on failure.
 | `name` | string | Required |
 | `model` | string | Required |
 | `state` | string | Required: `idle`, `printing`, `paused`, `attention`, `busy`, `error`, or `offline` |
-| `job_id` | string | Optional; active job ID, or the live file path for Duet |
+| `job_id` | string | Optional; active job ID, the live file path for Duet, or the `TaskId` for Elegoo SDCP |
 | `job_name` | string | Optional; active job name |
 | `job_path` | string | Optional; backend relative live file path, currently OctoPrint |
 | `progress` | number | Optional; fraction from 0 to 1 |
@@ -216,6 +216,25 @@ with a session key; an expired session is renewed, but G-code refused with 401 i
 Standalone firmware does not report how a file ended: a companion cancellation yields
 `cancelled`, a halt `failed`, and other endings `ended`. See
 [Duet configuration and checks](print.md#duet-reprapfirmware-standalone).
+
+Elegoo SDCP (`kind = "elegoo-sdcp"`) printers report status only through the printer routes;
+preparation and Start are refused for both profiles, so they never have tracked jobs. Status
+needs a fresh report on the current WebSocket connection: until one arrives, and for 30
+seconds after the last, the printer is `offline`, and every action is refused. `profile =
+"resin"` maps `CurrentStatus` and `PrintInfo.Status` as in the vendor specification: an active
+print activity is `printing` (substate 6 is `paused`) even when the substate still holds
+STOPPED or COMPLETED; transfers, exposure tests, and self-tests are `busy`; idle with
+substate 0, 8, or 9 is `idle`; a nonzero `ErrorNumber`, a contradictory, or an unknown value is
+`error`. `profile = "centauri"` maps `PrintInfo.Status` 0 to `idle`; 5, 8, 9, 13, and 20 to
+`printing`; 10 to `paused`; and anything else to `error` with the raw code in `detail`.
+`detail` starts with the vendor state name. `job_id` is `TaskId` and `job_name` `Filename`.
+`progress` is the layer fraction while printing or paused. Resin `seconds_left` comes from
+millisecond ticks; Centauri omits it. Resin UV LED and enclosure temperatures appear only in
+`detail`; Centauri reports nozzle and bed temperatures. Centauri is monitoring only: every
+challenge except `clear` and every action route are refused, and no command is sent. Resin
+supports printer Stop only; `pause` and `resume` challenges and routes are refused, because
+they act on and return a tracked job, and Print never starts resin jobs. See
+[Elegoo (SDCP)](print.md#elegoo-sdcp).
 
 Printer commands are serialized separately for each printer. Uploads and command outcome
 waits on one printer do not block another printer's status, confirmation review, or Stop.
@@ -377,7 +396,9 @@ outcome. External jobs are not added to the prepared-job list.
 PrusaLink addresses the live job ID; OctoPrint cancels only the same live origin/file path;
 Moonraker requires the same history execution and filename; Bambu requires the same
 subtask name and positive start time; Duet requires the same live file path and pauses a
-running job before sending `M0`. OctoPrint cannot distinguish another execution of
+running job before sending `M0`; Elegoo resin requires the same `TaskId` and `Filename`, sends
+command 130 once, waits up to 10 seconds for its `Ack`, and is confirmed by STOPPED for that
+task. OctoPrint cannot distinguish another execution of
 the same file. Stop waits up to 25 seconds, sends once, and returns 409 when unconfirmed.
 The same per-printer command locking and pending-wait preemption apply as for cancel.
 

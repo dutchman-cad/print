@@ -47,6 +47,7 @@ pub struct Printers {
     octoprint: BTreeMap<String, Arc<crate::octoprint::Client>>,
     moonraker: BTreeMap<String, Arc<crate::moonraker::Client>>,
     duet: BTreeMap<String, Arc<crate::duet::Client>>,
+    sdcp: BTreeMap<String, Arc<crate::elegoo_sdcp::Client>>,
     slicers: BTreeMap<String, crate::slicer::Config>,
     jobs: Mutex<BTreeMap<String, Prepared>>,
     store: Option<PathBuf>,
@@ -86,7 +87,14 @@ impl Printers {
             .map(|p| {
                 if matches!(
                     p.kind.as_deref(),
-                    Some("bambu" | "octoprint" | "moonraker" | "snapmaker-u1" | "duet")
+                    Some(
+                        "bambu"
+                            | "octoprint"
+                            | "moonraker"
+                            | "snapmaker-u1"
+                            | "duet"
+                            | "elegoo-sdcp"
+                    )
                 ) {
                     Ok(None)
                 } else {
@@ -105,6 +113,7 @@ impl Printers {
         let slicers = config
             .printers
             .iter()
+            .filter(|p| p.kind.as_deref() != Some("elegoo-sdcp"))
             .map(|p| config.slicer_for(p).map(|s| (p.id.clone(), s.clone())))
             .collect::<Result<_, _>>()?;
         let octoprint = config
@@ -125,6 +134,14 @@ impl Printers {
             .filter(|p| p.kind.as_deref() == Some("duet"))
             .map(|p| crate::duet::Client::new(p.clone()).map(|c| (p.id.clone(), Arc::new(c))))
             .collect::<Result<_, _>>()?;
+        let sdcp = config
+            .printers
+            .iter()
+            .filter(|p| p.kind.as_deref() == Some("elegoo-sdcp"))
+            .map(|p| {
+                crate::elegoo_sdcp::Client::new(p.clone()).map(|c| (p.id.clone(), Arc::new(c)))
+            })
+            .collect::<Result<_, _>>()?;
         let machines = config
             .printers
             .iter()
@@ -144,6 +161,7 @@ impl Printers {
             octoprint,
             moonraker,
             duet,
+            sdcp,
             slicers,
             jobs: Mutex::new(BTreeMap::new()),
             store: None,
@@ -290,8 +308,10 @@ impl Printers {
         if !matches!(
             target.job.state,
             JobState::Ready | JobState::Printing | JobState::Paused | JobState::Ended
-        ) {
-            // The saved terminal result remains valid after its staged file is removed.
+        ) || self.sdcp.contains_key(&target.job.printer)
+        {
+            // The saved terminal result remains valid after its staged file is removed;
+            // Elegoo SDCP printers never have tracked jobs.
         } else if self.bambu.contains_key(&target.job.printer) {
             self.reconcile_bambu(target).await?;
         } else if self.octoprint.contains_key(&target.job.printer) {
@@ -567,7 +587,9 @@ impl Printers {
         action: &str,
         guard: &mut MachineGuard,
     ) -> Result<Job, Error> {
-        if self.moonraker.contains_key(&target.job.printer) {
+        if let Some(client) = self.sdcp.get(&target.job.printer) {
+            Err(client.refusal(action))
+        } else if self.moonraker.contains_key(&target.job.printer) {
             self.moonraker_control(target, action, guard).await
         } else if self.duet.contains_key(&target.job.printer) {
             self.duet_control(target, action, guard).await
@@ -1285,6 +1307,9 @@ impl Printers {
         target: &mut Prepared,
         guard: &mut MachineGuard,
     ) -> Result<Job, Error> {
+        if let Some(client) = self.sdcp.get(&target.job.printer) {
+            return Err(client.refusal("start"));
+        }
         if self.moonraker.contains_key(&target.job.printer) {
             return self.start_moonraker(target, guard).await;
         }
@@ -1468,6 +1493,9 @@ impl Backend for Printers {
                 return Ok(());
             }
             self.check_control(printer)?;
+            if let Some(client) = self.sdcp.get(printer) {
+                return Err(client.refusal(action));
+            }
             if let Some(client) = self.bambu.get(printer) {
                 let live = client.snapshot().await;
                 let jobs = self.jobs.lock().await;
@@ -1714,6 +1742,9 @@ impl Backend for Printers {
             if let Some(bambu) = self.bambu.get(id) {
                 return Ok(bambu.snapshot().await);
             }
+            if let Some(client) = self.sdcp.get(id) {
+                return Ok(client.snapshot().await);
+            }
             if let Some(client) = self.moonraker.get(id) {
                 return Ok(match client.snapshot().await {
                     Ok(snapshot) => snapshot.printer,
@@ -1773,6 +1804,8 @@ impl Backend for Printers {
     fn check_control(&self, printer: &str) -> Result<(), Error> {
         if let Some(client) = self.bambu.get(printer) {
             client.check_control()
+        } else if let Some(client) = self.sdcp.get(printer) {
+            client.check_control()
         } else {
             Ok(())
         }
@@ -1783,6 +1816,7 @@ impl Backend for Printers {
             || self.octoprint.contains_key(printer)
             || self.moonraker.contains_key(printer)
             || self.duet.contains_key(printer)
+            || self.sdcp.contains_key(printer)
     }
     fn clear<'a>(&'a self, id: &'a str) -> Reply<'a, ()> {
         Box::pin(async move {
@@ -1796,6 +1830,9 @@ impl Backend for Printers {
                 client.acknowledge();
             }
             if let Some(client) = self.duet.get(id) {
+                client.acknowledge();
+            }
+            if let Some(client) = self.sdcp.get(id) {
                 client.acknowledge();
             }
             Ok(())
@@ -1827,6 +1864,8 @@ impl Backend for Printers {
                         )
                     });
                 } else if let Some(client) = self.bambu.get(&config.id).cloned() {
+                    tasks.spawn(async move { (index, client.snapshot().await) });
+                } else if let Some(client) = self.sdcp.get(&config.id).cloned() {
                     tasks.spawn(async move { (index, client.snapshot().await) });
                 } else if let Some(client) = self.octoprint.get(&config.id).cloned() {
                     tasks.spawn(async move {
@@ -1887,6 +1926,9 @@ impl Backend for Printers {
                 .iter()
                 .find(|p| p.id == printer)
                 .ok_or(Error::NotFound)?;
+            if let Some(client) = self.sdcp.get(printer) {
+                return Err(client.refusal("prepare"));
+            }
             for (label, selected, configured) in [
                 (
                     "printer",
@@ -2118,10 +2160,20 @@ impl Backend for Printers {
         Box::pin(async move { self.stop_live(printer, identity, name, path).await })
     }
     fn pause<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
-        Box::pin(async move { self.control(printer, "pause", JobState::Printing).await })
+        Box::pin(async move {
+            if let Some(client) = self.sdcp.get(printer) {
+                return Err(client.refusal("pause"));
+            }
+            self.control(printer, "pause", JobState::Printing).await
+        })
     }
     fn resume<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
-        Box::pin(async move { self.control(printer, "resume", JobState::Paused).await })
+        Box::pin(async move {
+            if let Some(client) = self.sdcp.get(printer) {
+                return Err(client.refusal("resume"));
+            }
+            self.control(printer, "resume", JobState::Paused).await
+        })
     }
     fn job<'a>(&'a self, id: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {

@@ -4,7 +4,8 @@ Dutchman Print is a local print companion for SolidCraft and a standalone comman
 A backend prepares 3MF files, estimates jobs, and controls printers. The included
 `simulated` backend is a demo: it contacts no printers and can optionally run a local slicer.
 The `printers` backend supports individually configured local PrusaLink, OctoPrint, Moonraker (Klipper),
-Snapmaker U1, Duet (RepRapFirmware standalone), and Bambu printers.
+Snapmaker U1, Duet (RepRapFirmware standalone), and Bambu printers, and monitors Elegoo printers
+that speak SDCP.
 
 Build `dutchman-print` from this checkout with Rust 1.88 or newer:
 
@@ -1025,6 +1026,146 @@ Testing uses synthetic responses on test-owned loopback servers. Session handlin
 spelling in `job.file.fileName`, delete replies for missing files, and macro behaviour still
 need checking on a real board before relying on control.
 
+## Elegoo (SDCP)
+
+`kind = "elegoo-sdcp"` monitors Elegoo printers that speak SDCP, a JSON protocol over a
+WebSocket. Set `profile` to say which protocol variant the printer uses; there is no default
+and no detection:
+
+- `profile = "resin"` follows CBD's
+  [SDCP V3.0.0 specification](https://github.com/cbd-tech/SDCP-Smart-Device-Control-Protocol-V3.0.0)
+  for resin printers. It adds printer-level Stop.
+- `profile = "centauri"` is the Elegoo Centauri Carbon (FDM), from
+  [community protocol notes](https://github.com/WalkerFrederick/sdcp-centauri-carbon/blob/main/README.md)
+  written against firmware 1.1.29. It is monitoring only.
+
+The two profiles share the connection and message envelope but never their status codes:
+the same number means different things on each.
+
+```toml
+[backend]
+kind = "printers"
+
+[[printers]]
+kind = "elegoo-sdcp"
+profile = "resin"
+id = "resin"
+name = "Resin bench"
+model = "Elegoo resin printer"
+host = "192.168.1.40"
+# port = 3030 # Optional; resin defaults to 3030.
+# mainboard_id = "000000000001d354" # Optional; refuse reports from any other mainboard.
+
+[[printers]]
+kind = "elegoo-sdcp"
+profile = "centauri"
+id = "centauri"
+name = "Centauri Carbon"
+model = "Elegoo Centauri Carbon"
+host = "192.168.1.41"
+```
+
+`host` is the printer's hostname or IP address, without a scheme or path. Print connects to
+`ws://<host>:3030/websocket` for resin and `ws://<host>/websocket` for Centauri; `port`
+replaces either port. There is no UDP discovery or network scan: configure the address
+yourself. Neither source describes a login, credentials, or TLS, so the connection is plain
+and unauthenticated; keep these printers on a trusted local network. `mainboard_id`, at most
+64 letters and digits, pins the printer's `MainboardID`; reports from another mainboard are
+then refused and the printer shows offline. Print never slices for these printers, so they
+take no `slicer` and no slicer profiles, and every other printer field is refused.
+
+### Connection and freshness
+
+Each printer keeps one WebSocket connection, opened at the first status read. Print requests
+status with command 0 every 10 seconds and sends a text `ping` every 20 seconds; the Centauri
+notes report that the printer closes a connection after about 60 seconds without client
+traffic. A status report is fresh for 30 seconds. A connection that delivers nothing for 45
+seconds is closed and reopened; reconnects back off from 1 second, doubling up to 30 seconds.
+After any reconnect the printer reads offline, and refuses every action, until a new status
+report arrives on the new connection; the reconnect also withdraws bed clearance. Messages
+are limited to 1 MiB.
+
+Requests use the specification's envelope (`Id`, `Data` with `Cmd`, `Data`, `RequestID`,
+`MainboardID`, `TimeStamp`, and `From`). Resin requests add `Topic: sdcp/request/<MainboardID>`
+and `From: 0`; Centauri requests match the notes' examples, with no `Topic` and `From: 1`.
+`MainboardID` and `Id` are learned from the printer's reports and replies (or taken from
+`mainboard_id`); until the first report, requests carry an empty `MainboardID`. Replies are
+matched by `RequestID` and `MainboardID`; others are ignored.
+
+### Resin status
+
+`Status.CurrentStatus` lists machine activities and `Status.PrintInfo.Status` is the print
+substate. The substate keeps its last value after a print ends, so it is read only in light of
+the activity:
+
+| Activity and substate | State | `detail` starts with |
+|---|---|---|
+| Printing (1), substate 1–5, 7 or 10 | printing | the substate: `HOMING`, `DESCENDING`, `EXPOSING`, `LIFTING`, `PAUSING`, `STOPPING`, `FILE_CHECKING` |
+| Printing (1), substate 6 | paused | `PAUSED` |
+| Printing (1), substate 0, 8 or 9 | printing | `PRINTING`: a retained STOPPED or COMPLETED never overrides an active print |
+| File transfer (2), exposure test (3), self-test (4) | busy | `FILE_TRANSFERRING`, `EXPOSURE_TESTING`, `DEVICES_TESTING` |
+| Idle (0), substate 0, 8 or 9 | idle | `IDLE`, `STOPPED`, `COMPLETED` |
+| Idle (0) with an active substate | error | the substate, noting the contradiction |
+| Nonzero `PrintInfo.ErrorNumber` | error | the substate, then `Error <n>:` and its meaning |
+| Missing, empty, or unknown activity or substate | error | `UNKNOWN ACTIVITY` or `UNKNOWN PRINT STATUS <n>` |
+
+`job_id` is `PrintInfo.TaskId` and `job_name` `PrintInfo.Filename`; both can remain from the
+last job while idle. While printing or paused, `progress` is `CurrentLayer / TotalLayer` and
+`seconds_left` is `(TotalTicks − CurrentTicks) / 1000`, since the specification gives ticks in
+milliseconds. The UV LED (`TempOfUVLED`) and enclosure (`TempOfBox`) temperatures appear in
+`detail`, rounded to whole degrees; they are never reported as nozzle or bed temperatures.
+
+### Centauri status
+
+Only `Status.PrintInfo.Status` is read, with the meanings the notes observed:
+
+| `PrintInfo.Status` | State | `detail` starts with |
+|---|---|---|
+| 0 | idle | `IDLE` |
+| 5, 8, 9, 13, 20 | printing | `PAUSING`, `PREPARING`, `STARTING`, `PRINTING`, `RESUMING` |
+| 10 | paused | `PAUSED` |
+| anything else, or missing | error | `UNKNOWN STATUS <n>` |
+
+Resin meanings never apply: Centauri 8 and 9 are preparation and start, not stopped and
+completed. An unknown code is reported as error rather than attention, with the raw code in
+`detail`, because nothing is known about it and it must block every action. `job_id` and
+`job_name` are `TaskId` and `Filename`; `progress` is the layer fraction while printing or
+paused. `nozzle_temperature` is `TempOfNozzle`, `bed_temperature` `TempOfHotbed`, and the
+enclosure temperature appears in `detail`. The notes do not give tick units, so
+`seconds_left` is always omitted.
+
+### What Print can do
+
+Centauri printers are monitoring only. The notes show commands for start, pause, resume, and
+cancel, but there is no vendor contract for their fields, effects, or replies on FDM firmware,
+so Print never sends upload, start, pause, resume, or Stop. Preparation, every confirmation
+challenge except bed clearance, and every action route are refused with an explanation, and
+nothing but status requests and keepalives reaches the printer.
+
+Resin printers accept printer-level Stop of the live job, using command 130 from the
+specification. Print slices FDM G-code only, while resin printers need CTB or GOO files made
+by a resin slicer, so preparation and Start are refused: send resin jobs from that slicer or
+from the printer, then monitor and Stop them here. Pause and resume are refused too. Their
+routes act on, and return, a job this companion started and is tracking, and Print never
+starts resin jobs; Stop is the one control the job API defines for work started elsewhere,
+and it is bound to the live job you confirmed. Pause or resume on the printer itself.
+
+Stop requires fresh status, a printing or paused state, and the same `TaskId` and `Filename`
+you confirmed. Print sends command 130 once and waits up to 10 seconds for the reply with the
+same `RequestID` and `MainboardID`. A nonzero `Ack` is reported with its meaning from the
+specification (busy, file not found, and so on). A lost connection or missing reply reports
+an uncertain outcome; the command is never resent, and a reconnect never replays it. After an
+accepted reply, Stop waits up to 25 seconds for a report of the same task in substate STOPPED
+(8) with no active print activity. A report naming another task, or COMPLETED (9) for the
+same task, is never taken as the Stop outcome.
+
+Testing uses a simulated SDCP printer on a test-owned loopback server. Before relying on
+these printers, check on real hardware: whether resin firmware answers status requests sent
+before its `MainboardID` is known (set `mainboard_id` if it does not), whether it accepts the
+learned `Id`, the default ports, how often it pushes status unasked, how `CurrentStatus` and
+`TaskId` look after a Stop, and, for Centauri, whether status 8 appears while idle, as one
+example in the notes suggests, and which further status codes the firmware uses.
+
 ## Stop a printer and clean staged files
 
 Run `dutchman-print --config config.toml stop <printer>` to review the current live job's
@@ -1043,6 +1184,9 @@ After a terminal outcome, only the recorded unique file staged by Dutchman is de
 and only after fresh status establishes it is no longer live. Uploaded ready jobs are
 also cleaned when cancelled before Start or forgotten. A cleanup failure is reported in
 job `detail` while preserving its outcome; inspect printer storage before removing a file.
+
+Elegoo resin Stop addresses the live `TaskId` and `Filename` and sends command 130 once;
+Centauri printers refuse Stop. See [Elegoo (SDCP)](#elegoo-sdcp).
 
 Duet Stop addresses the live file path: a running job is paused with `M25`, the pause is
 confirmed, and then `M0` is sent. Stop is confirmed when the printer is idle with that file

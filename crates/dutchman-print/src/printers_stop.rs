@@ -78,6 +78,10 @@ impl Printers {
             self.stop_duet(client, identity, name).await?;
             return self.printer(printer).await;
         }
+        if let Some(client) = self.sdcp.get(printer) {
+            client.stop(identity, name).await?;
+            return self.printer(printer).await;
+        }
         let mut baseline = None;
         let mut file_path = None;
         if let Some(client) = self.octoprint.get(printer) {
