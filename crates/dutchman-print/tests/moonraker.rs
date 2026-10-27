@@ -779,7 +779,7 @@ async fn background_polling_withdraws_clearance_after_external_history() {
     let b = Arc::new(
         Safety::new(Arc::new(Printers::new(f.config()).unwrap())).timing(
             Arc::new(dutchman_print::simulated::SystemClock::default()),
-            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(60),
         ),
     );
@@ -913,4 +913,150 @@ async fn each_job_change_is_checkpointed_and_restored() {
     raw.forget("one").await.unwrap();
     let stored: Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
     assert!(stored.get("one").is_none());
+}
+
+#[tokio::test]
+async fn independent_printers_and_stop_during_start_poll() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+    for pending in [false, true] {
+        let a = Fake::new().await;
+        let b = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = input(dir.path());
+        let mut config = a.config();
+        let mut other = b.config().printers.remove(0);
+        other.id = "other".into();
+        config.printers.push(other);
+        let backend = Arc::new(Safety::new(Arc::new(Printers::new(config).unwrap())));
+        backend
+            .prepare("one", &path, "test", Options::default())
+            .await
+            .unwrap();
+        backend
+            .prepare("two", &path, "other", Options::default())
+            .await
+            .unwrap();
+        backend.clear("other").await.unwrap();
+        backend.start("two").await.unwrap();
+        backend.clear("test").await.unwrap();
+        {
+            let mut m = a.shared.machine.lock().await;
+            if pending {
+                m.hold_start = true;
+            } else {
+                m.block = Some("/server/files/upload".into());
+            }
+        }
+        let start = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.start("one").await }
+        });
+        timeout(Duration::from_secs(5), async {
+            if pending {
+                a.shared.polled.notified().await;
+            } else {
+                a.shared.entered.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!start.is_finished());
+        timeout(Duration::from_secs(2), async {
+            assert_eq!(
+                backend.printer("other").await.unwrap().state,
+                PrinterState::Printing
+            );
+            assert_eq!(backend.job("two").await.unwrap().state, JobState::Printing);
+            backend
+                .review_action("cancel", "other", Some("two"))
+                .await
+                .unwrap();
+            assert_eq!(
+                backend.cancel("two").await.unwrap().state,
+                JobState::Cancelled
+            );
+        })
+        .await
+        .unwrap();
+        if pending {
+            assert_eq!(
+                timeout(Duration::from_secs(2), backend.cancel("one"))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                JobState::Cancelled
+            );
+            assert_eq!(
+                timeout(Duration::from_secs(2), start)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                JobState::Cancelled
+            );
+            assert_eq!(backend.job("one").await.unwrap().state, JobState::Cancelled);
+        } else {
+            a.shared.release.notify_one();
+            assert_eq!(
+                timeout(Duration::from_secs(5), start)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                JobState::Printing
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn stop_overtakes_pause_and_resume_polls() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+    for resume in [false, true] {
+        let f = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let backend = backend(&f, dir.path()).await;
+        backend.clear("test").await.unwrap();
+        backend.start("one").await.unwrap();
+        if resume {
+            backend.pause("test").await.unwrap();
+        }
+        f.shared.machine.lock().await.hold_controls = true;
+        let command = tokio::spawn({
+            let backend = backend.clone();
+            async move {
+                if resume {
+                    backend.resume("test").await
+                } else {
+                    backend.pause("test").await
+                }
+            }
+        });
+        timeout(Duration::from_secs(5), f.shared.polled.notified())
+            .await
+            .unwrap();
+        assert!(!command.is_finished());
+        assert_eq!(
+            timeout(Duration::from_secs(2), backend.cancel("one"))
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Cancelled
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(2), command)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Cancelled
+        );
+    }
 }

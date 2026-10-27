@@ -25,6 +25,7 @@ pub struct Fake {
     pub reports: broadcast::Sender<serde_json::Value>,
     pub connections: Arc<AtomicUsize>,
     pub requests: Arc<AtomicUsize>,
+    pub processed: Arc<AtomicUsize>,
     pub disconnects: Arc<AtomicUsize>,
     pub credentials: Arc<AtomicUsize>,
     pub tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -64,6 +65,8 @@ impl Fake {
         let (reports, _) = broadcast::channel::<serde_json::Value>(64);
         let connections = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(AtomicUsize::new(0));
+        let processed = Arc::new(AtomicUsize::new(0));
+        let processing = processed.clone();
         let disconnects = Arc::new(AtomicUsize::new(0));
         let credentials = Arc::new(AtomicUsize::new(0));
         let authorization = Arc::new(AtomicBool::new(false));
@@ -97,6 +100,7 @@ impl Fake {
                     let (socket, _) = listener.accept().await.unwrap();
                     connections.fetch_add(1, Ordering::SeqCst);
                     let broadcast = reports.clone();
+                    let processing = processing.clone();
                     let (acceptor, mut reports, requests, disconnects, credentials) = (
                         acceptor.clone(),
                         reports.subscribe(),
@@ -176,6 +180,7 @@ impl Fake {
                                                     }
                                                     let _ = broadcast.send(state.clone());
                                                 }
+                                                processing.fetch_add(1, Ordering::SeqCst);
                                                 if lose_reply.load(Ordering::SeqCst) { return; }
                                                 Packet::Publish(Publish::new("device/TESTSERIAL/report", QoS::AtMostOnce, reply.to_string()))
                                             }
@@ -207,6 +212,7 @@ impl Fake {
             reports,
             connections,
             requests,
+            processed,
             disconnects,
             credentials,
             tasks,

@@ -277,6 +277,13 @@ are consumed before attempting a backend action, including failed attempts. Head
 are never logged. Confirmation is separate from authentication. Standalone CLI prompts
 and `--yes` create and consume the same observation-bound challenges internally.
 
+Printer commands are serialized separately for each printer. Uploads and command outcome
+waits on one printer do not block another printer's status, confirmation review, or Stop.
+Stop can also overtake its own printer's pending Start, pause, or resume outcome wait;
+the earlier request reconciles to the confirmed cancellation without resending a command.
+Start attempts are durably recorded before sending Start. Late status results cannot
+replace a newer cancellation or restore a forgotten job.
+
 ## Server settings and hardening
 
 | Option | Environment | Default |

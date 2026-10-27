@@ -330,12 +330,24 @@ use dutchman_print::config::Printer as PrinterConfig;
 use dutchman_print::safety::hash;
 #[path = "helpers/ftps.rs"]
 mod ftps;
+fn copy_config(config: &Config) -> Config {
+    Config {
+        backend: dutchman_print::config::Backend {
+            kind: config.backend.kind.clone(),
+            slice: config.backend.slice,
+        },
+        slicer: config.slicer.clone(),
+        slicers: config.slicers.clone(),
+        printers: config.printers.clone(),
+    }
+}
 struct Control {
     fake: Fake,
     ftps: ftps::Fake,
     safety: Safety,
     app: axum::Router,
     backend: Arc<Printers>,
+    config: Config,
     dir: tempfile::TempDir,
     input: std::path::PathBuf,
 }
@@ -442,7 +454,7 @@ impl Control {
             }],
         };
         let backend = Arc::new(
-            Printers::new(config)
+            Printers::new(copy_config(&config))
                 .unwrap()
                 .with_store(root.join("jobs.json")),
         );
@@ -467,6 +479,7 @@ impl Control {
         );
         Self {
             app,
+            config,
             fake,
             ftps,
             safety,
@@ -896,7 +909,6 @@ async fn stop_after_reconnect_uses_live_delta_and_matching_cached_identity() {
     let requests = c.fake.requests.load(Ordering::SeqCst);
     c.fake.reports.send(serde_json::Value::Null).unwrap();
     Fake::wait(&c.fake.connections, count + 1).await;
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     c.report(json!({"print":{"bed_temper":40}})).await;
     assert_eq!(c.status().await.state, PrinterState::Printing);
     assert_eq!(c.fake.requests.load(Ordering::SeqCst), requests);
@@ -948,7 +960,6 @@ async fn reconnect_between_polls_revokes_server_clearance() {
     let count = c.fake.connections.load(Ordering::SeqCst);
     c.fake.reports.send(serde_json::Value::Null).unwrap();
     Fake::wait(&c.fake.connections, count + 1).await;
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     c.report(json!({"print":{"bed_temper":40}})).await;
     assert_eq!(c.status().await.state, PrinterState::Idle);
     assert_eq!(c.status().await.needs_clearing, Some(true));
@@ -988,5 +999,159 @@ async fn commands_wait_for_later_reports_without_resending() {
         let (result, ()) = tokio::join!(c.action(action), transition);
         assert_eq!(result.unwrap().state, expected);
         assert_eq!(c.fake.commands.lock().await.len(), count + 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn independent_printers_and_stop_during_start_poll() {
+    use dutchman_print::backend::JobState;
+    use std::time::Duration;
+    use tokio::time::timeout;
+    for pending in [false, true] {
+        let a = Control::new().await;
+        let b = Control::new().await;
+        let mut config = copy_config(&a.config);
+        let mut other = b.config.printers[0].clone();
+        other.id = "other".into();
+        config.printers.push(other);
+        let backend = Arc::new(Safety::new(Arc::new(Printers::new(config).unwrap())));
+        backend
+            .prepare("one", &a.input, "bambu", Options::default())
+            .await
+            .unwrap();
+        backend
+            .prepare("two", &a.input, "other", Options::default())
+            .await
+            .unwrap();
+        backend.clear("other").await.unwrap();
+        backend.start("two").await.unwrap();
+        backend.clear("bambu").await.unwrap();
+        if pending {
+            a.fake.no_state.store(true, Ordering::SeqCst);
+        } else {
+            a.ftps.block_upload.store(true, Ordering::SeqCst);
+        }
+        let start = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.start("one").await }
+        });
+        timeout(Duration::from_secs(5), async {
+            if pending {
+                let command = loop {
+                    if let Some(command) = a.fake.commands.lock().await.first().cloned() { break command; }
+                    tokio::task::yield_now().await;
+                };
+                a.fake.reports.send(json!({"print":{"gcode_state":"PAUSE","subtask_name":command["print"]["subtask_name"],"gcode_start_time":"1234","print_error":0}})).unwrap();
+                loop {
+                    if backend.printer("bambu").await.unwrap().state == PrinterState::Paused { break; }
+                    tokio::task::yield_now().await;
+                }
+            } else { a.ftps.entered.notified().await; }
+        }).await.unwrap();
+        assert!(!start.is_finished());
+        timeout(Duration::from_secs(2), async {
+            assert_eq!(
+                backend.printer("other").await.unwrap().state,
+                PrinterState::Printing
+            );
+            assert_eq!(backend.job("two").await.unwrap().state, JobState::Printing);
+            backend
+                .review_action("cancel", "other", Some("two"))
+                .await
+                .unwrap();
+            assert_eq!(
+                backend.cancel("two").await.unwrap().state,
+                JobState::Cancelled
+            );
+        })
+        .await
+        .unwrap();
+        if pending {
+            a.fake.no_state.store(false, Ordering::SeqCst);
+            assert_eq!(
+                timeout(Duration::from_secs(2), backend.cancel("one"))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                JobState::Cancelled
+            );
+            assert_eq!(
+                timeout(Duration::from_secs(2), start)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                JobState::Cancelled
+            );
+            assert_eq!(backend.job("one").await.unwrap().state, JobState::Cancelled);
+            assert_eq!(a.fake.commands.lock().await.len(), 2);
+        } else {
+            a.ftps.release.notify_one();
+            assert_eq!(
+                timeout(Duration::from_secs(5), start)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                JobState::Printing
+            );
+        }
+        assert_eq!(b.fake.commands.lock().await.len(), 2);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_overtakes_pause_and_resume_polls() {
+    use dutchman_print::backend::JobState;
+    use std::time::Duration;
+    use tokio::time::timeout;
+    for resume in [false, true] {
+        let c = Control::new().await;
+        c.backend.start("control").await.unwrap();
+        if resume {
+            c.backend.pause("bambu").await.unwrap();
+        }
+        let count = c.fake.commands.lock().await.len();
+        c.fake.no_state.store(true, Ordering::SeqCst);
+        let command = tokio::spawn({
+            let backend = c.backend.clone();
+            async move {
+                if resume {
+                    backend.resume("bambu").await
+                } else {
+                    backend.pause("bambu").await
+                }
+            }
+        });
+        timeout(Duration::from_secs(5), async {
+            while c.fake.processed.load(Ordering::SeqCst) == count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!command.is_finished());
+        c.fake.no_state.store(false, Ordering::SeqCst);
+        assert_eq!(
+            timeout(Duration::from_secs(2), c.backend.cancel("control"))
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Cancelled
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(2), command)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Cancelled
+        );
+        assert_eq!(c.fake.commands.lock().await.len(), count + 2);
     }
 }

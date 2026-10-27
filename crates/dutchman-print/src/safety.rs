@@ -25,7 +25,7 @@ struct State {
     #[serde(default)]
     observed: HashMap<String, (Option<String>, Option<String>)>,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Review {
     printer: String,
     path: std::path::PathBuf,
@@ -127,15 +127,17 @@ impl Safety {
             loop {
                 tokio::time::sleep(interval).await;
                 let Some(safety) = weak.upgrade() else { break };
-                let mut state = safety.state.lock().await;
-                let ids: Vec<_> = state
+                let ids: Vec<_> = safety
+                    .state
+                    .lock()
+                    .await
                     .cleared
                     .iter()
                     .filter(|(_, held)| **held)
                     .map(|(id, _)| id.clone())
                     .collect();
                 for id in ids {
-                    let _ = safety.fresh(&mut state, &id).await;
+                    let _ = safety.fresh(&id).await;
                 }
             }
         });
@@ -143,9 +145,10 @@ impl Safety {
     pub async fn review_digest(&self, id: Option<&str>) -> Result<Option<String>, Error> {
         let state = self.state.lock().await;
         let Some(id) = id else { return Ok(None) };
-        let Some(review) = state.reviews.get(id) else {
+        let Some(review) = state.reviews.get(id).cloned() else {
             return Ok(None);
         };
+        drop(state);
         let digest = hash(&file_bytes(&review.path).await?);
         if digest != review.hash {
             return Err(Error::Refused(
@@ -242,17 +245,21 @@ impl Safety {
                 Some(!*cleared && !self.inner.bed_ready(&printer.id, printer.detail.as_deref()));
         }
     }
-    async fn fresh(&self, state: &mut State, id: &str) -> Result<Printer, Error> {
+    async fn fresh(&self, id: &str) -> Result<Printer, Error> {
         let mut printer =
             match tokio::time::timeout(self.interval * 2, self.inner.printer(id)).await {
                 Ok(Ok(printer)) => printer,
                 _ => {
+                    let mut state = self.state.lock().await;
                     state.cleared.insert(id.into(), false);
                     state.clearance.remove(id);
                     return Err(Error::Unavailable);
                 }
             };
-        self.observe(state, std::slice::from_mut(&mut printer));
+        self.observe(
+            &mut *self.state.lock().await,
+            std::slice::from_mut(&mut printer),
+        );
         Ok(printer)
     }
 }
@@ -266,7 +273,7 @@ impl Backend for Safety {
         self.inner.review_action(action, printer, job)
     }
     fn printer<'a>(&'a self, id: &'a str) -> Reply<'a, Printer> {
-        Box::pin(async move { self.fresh(&mut *self.state.lock().await, id).await })
+        Box::pin(async move { self.fresh(id).await })
     }
     fn check_control(&self, printer: &str) -> Result<(), Error> {
         self.inner.check_control(printer)
@@ -274,24 +281,29 @@ impl Backend for Safety {
 
     fn printers(&self) -> Reply<'_, Vec<Printer>> {
         Box::pin(async {
-            let mut state = self.state.lock().await;
             let mut printers =
                 match tokio::time::timeout(self.interval * 2, self.inner.printers()).await {
                     Ok(Ok(printers)) => printers,
                     _ => {
+                        let mut state = self.state.lock().await;
                         state.cleared.clear();
                         state.clearance.clear();
                         return Err(Error::Unavailable);
                     }
                 };
-            self.observe(&mut state, &mut printers);
+            self.observe(&mut *self.state.lock().await, &mut printers);
             Ok(printers)
         })
     }
     fn clear<'a>(&'a self, id: &'a str) -> Reply<'a, ()> {
         Box::pin(async move {
+            let printer = self.fresh(id).await?;
             let mut state = self.state.lock().await;
-            let printer = self.fresh(&mut state, id).await?;
+            if state.observed.get(id) != Some(&(printer.job_id.clone(), printer.detail.clone())) {
+                return Err(Error::Refused(
+                    "The printer changed. Read fresh status before acknowledging its bed.".into(),
+                ));
+            }
             if printer.state != PrinterState::Idle {
                 return Err(Error::Refused(format!(
                     "{} is not idle. Wait before acknowledging its bed.",
@@ -332,7 +344,6 @@ impl Backend for Safety {
     }
     fn start<'a>(&'a self, id: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {
-            let mut state = self.state.lock().await;
             let job = self.inner.job(id).await?;
             self.inner.check_control(&job.printer)?;
             if job.state != JobState::Ready {
@@ -340,25 +351,50 @@ impl Backend for Safety {
                     "Only a ready job can be started. Read status to reconcile it.".into(),
                 ));
             }
-            let printer = self.fresh(&mut state, &job.printer).await?;
-            if printer.state != PrinterState::Idle {
-                return Err(Error::Refused("Printer readiness is unknown or the printer is busy. Read fresh status before starting.".into()));
-            }
-            if printer.needs_clearing != Some(false) {
-                return Err(Error::Refused(format!(
-                    "Check that {} has a clear bed, then acknowledge it in this run or through the server for {}.",
-                    printer.name, printer.id
-                )));
-            }
-            let review = state
+            let printer = self.fresh(&job.printer).await?;
+            let review = self
+                .state
+                .lock()
+                .await
                 .reviews
                 .get(id)
+                .cloned()
                 .ok_or_else(|| Error::Refused("Prepare and review this job again.".into()))?;
             if review.printer != job.printer
                 || hash(&file_bytes(&review.path).await?) != review.hash
             {
                 return Err(Error::Refused(
                     "Prepared file or printer changed. Prepare and review this job again.".into(),
+                ));
+            }
+            let mut state = self.state.lock().await;
+            if state.observed.get(&job.printer)
+                != Some(&(printer.job_id.clone(), printer.detail.clone()))
+            {
+                return Err(Error::Refused(
+                    "The printer changed. Read fresh status before starting.".into(),
+                ));
+            }
+            if printer.state != PrinterState::Idle {
+                return Err(Error::Refused("Printer readiness is unknown or the printer is busy. Read fresh status before starting.".into()));
+            }
+            if !state.cleared.get(&job.printer).copied().unwrap_or(false)
+                && !self
+                    .inner
+                    .bed_ready(&job.printer, printer.detail.as_deref())
+            {
+                return Err(Error::Refused(format!(
+                    "Check that {} has a clear bed, then acknowledge it in this run or through the server for {}.",
+                    printer.name, printer.id
+                )));
+            }
+            if state.reviews.get(id).is_none_or(|current| {
+                current.printer != review.printer
+                    || current.path != review.path
+                    || current.hash != review.hash
+            }) {
+                return Err(Error::Refused(
+                    "Prepared job changed. Prepare and review again.".into(),
                 ));
             }
             if self.stops.lock().await.get(id).copied().unwrap_or(false) {
@@ -369,9 +405,15 @@ impl Backend for Safety {
             // A failed or uncertain start can still have moved the machine.
             state.cleared.insert(job.printer.clone(), false);
             self.checkpoint(&state).await?;
+            drop(state);
             let result = self.inner.start(id).await;
             if self.stops.lock().await.get(id).copied().unwrap_or(false) {
                 // Backends reconcile uncertain starts and verify the live job before cancelling.
+                if let Ok(job) = self.inner.job(id).await {
+                    if job.state == JobState::Cancelled {
+                        return Ok(job);
+                    }
+                }
                 return self.inner.cancel(id).await;
             }
             result
@@ -386,24 +428,25 @@ impl Backend for Safety {
                 }
                 stops.insert(id.into(), true);
             }
-            let mut state = self.state.lock().await;
             let before = self.inner.job(id).await?;
             self.inner.check_control(&before.printer)?;
             if before.state == JobState::Cancelled {
                 return Ok(before);
             }
-            let result = self.inner.cancel(id).await;
             if before.state != JobState::Ready {
-                state.cleared.insert(before.printer, false);
+                self.state
+                    .lock()
+                    .await
+                    .cleared
+                    .insert(before.printer, false);
             }
-            result
+            self.inner.cancel(id).await
         })
     }
     fn pause<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {
             self.inner.check_control(printer)?;
-            let mut state = self.state.lock().await;
-            let p = self.fresh(&mut state, printer).await?;
+            let p = self.fresh(printer).await?;
             if p.state != PrinterState::Printing {
                 return Err(Error::Refused(
                     "Printer is not printing. Read fresh status.".into(),
@@ -415,8 +458,7 @@ impl Backend for Safety {
     fn resume<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {
             self.inner.check_control(printer)?;
-            let mut state = self.state.lock().await;
-            let p = self.fresh(&mut state, printer).await?;
+            let p = self.fresh(printer).await?;
             if p.state != PrinterState::Paused
                 || p.detail
                     .as_deref()
@@ -429,7 +471,6 @@ impl Backend for Safety {
     }
     fn job<'a>(&'a self, id: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {
-            let _state = self.state.lock().await;
             let job = self.inner.job(id).await?;
             if matches!(job.state, JobState::Printing | JobState::Paused)
                 && self.stops.lock().await.get(id).copied().unwrap_or(false)
@@ -441,9 +482,8 @@ impl Backend for Safety {
     }
     fn forget<'a>(&'a self, id: &'a str) -> Reply<'a, ()> {
         Box::pin(async move {
-            let mut state = self.state.lock().await;
             self.inner.forget(id).await?;
-            state.reviews.remove(id);
+            self.state.lock().await.reviews.remove(id);
             self.stops.lock().await.remove(id);
             Ok(())
         })

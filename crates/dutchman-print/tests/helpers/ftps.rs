@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 use super::{hash, PrinterConfig};
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -15,6 +15,9 @@ pub struct Fake {
     pub received: Arc<AtomicUsize>,
     pub resumed: Arc<AtomicUsize>,
     pub deleted: Arc<AtomicUsize>,
+    pub block_upload: Arc<AtomicBool>,
+    pub entered: Arc<tokio::sync::Notify>,
+    pub release: Arc<tokio::sync::Notify>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Fake {
@@ -74,6 +77,11 @@ impl Fake {
         let received = Arc::new(AtomicUsize::new(0));
         let resumed = Arc::new(AtomicUsize::new(0));
         let deleted = Arc::new(AtomicUsize::new(0));
+        let block_upload = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (blocking, arrival, continuation) =
+            (block_upload.clone(), entered.clone(), release.clone());
         let deletion = deleted.clone();
         let (auth, length, reuse) = (credentials.clone(), received.clone(), resumed.clone());
         let task = tokio::spawn(async move {
@@ -147,6 +155,10 @@ impl Fake {
                                     let _ = data.read_to_end(&mut bytes).await;
                                 }
                                 length.store(bytes.len(), Ordering::SeqCst);
+                                if blocking.load(Ordering::SeqCst) {
+                                    arrival.notify_one();
+                                    continuation.notified().await;
+                                }
                                 if data_mode == 3 {
                                     // Withhold completion until the client closes the timed-out upload.
                                     let mut line = String::new();
@@ -196,6 +208,9 @@ impl Fake {
             received,
             resumed,
             deleted,
+            block_upload,
+            entered,
+            release,
             task,
         }
     }

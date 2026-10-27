@@ -181,6 +181,13 @@ commissioned behaviour and unchanged machine configuration. Completed, cancelled
 failed executions remain distinct; idle alone cannot establish completion. See
 [Moonraker configuration and checks](print.md#moonraker-klipper).
 
+Printer commands are serialized separately for each printer. Uploads and command outcome
+waits on one printer do not block another printer's status, confirmation review, or Stop.
+Stop can also overtake its own printer's pending Start, pause, or resume outcome wait;
+the earlier request reconciles to the confirmed cancellation without resending a command.
+Start attempts are durably recorded before sending Start. Late status results cannot
+replace a newer cancellation or restore a forgotten job.
+
 ## Job JSON and states
 
 ```json
