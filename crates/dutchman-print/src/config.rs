@@ -105,8 +105,14 @@ impl Config {
         if bytes.len() as u64 > MAX_CONFIG_BYTES {
             return Err("Config exceeds 1 MiB. Use at most 64 printers.".into());
         }
-        // Parser diagnostics can quote secret values, so do not pass them on.
         let text = std::str::from_utf8(&bytes).map_err(|_| "Config must be UTF-8 TOML.")?;
+        Self::from_text(text, enrollment)
+    }
+
+    /// Parses and validates config text as `load` does, after its file checks. `enrollment`
+    /// names a Bambu printer that may still lack a trust decision.
+    pub fn from_text(text: &str, enrollment: Option<&str>) -> Result<Self, String> {
+        // Parser diagnostics can quote secret values, so do not pass them on.
         let config: Self = toml::from_str(text)
             .map_err(|_| "Cannot read config TOML. Check the printer fields in docs/print.md.")?;
         config.validate_mode(enrollment)?;

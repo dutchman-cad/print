@@ -343,6 +343,7 @@ dependencies = [
  "md-5",
  "rcgen",
  "rumqttc",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
