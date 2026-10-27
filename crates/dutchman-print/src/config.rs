@@ -36,6 +36,13 @@ pub struct Printer {
     pub url: Option<String>,
     pub host: Option<String>,
     pub port: Option<u16>,
+    pub ftps_port: Option<u16>,
+    #[serde(default)]
+    pub lan_control: bool,
+    #[serde(default)]
+    pub start_profile: crate::bambu::StartProfile,
+    #[serde(default)]
+    pub ams_mapping: BTreeMap<String, u8>,
     pub serial: Option<String>,
     pub access_code: Option<String>,
     pub ca_file: Option<PathBuf>,

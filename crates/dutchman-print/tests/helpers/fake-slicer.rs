@@ -51,9 +51,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .find_map(|s| s.strip_prefix("--export-3mf="))
             .ok_or("No export")?;
         let mut zip = zip::ZipWriter::new(std::fs::File::create(Path::new(path))?);
+        let filaments = if mode == "multi" {
+            b"{\"filament_type\":[\"PLA\",\"PETG\"]}".as_slice()
+        } else {
+            b"{\"filament_type\":[\"PLA\"]}".as_slice()
+        };
+        let mut gcode = b"; nozzle_diameter = 0.4\n; model printing time: 1m 50s; total estimated time: 2m 3s\n; total filament length [mm] : 450\n; total filament weight [g] : 1.5\n; total layer number: 12\nG1 X0".to_vec();
+        if mode == "hardened" {
+            gcode.extend_from_slice(b"\n; nozzle_type = hardened_steel\n");
+        }
         for (name, bytes) in [
-            ("Metadata/plate_1.gcode", b"; model printing time: 1m 50s; total estimated time: 2m 3s\n; total filament length [mm] : 450\n; total filament weight [g] : 1.5\n; total layer number: 12\nG1 X0".as_slice()),
+            ("Metadata/plate_1.gcode", gcode.as_slice()),
             ("Metadata/plate_1.png", png.as_slice()),
+            ("Metadata/project_settings.config", filaments),
         ] {
             zip.start_file(name, zip::write::SimpleFileOptions::default())?;
             zip.write_all(bytes)?;

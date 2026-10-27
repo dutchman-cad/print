@@ -417,7 +417,10 @@ impl Backend for Safety {
             self.inner.check_control(printer)?;
             let mut state = self.state.lock().await;
             let p = self.fresh(&mut state, printer).await?;
-            if p.state != PrinterState::Paused || p.detail.as_deref().is_some_and(|s| s != "PAUSED")
+            if p.state != PrinterState::Paused
+                || p.detail
+                    .as_deref()
+                    .is_some_and(|s| !matches!(s, "PAUSED" | "PAUSE"))
             {
                 return Err(Error::Refused("Printer readiness is unknown or attention is required. Read fresh status before resuming.".into()));
             }
