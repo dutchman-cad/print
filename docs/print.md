@@ -796,8 +796,8 @@ checking that this printer's installed pause/resume macros behave safely. A chan
 machine configuration, including macros, requires fresh preparation and review.
 
 Status polls server connectivity and available printer objects, then reads a full object
-snapshot. Klippy startup, shutdown, error, missing objects, and contradictory states block
-movement; disconnection or unavailable telemetry reports offline. `print_stats` standby,
+snapshot. Klippy startup reports offline while it connects; shutdown, error, missing objects,
+and contradictory states block movement; disconnection or unavailable telemetry reports offline. `print_stats` standby,
 complete, and cancelled map to idle; printing and paused retain those states; unknown
 states map to error. `detail` contains the known state or a safe explanation. Raw fault
 messages are omitted because they may contain private data. Progress is a fraction;
@@ -806,6 +806,19 @@ because these objects provide no universal time-left measurement. Preparation es
 still come from the slicer. See [printer objects](https://moonraker.readthedocs.io/en/latest/printer_objects/).
 
 Preparation slices locally to text G-code and reads machine configuration without uploading.
+The slicer-written `nozzle_diameter` must match Klipper's
+`configfile.settings.extruder.nozzle_diameter` during preparation, challenge review, and
+before upload. Missing or ambiguous values block the action; mismatches name both diameters.
+There is no override. This verifies configuration; check the physical nozzle separately.
+See [Klipper configuration status](https://www.klipper3d.org/Status_Reference.html#configfile).
+
+Acknowledge the bed through a clear challenge and the API clear route in the running server,
+then request a separate Start challenge. Clearance expires and is polled under the shared policy.
+Polling also reads the latest Moonraker history entry: changes to execution identity or its
+fractional start timestamp, or to observed `print_stats` state or filename, withdraw clearance.
+History timestamps remain finite floating-point Unix seconds, without truncation.
+Activity with no retained history or observed state change cannot be detected.
+
 Start requires fresh ready status, an acknowledged clear bed, unchanged input and G-code,
 and unchanged machine identity, firmware, configuration, and profiles. A unique file is
 staged under `gcodes` with `print=false` and a SHA256 checksum; existing staging names are
@@ -813,12 +826,19 @@ refused. The upload must report neither printing nor queueing. Stored metadata m
 the reviewed filename and size before an explicit print start. Prepared files are limited
 to 200 MiB, response bodies to 1 MiB, status snapshots to four seconds, and upload time to
 30 seconds plus one second per 32 KiB. Metadata that is not ready within these checks
-blocks start; it does not cause a start retry. See [file management](https://moonraker.readthedocs.io/en/latest/external_api/file_manager/).
+blocks start; it does not cause a start retry. Failed or uncertain uploads and failed
+stored-file validation trigger deletion of the staged file before returning an error.
+If cleanup cannot be confirmed, inspect Moonraker storage and remove the file before preparing again.
+These failures never send Start. See [file management](https://moonraker.readthedocs.io/en/latest/external_api/file_manager/).
 
 Every start, pause, resume, cancel, and clear uses the shared CLI/API confirmation and bed
-policy. A start attempt is saved before sending the command when CLI persistence is enabled.
+policy. Tracked service and CLI jobs are checkpointed after changes; a start attempt is saved
+durably before sending the command.
 A lost reply is reconciled through fresh status, file metadata, and job history; start is
-never repeated automatically. Pause, resume, and cancel require the same live filename and
+never repeated automatically. Accepted commands poll for matching status for up to 25 seconds
+for start/cancel and 10 seconds for pause/resume, announcing pending on stderr.
+Expiry leaves an unconfirmed outcome: read status before another action. Polling never resends
+the command. Pause, resume, and cancel require the same live filename and
 execution ID started here. Moonraker's history component must be available for execution
 tracking and control. Completion, cancellation, and failure remain separate outcomes;
 idle alone cannot finish a tracked job. Any start attempt consumes bed clearance, and

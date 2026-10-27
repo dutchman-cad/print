@@ -150,6 +150,8 @@ impl Printers {
             // Offline printers remain tracked; controls still require live reconciliation.
             if self.octoprint.contains_key(&target.job.printer) {
                 let _ = self.reconcile_octoprint(target).await;
+            } else if self.moonraker.contains_key(&target.job.printer) {
+                let _ = self.reconcile_moonraker(target).await;
             } else {
                 let _ = self.reconcile(target).await;
             }
@@ -313,7 +315,9 @@ impl Printers {
                 .ok_or_else(|| {
                     refuse("No matching tracked job. Read status to reconcile the printer.")
                 })?;
-            return self.moonraker_control(target, action).await;
+            let result = self.moonraker_control(target, action).await;
+            self.checkpoint(&jobs).await?;
+            return result;
         }
         if self.octoprint.contains_key(printer) {
             let mut jobs = self.jobs.lock().await;
@@ -832,21 +836,60 @@ impl Printers {
         if live.objects.get("pause_resume").is_none() {
             return Err(refuse("Printer control capability is missing. Review the installed pause and cancel macros."));
         }
-        let result = client.command(&format!("/printer/print/{action}")).await;
-        let fresh = self.reconcile_moonraker(target).await;
-        result?;
-        fresh?;
+        if let Err(error) = client.command(&format!("/printer/print/{action}")).await {
+            let _ = self.reconcile_moonraker(target).await;
+            return Err(error);
+        }
+        self.wait_moonraker(target, action).await?;
+        Ok(target.job.clone())
+    }
+    async fn wait_moonraker(&self, target: &mut Prepared, action: &str) -> Result<(), Error> {
+        use std::time::Duration;
+        use tokio::time::{sleep, timeout_at, Instant};
+        let deadline = Instant::now()
+            + Duration::from_secs(if matches!(action, "start" | "cancel") {
+                25
+            } else {
+                10
+            });
         let expected = match action {
             "pause" => JobState::Paused,
-            "resume" => JobState::Printing,
-            _ => JobState::Cancelled,
+            "cancel" => JobState::Cancelled,
+            _ => JobState::Printing,
         };
-        if target.job.state != expected {
-            return Err(refuse(
-                "Command outcome is not confirmed. Read fresh status to reconcile the job.",
-            ));
+        let mut pending = false;
+        loop {
+            if let Ok(Ok(live)) = timeout_at(deadline, self.reconcile_moonraker(target)).await {
+                if target.job.state == expected
+                    && target.remote.is_some()
+                    && target.remote == live.printer.job_id
+                {
+                    return Ok(());
+                }
+                if live
+                    .printer
+                    .job_name
+                    .as_deref()
+                    .is_some_and(|name| name != target.filename)
+                    || target.remote.is_some() && target.remote != live.printer.job_id
+                {
+                    return Err(refuse(
+                        "Live job changed while the command was pending. Read fresh status.",
+                    ));
+                }
+            }
+            if !pending {
+                eprintln!("Moonraker {action} is pending. Waiting for fresh status; do not repeat the command.");
+                pending = true;
+            }
+            if Instant::now() >= deadline {
+                return Err(refuse("Moonraker command is not confirmed after waiting. Read fresh status to reconcile the pending outcome; do not repeat the command."));
+            }
+            sleep(
+                Duration::from_millis(250).min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
         }
-        Ok(target.job.clone())
     }
     async fn start_moonraker(
         &self,
@@ -866,10 +909,12 @@ impl Printers {
             .ok_or(Error::NotFound)?;
         let live = client.snapshot().await?;
         crate::moonraker::ready(&live)?;
-        if client.review(&live).await? != target.info {
+        let bytes = file_bytes(&target.path).await?;
+        let info = client.review(&live).await?;
+        check_nozzle(&bytes, &info)?;
+        if info != target.info {
             return Err(refuse("Machine identity, firmware, build volume, or tooling changed. Prepare and review again."));
         }
-        let bytes = file_bytes(&target.path).await?;
         if hash(&bytes) != target.digest {
             return Err(refuse("Prepared G-code changed. Prepare and review again."));
         }
@@ -886,14 +931,31 @@ impl Printers {
         if code != StatusCode::NOT_FOUND {
             return Err(refuse("Staging file already exists or storage cannot be checked. Prepare a new job after inspecting storage."));
         }
-        crate::moonraker::ready(&client.snapshot().await?)?;
-        client.upload(&filename, &bytes).await?;
-        let metadata = client.metadata(&filename).await?;
-        if metadata.get("filename").and_then(Value::as_str) != Some(filename.as_str())
-            || metadata.get("size").and_then(Value::as_u64) != Some(bytes.len() as u64)
-        {
-            return Err(refuse("Uploaded file metadata differs from the reviewed name or size. Inspect storage before starting."));
+        let fresh = client.snapshot().await?;
+        crate::moonraker::ready(&fresh)?;
+        check_nozzle(&bytes, &client.review(&fresh).await?)?;
+        let staged = async {
+            client.upload(&filename, &bytes).await?;
+            let metadata = client.metadata(&filename).await?;
+            if metadata.get("filename").and_then(Value::as_str) != Some(filename.as_str())
+                || metadata.get("size").and_then(Value::as_u64) != Some(bytes.len() as u64)
+            {
+                return Err(refuse(
+                    "Uploaded file metadata differs from the reviewed name or size. Prepare again.",
+                ));
+            }
+            Ok(metadata)
         }
+        .await;
+        let metadata = match staged {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                if client.delete(&filename).await.is_err() {
+                    return Err(refuse("Upload failed and remote cleanup is not confirmed. Inspect Moonraker storage and remove the staged file before preparing again."));
+                }
+                return Err(error);
+            }
+        };
         target.history =
             serde_json::json!({"job_id":metadata.get("job_id"),"size":metadata.get("size")});
         let live = client.snapshot().await?;
@@ -904,31 +966,20 @@ impl Printers {
             ));
         }
         target.attempted = true;
-        if let Some(path) = &self.store {
-            let bytes = serde_json::to_vec(&*jobs).map_err(|_| Error::Unavailable)?;
-            let temporary = path.with_extension("new");
-            tokio::fs::write(&temporary, bytes)
-                .await
-                .map_err(|_| Error::Unavailable)?;
-            tokio::fs::rename(temporary, path)
-                .await
-                .map_err(|_| Error::Unavailable)?;
-        }
+        self.checkpoint(jobs).await?;
         let target = jobs.get_mut(id).ok_or(Error::NotFound)?;
         let reply = client
             .command(&format!("/printer/print/start?filename={filename}"))
             .await;
-        let fresh = self.reconcile_moonraker(target).await;
-        match reply {
-            Err(Error::Unavailable) => return Err(refuse("Start reply was lost. Read status to reconcile the intended file and job. Start will not be repeated.")),
-            other => other?,
+        if let Err(error) = reply {
+            let _ = self.reconcile_moonraker(target).await;
+            return Err(if matches!(error, Error::Unavailable) {
+                refuse("Start reply was lost. Read status to reconcile the intended file and job. Start will not be repeated.")
+            } else {
+                error
+            });
         }
-        fresh?;
-        if target.job.state != JobState::Printing {
-            return Err(refuse(
-                "Start is not confirmed. Read status to reconcile the intended file and job.",
-            ));
-        }
+        self.wait_moonraker(target, "start").await?;
         Ok(target.job.clone())
     }
 }
@@ -979,6 +1030,56 @@ impl Backend for Printers {
                     return Err(refuse(
                         "The live job differs from the reviewed job. No command was sent.",
                     ));
+                }
+                return Ok(());
+            }
+            if let Some(client) = self.moonraker.get(printer) {
+                let live = client.snapshot().await?;
+                let jobs = self.jobs.lock().await;
+                let target = job
+                    .and_then(|id| jobs.get(id))
+                    .or_else(|| {
+                        jobs.values().find(|p| {
+                            p.job.printer == printer
+                                && p.remote.is_some()
+                                && p.remote == live.printer.job_id
+                        })
+                    })
+                    .ok_or_else(|| {
+                        refuse("No matching tracked job. Read status to reconcile the printer.")
+                    })?;
+                if action == "start" {
+                    crate::moonraker::ready(&live)?;
+                    if target.attempted || target.job.state != JobState::Ready {
+                        return Err(refuse(
+                            "Start was already attempted. Read status; do not repeat Start.",
+                        ));
+                    }
+                    let bytes = file_bytes(&target.path).await?;
+                    let info = client.review(&live).await?;
+                    check_nozzle(&bytes, &info)?;
+                    if hash(&bytes) != target.digest
+                        || info != target.info
+                        || self.profiles(printer)? != target.profiles
+                    {
+                        return Err(refuse(
+                            "Prepared file or printer changed. Prepare and review again.",
+                        ));
+                    }
+                } else if target.attempted {
+                    if target.remote.is_none()
+                        || target.remote != live.printer.job_id
+                        || live.printer.job_name.as_deref() != Some(target.filename.as_str())
+                        || !matches!(live.printer.detail.as_deref(), Some("printing" | "paused"))
+                    {
+                        return Err(refuse("The live job differs from the reviewed job or readiness is unknown. Read fresh status."));
+                    }
+                    if action == "resume"
+                        && (!client.resume_commissioned()
+                            || client.review(&live).await? != target.info)
+                    {
+                        return Err(refuse("Review the printer configuration and commission resume before resuming."));
+                    }
                 }
                 return Ok(());
             }
@@ -1087,6 +1188,12 @@ impl Backend for Printers {
             if let Some(bambu) = self.bambu.get(id) {
                 return Ok(bambu.snapshot().await);
             }
+            if let Some(client) = self.moonraker.get(id) {
+                return Ok(match client.snapshot().await {
+                    Ok(snapshot) => snapshot.printer,
+                    Err(error) => client.offline(&error),
+                });
+            }
             if let Some(client) = self.octoprint.get(id) {
                 return Ok(match client.snapshot().await {
                     Ok(snapshot) => snapshot.printer,
@@ -1122,11 +1229,16 @@ impl Backend for Printers {
     }
 
     fn latches_terminal_reports(&self, printer: &str) -> bool {
-        self.bambu.contains_key(printer) || self.octoprint.contains_key(printer)
+        self.bambu.contains_key(printer)
+            || self.octoprint.contains_key(printer)
+            || self.moonraker.contains_key(printer)
     }
     fn clear<'a>(&'a self, id: &'a str) -> Reply<'a, ()> {
         Box::pin(async move {
             if let Some(client) = self.bambu.get(id) {
+                client.acknowledge();
+            }
+            if let Some(client) = self.moonraker.get(id) {
                 client.acknowledge();
             }
             if let Some(client) = self.octoprint.get(id) {
@@ -1355,7 +1467,9 @@ impl Backend for Printers {
             let mut jobs = self.jobs.lock().await;
             let target = jobs.get_mut(id).ok_or(Error::NotFound)?;
             if self.moonraker.contains_key(&target.job.printer) {
-                return self.start_moonraker(id, &mut jobs).await;
+                let result = self.start_moonraker(id, &mut jobs).await;
+                self.checkpoint(&jobs).await?;
+                return result;
             }
             if self.octoprint.contains_key(&target.job.printer) {
                 let result = self.start_octoprint(id, &mut jobs).await;
@@ -1527,7 +1641,11 @@ impl Backend for Printers {
             }
             if !target.attempted && target.job.state == JobState::Ready {
                 target.job.state = JobState::Cancelled;
-                return Ok(target.job.clone());
+                let job = target.job.clone();
+                if self.moonraker.contains_key(&job.printer) {
+                    self.checkpoint(&jobs).await?;
+                }
+                return Ok(job);
             }
             if self.octoprint.contains_key(&target.job.printer) {
                 let result = self.octoprint_control(target, "cancel").await;
@@ -1535,7 +1653,9 @@ impl Backend for Printers {
                 return result;
             }
             if self.moonraker.contains_key(&target.job.printer) {
-                return self.moonraker_control(target, "cancel").await;
+                let result = self.moonraker_control(target, "cancel").await;
+                self.checkpoint(&jobs).await?;
+                return result;
             }
             self.control_job(target, "cancel").await
         })
@@ -1568,7 +1688,11 @@ impl Backend for Printers {
     }
     fn forget<'a>(&'a self, id: &'a str) -> Reply<'a, ()> {
         Box::pin(async move {
-            self.jobs.lock().await.remove(id);
+            let mut jobs = self.jobs.lock().await;
+            let removed = jobs.remove(id);
+            if removed.is_some_and(|p| self.moonraker.contains_key(&p.job.printer)) {
+                self.checkpoint(&jobs).await?;
+            }
             Ok(())
         })
     }

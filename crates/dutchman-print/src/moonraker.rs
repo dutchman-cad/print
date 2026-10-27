@@ -16,6 +16,8 @@ pub struct Client {
     config: crate::config::Printer,
     uri: Uri,
     tls: Arc<rustls::ClientConfig>,
+    observation: tokio::sync::Mutex<Option<Value>>,
+    changed: std::sync::atomic::AtomicBool,
 }
 pub struct Snapshot {
     pub printer: Printer,
@@ -98,6 +100,8 @@ impl Client {
             config,
             uri,
             tls: Arc::new(tls),
+            observation: tokio::sync::Mutex::new(None),
+            changed: std::sync::atomic::AtomicBool::new(false),
         })
     }
     pub async fn request(
@@ -252,6 +256,32 @@ impl Client {
         }
         Ok(())
     }
+    pub fn acknowledge(&self) {
+        self.changed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub async fn delete(&self, filename: &str) -> Result<(), Error> {
+        let (code, body) = self
+            .request(
+                Method::DELETE,
+                &format!("/server/files/gcodes/{}", encode(filename)),
+                Bytes::new(),
+                "application/json",
+                false,
+            )
+            .await?;
+        if code == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        let reply = result(&body)?;
+        if code != StatusCode::OK
+            || reply.pointer("/item/path").and_then(Value::as_str) != Some(filename)
+            || reply.pointer("/item/root").and_then(Value::as_str) != Some("gcodes")
+        {
+            return Err(Error::Unavailable);
+        }
+        Ok(())
+    }
     pub async fn metadata(&self, filename: &str) -> Result<Value, Error> {
         self.json(&format!(
             "/server/files/metadata?filename={}",
@@ -270,11 +300,12 @@ impl Client {
         let connected = server.get("klippy_connected").and_then(Value::as_bool);
         let klippy = server.get("klippy_state").and_then(Value::as_str);
         if connected != Some(true) || klippy != Some("ready") {
-            printer.state = if connected == Some(false) || klippy == Some("disconnected") {
-                PrinterState::Offline
-            } else {
-                PrinterState::Error
-            };
+            printer.state =
+                if connected == Some(false) || matches!(klippy, Some("disconnected" | "startup")) {
+                    PrinterState::Offline
+                } else {
+                    PrinterState::Error
+                };
             printer.detail = Some(
                 match klippy {
                     Some("disconnected") => "Klippy disconnected. Restore the printer connection.",
@@ -347,7 +378,9 @@ impl Client {
         let active = objects
             .pointer("/virtual_sdcard/is_active")
             .and_then(Value::as_bool);
-        printer.state = if webhook != Some("ready") {
+        printer.state = if webhook == Some("startup") {
+            PrinterState::Offline
+        } else if webhook != Some("ready") {
             PrinterState::Error
         } else {
             match (state, active) {
@@ -404,8 +437,30 @@ impl Client {
         printer.bed_temperature = objects
             .pointer("/heater_bed/temperature")
             .and_then(Value::as_f64);
-        printer.needs_clearing =
-            matches!(state, Some("complete" | "cancelled" | "error")).then_some(true);
+        let jobs = self.json("/server/history/list?limit=1&order=desc").await?;
+        let jobs = jobs
+            .get("jobs")
+            .and_then(Value::as_array)
+            .filter(|j| j.len() <= 1)
+            .ok_or(Error::Unavailable)?;
+        let latest = jobs
+            .first()
+            .map(|job| {
+                job.get("start_time")
+                    .and_then(Value::as_f64)
+                    .filter(|t| t.is_finite() && *t >= 0.0)
+                    .map(|time| json!({"id":job.get("job_id"),"start":time,"end":job.get("end_time"),"status":job.get("status")}))
+                    .ok_or(Error::Unavailable)
+            })
+            .transpose()?;
+        let observed = json!({"state":state,"filename":printer.job_name,"latest":latest});
+        let mut previous = self.observation.lock().await;
+        if previous.as_ref().is_some_and(|old| old != &observed) {
+            self.changed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        *previous = Some(observed);
+        printer.needs_clearing = Some(self.changed.load(std::sync::atomic::Ordering::SeqCst));
         // Metadata links a filename to an execution; history distinguishes repeated prints of that file.
         let mut history = Value::Null;
         if let Some(name) = &printer.job_name {
@@ -520,7 +575,7 @@ impl Client {
         Ok(
             json!({"endpoint":crate::safety::hash(self.config.url.as_deref().unwrap_or_default().as_bytes()),
             "identity":crate::safety::hash(&serde_json::to_vec(&json!({"hostname":host.get("hostname"),"version":host.get("software_version"),"server":live.server.get("moonraker_version")})).map_err(|_| Error::Unavailable)?),
-            "configuration":crate::safety::hash(&config),"min":bounds("axis_minimum"),"max":bounds("axis_maximum")}),
+            "info":{"nozzle_diameter":nozzle},"configuration":crate::safety::hash(&config),"min":bounds("axis_minimum"),"max":bounds("axis_maximum")}),
         )
     }
     pub fn resume_commissioned(&self) -> bool {

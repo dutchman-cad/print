@@ -4,6 +4,7 @@
 mod fake;
 #[path = "helpers/slicer.rs"]
 mod slicer_fixture;
+use axum::{body::Body, http::StatusCode, Router};
 use dutchman_print::{
     backend::{Backend, Error, JobState, Options, PrinterState},
     moonraker::Client,
@@ -61,7 +62,7 @@ async fn mapping_klippy_states_auth_and_optional_telemetry() {
         );
     }
     for (klippy, expected) in [
-        ("startup", PrinterState::Error),
+        ("startup", PrinterState::Offline),
         ("shutdown", PrinterState::Error),
         ("error", PrinterState::Error),
         ("disconnected", PrinterState::Offline),
@@ -412,11 +413,21 @@ async fn api_actions_require_fresh_confirmation_before_commands() {
     use tower::ServiceExt as _;
     let f = Fake::new().await;
     let dir = tempfile::tempdir().unwrap();
-    let b = backend(&f, dir.path()).await;
+    let raw = Arc::new(Printers::new(f.config()).unwrap());
+    let safety = Safety::new(raw.clone());
+    safety
+        .prepare("one", &input(dir.path()), "test", Options::default())
+        .await
+        .unwrap();
     let mut settings = dutchman_print::ServerConfig::default();
     settings.storage.data_dir = dir.path().join("api");
     settings.storage.min_free = 0;
-    let app = dutchman_print::router(b, settings);
+    std::fs::create_dir_all(&settings.storage.data_dir).unwrap();
+    safety
+        .save(&settings.storage.data_dir.join("safety.json"))
+        .await
+        .unwrap();
+    let app = dutchman_print::router(raw, settings);
     for path in [
         "/api/v1/jobs/one/start",
         "/api/v1/jobs/one/cancel",
@@ -437,14 +448,36 @@ async fn api_actions_require_fresh_confirmation_before_commands() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
+    let challenge = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/confirmations")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"action":"clear","printer":"test"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(challenge.status(), StatusCode::CREATED);
+    let challenge: Value = serde_json::from_slice(
+        &axum::body::to_bytes(challenge.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     let token = "a".repeat(64);
-    for expected in [StatusCode::NO_CONTENT, StatusCode::FORBIDDEN] {
+    for expected in [StatusCode::NO_CONTENT, StatusCode::CONFLICT] {
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/printers/test/clear")
+                    .uri(format!(
+                        "/api/v1/printers/test/clear?confirmation={}",
+                        challenge["id"].as_str().unwrap()
+                    ))
                     .header("Plugin-Confirmation", &token)
                     .body(Body::empty())
                     .unwrap(),
@@ -453,7 +486,34 @@ async fn api_actions_require_fresh_confirmation_before_commands() {
             .unwrap();
         assert_eq!(response.status(), expected);
     }
+    f.shared.machine.lock().await.settings["extruder"]["nozzle_diameter"] = json!(0.6);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/confirmations")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    r#"{"action":"start","printer":"test","job":"one"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let message = String::from_utf8_lossy(&bytes);
+    assert!(message.contains("0.4") && message.contains("0.6"));
     assert!(f.commands().await.is_empty());
+    f.shared.machine.lock().await.settings["extruder"]["nozzle_diameter"] = json!(0.4);
+    api_action(&app, "start", Some("one"), 2).await;
+    api_action(&app, "pause", None, 3).await;
+    api_action(&app, "resume", None, 4).await;
+    api_action(&app, "cancel", Some("one"), 5).await;
+    assert_eq!(f.commands().await.len(), 4);
 }
 #[tokio::test]
 async fn restart_preserves_uncertain_attempt_and_requires_new_bed_clearance() {
@@ -571,6 +631,7 @@ async fn old_history_for_the_staged_filename_cannot_finish_a_new_attempt() {
         m.history_state = "completed".into();
         m.stale_history = true;
     }
+    b.clear("test").await.unwrap();
     assert!(b.start("one").await.is_err());
     assert_eq!(b.job("one").await.unwrap().state, JobState::Ready);
     assert!(b.start("one").await.is_err());
@@ -603,4 +664,253 @@ async fn existing_staging_file_is_not_overwritten_and_backend_messages_stay_priv
             && !public.contains("private.invalid")
             && !public.contains(&f.url)
     );
+}
+
+#[tokio::test]
+async fn history_fractions_and_observed_activity_withdraw_clearance() {
+    for change in ["history", "filename", "state"] {
+        let f = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend(&f, dir.path()).await;
+        f.shared.machine.lock().await.id = Some("old".into());
+        b.clear("test").await.unwrap();
+        assert_eq!(b.printers().await.unwrap()[0].needs_clearing, Some(false));
+        {
+            let mut m = f.shared.machine.lock().await;
+            match change {
+                "history" => m.history_time += 0.125,
+                "filename" => m.name = "external.gcode".into(),
+                _ => m.state = "complete".into(),
+            }
+        }
+        assert_eq!(
+            b.printers().await.unwrap()[0].needs_clearing,
+            Some(true),
+            "{change}"
+        );
+    }
+}
+#[tokio::test]
+async fn configured_nozzle_must_match_slicer_and_be_known() {
+    for nozzle in [json!(0.6), Value::Null] {
+        let f = Fake::new().await;
+        f.shared.machine.lock().await.settings["extruder"]["nozzle_diameter"] = nozzle.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let path = input(dir.path());
+        let b = Printers::new(f.config()).unwrap();
+        let error = b
+            .prepare("one", &path, "test", Options::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nozzle"));
+        if nozzle == json!(0.6) {
+            assert!(error.contains("0.6") && error.contains("0.4"));
+        }
+        assert!(f.commands().await.is_empty());
+    }
+}
+#[tokio::test]
+async fn failed_and_uncertain_uploads_are_deleted_without_start() {
+    for mode in ["lost", "size", "queued"] {
+        let f = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend(&f, dir.path()).await;
+        b.clear("test").await.unwrap();
+        {
+            let mut m = f.shared.machine.lock().await;
+            match mode {
+                "lost" => m.upload_lost = true,
+                "size" => m.bad_size = true,
+                _ => m.queued = true,
+            }
+        }
+        assert!(b.start("one").await.is_err());
+        assert!(f.commands().await.is_empty());
+        let m = f.shared.machine.lock().await;
+        assert!(m.records.iter().any(
+            |(method, path, _)| method == "DELETE" && path.starts_with("/server/files/gcodes/")
+        ));
+        assert!(m.bytes.is_empty());
+    }
+}
+#[tokio::test]
+async fn delayed_commands_are_polled_and_sent_once() {
+    let f = Fake::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let b = backend(&f, dir.path()).await;
+    b.clear("test").await.unwrap();
+    f.shared.machine.lock().await.delay_reads = 7;
+    assert_eq!(b.start("one").await.unwrap().state, JobState::Printing);
+    f.shared.machine.lock().await.delay_reads = 4;
+    assert_eq!(b.pause("test").await.unwrap().state, JobState::Paused);
+    f.shared.machine.lock().await.delay_reads = 4;
+    assert_eq!(b.resume("test").await.unwrap().state, JobState::Printing);
+    f.shared.machine.lock().await.delay_reads = 4;
+    assert_eq!(b.cancel("one").await.unwrap().state, JobState::Cancelled);
+    assert_eq!(
+        f.commands().await,
+        vec![
+            "/printer/print/start",
+            "/printer/print/pause",
+            "/printer/print/resume",
+            "/printer/print/cancel"
+        ]
+    );
+}
+#[tokio::test]
+async fn missing_sliced_nozzle_is_refused() {
+    let f = Fake::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = input(dir.path());
+    std::fs::write(dir.path().join("mode"), "missing").unwrap();
+    let b = Printers::new(f.config()).unwrap();
+    assert!(b
+        .prepare("one", &path, "test", Options::default())
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("nozzle"));
+    assert!(f.commands().await.is_empty());
+}
+#[tokio::test]
+async fn background_polling_withdraws_clearance_after_external_history() {
+    let f = Fake::new().await;
+    let b = Arc::new(
+        Safety::new(Arc::new(Printers::new(f.config()).unwrap())).timing(
+            Arc::new(dutchman_print::simulated::SystemClock::default()),
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(60),
+        ),
+    );
+    b.clear("test").await.unwrap();
+    let before = {
+        let mut m = f.shared.machine.lock().await;
+        m.id = Some("external".into());
+        m.records
+            .iter()
+            .filter(|(_, path, _)| path == "/server/history/list")
+            .count()
+    };
+    b.monitor();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let count = f
+                .shared
+                .machine
+                .lock()
+                .await
+                .records
+                .iter()
+                .filter(|(_, path, _)| path == "/server/history/list")
+                .count();
+            if count > before {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(b.printer("test").await.unwrap().needs_clearing, Some(true));
+}
+
+async fn api_action(app: &Router, action: &str, job: Option<&str>, token: u64) {
+    use tower::ServiceExt as _;
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/confirmations")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    json!({"action":action,"printer":"test","job":job}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let code = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        code,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let challenge: Value = serde_json::from_slice(&bytes).unwrap();
+    let route = match job {
+        Some(job) => format!("/api/v1/jobs/{job}/{action}"),
+        None => format!("/api/v1/printers/test/{action}"),
+    };
+    let request = || {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(&route)
+            .header("Content-Type", "application/json")
+            .header("Plugin-Confirmation", format!("{token:064x}"))
+            .body(Body::from(
+                json!({"confirmation":challenge["id"]}).to_string(),
+            ))
+            .unwrap()
+    };
+    let response = app.clone().oneshot(request()).await.unwrap();
+    let code = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        code,
+        if action == "clear" {
+            StatusCode::NO_CONTENT
+        } else {
+            StatusCode::OK
+        },
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(
+        app.clone().oneshot(request()).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn each_job_change_is_checkpointed_and_restored() {
+    let f = Fake::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("jobs.json");
+    let raw = Arc::new(Printers::new(f.config()).unwrap().with_store(state.clone()));
+    let b = Safety::new(raw.clone());
+    b.prepare("one", &input(dir.path()), "test", Options::default())
+        .await
+        .unwrap();
+    b.clear("test").await.unwrap();
+    for (action, expected) in [
+        ("start", JobState::Printing),
+        ("pause", JobState::Paused),
+        ("resume", JobState::Printing),
+        ("cancel", JobState::Cancelled),
+    ] {
+        match action {
+            "start" => b.start("one").await.unwrap(),
+            "pause" => b.pause("test").await.unwrap(),
+            "resume" => b.resume("test").await.unwrap(),
+            _ => b.cancel("one").await.unwrap(),
+        };
+        let restored = Printers::new(f.config()).unwrap();
+        restored.restore(&state).await.unwrap();
+        assert_eq!(restored.job("one").await.unwrap().state, expected);
+        let stored: Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+        assert_eq!(
+            stored["one"]["job"]["state"],
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+    raw.forget("one").await.unwrap();
+    let stored: Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    assert!(stored.get("one").is_none());
 }

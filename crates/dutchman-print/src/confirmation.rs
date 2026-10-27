@@ -166,7 +166,7 @@ impl Confirmations {
                     && printer
                         .detail
                         .as_deref()
-                        .is_none_or(|s| matches!(s, "PAUSED" | "PAUSE" | "Paused"))
+                        .is_none_or(|s| matches!(s, "PAUSED" | "PAUSE" | "Paused" | "paused"))
             }
             _ => false,
         };

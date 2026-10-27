@@ -40,6 +40,10 @@ pub struct Machine {
     pub identity: String,
     pub block: Option<String>,
     pub stale_history: bool,
+    pub history_time: f64,
+    pub delay_reads: usize,
+    pub pending_state: Option<String>,
+    pub upload_lost: bool,
 }
 pub struct Shared {
     pub machine: Mutex<Machine>,
@@ -104,7 +108,15 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
         ("GET", "/printer/objects/list") => {
             json!({"objects":["webhooks","print_stats","virtual_sdcard","display_status","extruder","heater_bed","toolhead","configfile","pause_resume","mcu"]})
         }
+        ("GET", "/server/history/list") => {
+            json!({"jobs":if m.id.is_some(){vec![json!({"job_id":m.id,"start_time":m.history_time})]}else{vec![]}})
+        }
         ("GET", "/printer/objects/query") => {
+            if m.delay_reads > 0 {
+                m.delay_reads -= 1;
+            } else if let Some(state) = m.pending_state.take() {
+                m.state = state;
+            }
             assert!(query.contains("print_stats") && query.contains("webhooks"));
             if m.missing {
                 json!({"eventtime":1,"status":{}})
@@ -128,6 +140,12 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
         ("GET", "/server/history/job") => {
             json!({"job":{"job_id":m.id,"filename":m.name,"status":m.history_state,"exists":true,"metadata":{"size":m.bytes.len()},"start_time":200,"end_time":if m.history_state=="in_progress" {Value::Null}else{json!(300)}}})
         }
+        ("DELETE", p) if p.starts_with("/server/files/gcodes/") => {
+            let name = m.name.clone();
+            m.name.clear();
+            m.bytes.clear();
+            json!({"item":{"root":"gcodes","path":name,"size":0}})
+        }
         ("POST", "/server/files/upload") => {
             let text = std::str::from_utf8(&body).unwrap();
             assert!(text.contains("name=\"print\"\r\n\r\nfalse"));
@@ -150,6 +168,9 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
             m.name = name.into();
             m.bytes = data.as_bytes().to_vec();
             let v = json!({"result":{"item":{"path":m.name,"root":"gcodes","size":m.bytes.len()},"print_started":m.incomplete,"print_queued":m.queued,"action":"create_file"}});
+            if m.upload_lost {
+                return Response::new(Body::new(Broken));
+            }
             return (StatusCode::CREATED, axum::Json(v)).into_response();
         }
         ("POST", "/printer/print/start") => {
@@ -157,7 +178,11 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
             if m.conflict {
                 return StatusCode::CONFLICT.into_response();
             }
-            m.state = "printing".into();
+            if m.delay_reads > 0 {
+                m.pending_state = Some("printing".into());
+            } else {
+                m.state = "printing".into();
+            }
             if !m.stale_history {
                 m.id = Some("000001".into());
                 m.history_state = "in_progress".into();
@@ -168,15 +193,27 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
             json!("ok")
         }
         ("POST", "/printer/print/pause") => {
-            m.state = "paused".into();
+            if m.delay_reads > 0 {
+                m.pending_state = Some("paused".into());
+            } else {
+                m.state = "paused".into();
+            }
             json!("ok")
         }
         ("POST", "/printer/print/resume") => {
-            m.state = "printing".into();
+            if m.delay_reads > 0 {
+                m.pending_state = Some("printing".into());
+            } else {
+                m.state = "printing".into();
+            }
             json!("ok")
         }
         ("POST", "/printer/print/cancel") => {
-            m.state = "cancelled".into();
+            if m.delay_reads > 0 {
+                m.pending_state = Some("cancelled".into());
+            } else {
+                m.state = "cancelled".into();
+            }
             m.history_state = "cancelled".into();
             json!("ok")
         }
@@ -217,6 +254,10 @@ impl Fake {
                 identity: "synthetic".into(),
                 block: None,
                 stale_history: false,
+                history_time: 200.25,
+                delay_reads: 0,
+                pending_state: None,
+                upload_lost: false,
             }),
             entered: Notify::new(),
             release: Notify::new(),
