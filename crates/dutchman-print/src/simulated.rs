@@ -205,6 +205,7 @@ impl Backend for Simulated {
                             Some(JobState::Paused) => PrinterState::Paused,
                             _ => PrinterState::Idle,
                         },
+                        job_path: None,
                         job_id: active.map(|j| j.id.clone()),
                         job_name: active.map(|j| j.name.clone()),
                         progress: active.and_then(|j| j.progress),
@@ -260,6 +261,7 @@ impl Backend for Simulated {
                 ));
             }
             let job = Job {
+                detail: None,
                 id: job_id.into(),
                 printer: printer.into(),
                 name: options.name.unwrap_or_else(|| {

@@ -220,7 +220,17 @@ async fn upload_with_idle(
     Ok(())
 }
 
-async fn delete(config: &crate::config::Printer, filename: &str) -> Result<(), Error> {
+pub(super) async fn delete(config: &crate::config::Printer, filename: &str) -> Result<(), Error> {
+    if filename.is_empty()
+        || filename.len() > 128
+        || !filename.ends_with(".gcode.3mf")
+        || filename.contains("..")
+        || !filename
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(refused("Use the staged .gcode.3mf basename for cleanup."));
+    }
     let host = config.host.as_deref().ok_or(Error::Unavailable)?;
     let serial = ServerName::try_from(config.serial.clone().unwrap_or_default())
         .map_err(|_| Error::Unavailable)?;

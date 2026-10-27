@@ -25,7 +25,7 @@ impl Default for StartProfile {
             md5_target: "plate".into(),
             leveling_field: "bed_leveling".into(),
             ams_convention: "per-filament".into(),
-            bed_leveling: false,
+            bed_leveling: true,
             flow_cali: false,
             vibration_cali: false,
             layer_inspect: false,
@@ -387,7 +387,7 @@ mod tests {
         let payload = start_payload(&config, "job.gcode.3mf", "job", &bytes).unwrap();
         assert_eq!(
             payload,
-            json!({"print":{"command":"project_file", "param":"Metadata/plate_1.gcode", "project_id":"0", "profile_id":"0", "task_id":"0", "subtask_id":"0", "subtask_name":"job", "url":"file:///sdcard/job.gcode.3mf", "md5":"ff52cbe2fe33af1fa1cdbd00107358b0", "timelapse":false, "bed_type":"auto", "bed_leveling":false, "flow_cali":false, "vibration_cali":false, "layer_inspect":false, "use_ams":false, "ams_mapping":""}})
+            json!({"print":{"command":"project_file", "param":"Metadata/plate_1.gcode", "project_id":"0", "profile_id":"0", "task_id":"0", "subtask_id":"0", "subtask_name":"job", "url":"file:///sdcard/job.gcode.3mf", "md5":"ff52cbe2fe33af1fa1cdbd00107358b0", "timelapse":false, "bed_type":"auto", "bed_leveling":true, "flow_cali":false, "vibration_cali":false, "layer_inspect":false, "use_ams":false, "ams_mapping":""}})
         );
         config.ams_mapping.insert("1".into(), 3);
         assert_eq!(
@@ -398,7 +398,7 @@ mod tests {
         config.start_profile.md5_target = "empty".into();
         config.start_profile.leveling_field = "bed_levelling".into();
         config.start_profile.ams_convention = "right-aligned-five".into();
-        config.start_profile.bed_leveling = true;
+        config.start_profile.bed_leveling = false;
         config.start_profile.flow_cali = true;
         config.start_profile.vibration_cali = true;
         config.start_profile.layer_inspect = true;
@@ -406,7 +406,7 @@ mod tests {
         let print = expected["print"].as_object_mut().unwrap();
         print.remove("bed_leveling");
         for (key, value) in [
-            ("bed_levelling", json!(true)),
+            ("bed_levelling", json!(false)),
             ("flow_cali", json!(true)),
             ("vibration_cali", json!(true)),
             ("layer_inspect", json!(true)),

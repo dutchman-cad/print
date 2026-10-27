@@ -18,6 +18,7 @@ pub struct Fake {
     pub authorization: Arc<AtomicBool>,
     pub lose_reply: Arc<AtomicBool>,
     pub ready: Arc<AtomicBool>,
+    pub wrong_sequence: Arc<AtomicBool>,
     pub no_state: Arc<AtomicBool>,
     pub commands: Arc<Mutex<Vec<serde_json::Value>>>,
     pub cert: rustls::pki_types::CertificateDer<'static>,
@@ -72,6 +73,7 @@ impl Fake {
         let authorization = Arc::new(AtomicBool::new(false));
         let lose_reply = Arc::new(AtomicBool::new(false));
         let no_state = Arc::new(AtomicBool::new(false));
+        let wrong_sequence = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(AtomicBool::new(false));
         let commands = Arc::new(Mutex::new(Vec::new()));
         let live = Arc::new(Mutex::new(
@@ -79,6 +81,7 @@ impl Fake {
         ));
         let tasks = Arc::new(Mutex::new(Vec::new()));
         let task = {
+            let wrong_sequence = wrong_sequence.clone();
             let (authorization, lose_reply, ready, commands, live, no_state) = (
                 authorization.clone(),
                 lose_reply.clone(),
@@ -117,6 +120,7 @@ impl Fake {
                         broadcast,
                         no_state.clone(),
                     );
+                    let wrong_sequence = wrong_sequence.clone();
                     let task = tokio::spawn(async move {
                         let Ok(mut socket) = acceptor.accept(socket).await else {
                             return;
@@ -167,6 +171,7 @@ impl Fake {
                                                 if p.qos == QoS::AtLeastOnce && send(&mut socket, Packet::PubAck(rumqttc::mqttbytes::v4::PubAck::new(p.pkid))).await.is_err() { return; }
                                                 let command = value["print"]["command"].as_str().unwrap();
                                                 let mut reply = serde_json::json!({"print":{"command":command,"sequence_id":value["print"]["sequence_id"],"result":"SUCCESS"}});
+                                                if wrong_sequence.load(Ordering::SeqCst) { reply["print"]["sequence_id"] = serde_json::json!("unrelated"); }
                                                 if authorization.load(Ordering::SeqCst) {
                                                     reply["print"]["result"] = serde_json::json!("FAIL");
                                                     reply["print"]["reason"] = serde_json::json!("verification");
@@ -205,6 +210,7 @@ impl Fake {
             lose_reply,
             ready,
             no_state,
+            wrong_sequence,
             commands,
             port,
             cert,

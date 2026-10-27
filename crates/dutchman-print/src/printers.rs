@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+#[path = "printers_stop.rs"]
+mod stop;
+
 type MachineGuard = Option<OwnedMutexGuard<()>>;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -23,6 +26,8 @@ struct Prepared {
     remote: Option<String>,
     attempted: bool,
     filename: String,
+    #[serde(default)]
+    staged: Option<String>,
     profiles: Value,
     #[serde(default)]
     history: Value,
@@ -196,6 +201,8 @@ impl Printers {
             && (current.job.state != target.job.state
                 || current.job.progress != target.job.progress
                 || current.job.seconds_left != target.job.seconds_left
+                || current.staged != target.staged
+                || current.job.detail != target.job.detail
                 || current.remote != target.remote
                 || current.cancelling != target.cancelling
                 || current.attempted != target.attempted
@@ -267,7 +274,12 @@ impl Printers {
         Ok(())
     }
     async fn reconcile_job(&self, target: &mut Prepared) -> Result<(), Error> {
-        if self.bambu.contains_key(&target.job.printer) {
+        if !matches!(
+            target.job.state,
+            JobState::Ready | JobState::Printing | JobState::Paused | JobState::Ended
+        ) {
+            // The saved terminal result remains valid after its staged file is removed.
+        } else if self.bambu.contains_key(&target.job.printer) {
             self.reconcile_bambu(target).await?;
         } else if self.octoprint.contains_key(&target.job.printer) {
             self.reconcile_octoprint(target).await?;
@@ -276,7 +288,18 @@ impl Printers {
         } else {
             self.reconcile(target).await?;
         }
-        self.publish(target).await
+        self.publish(target).await?;
+        if !matches!(
+            target.job.state,
+            JobState::Ready | JobState::Printing | JobState::Paused
+        ) && target.staged.is_some()
+        {
+            let _guard = self.machine(&target.job.printer).await?;
+            *target = self.tracked(&target.job.id).await?;
+            self.cleanup_staged(target).await;
+            self.publish(target).await?;
+        }
+        Ok(())
     }
     pub async fn reconcile_all(&self) -> Result<(), String> {
         let targets: Vec<_> = self
@@ -386,7 +409,8 @@ impl Printers {
             || target.remote != live.job_id
             || live.state == crate::backend::PrinterState::Offline
             || !matches!(target.job.state, JobState::Printing | JobState::Paused)
-            || (action == "resume" && live.detail.as_deref() != Some("PAUSE"))
+            || (action == "resume"
+                && live.detail.as_deref().and_then(|d| d.split("; ").next()) != Some("PAUSE"))
             || (action != "cancel"
                 && !matches!(
                     (
@@ -922,6 +946,8 @@ impl Printers {
                 return Err(error);
             }
         };
+        target.staged = Some(filename.clone());
+        self.publish(target).await?;
         target.history = crate::octoprint::history(&uploaded);
         let live = client.snapshot().await?;
         crate::octoprint::ready(&live)?;
@@ -1208,6 +1234,8 @@ impl Printers {
                 return Err(error);
             }
         };
+        target.staged = Some(filename.clone());
+        self.publish(target).await?;
         target.history =
             serde_json::json!({"job_id":metadata.get("job_id"),"size":metadata.get("size")});
         let live = client.snapshot().await?;
@@ -1274,6 +1302,8 @@ impl Printers {
                 ));
             }
             client.upload(&target.filename, &bytes).await?;
+            target.staged = Some(target.filename.clone());
+            self.publish(target).await?;
             client.ready().await?;
             self.attempted(target).await?;
             self.publish(target).await?;
@@ -1377,6 +1407,8 @@ impl Printers {
             }
             return Err(error);
         }
+        target.staged = Some(path.clone());
+        self.publish(target).await?;
         ready(&client.snapshot().await?)?;
         if self.review_info(client).await? != target.info {
             return Err(refuse("Machine identity, firmware, or tooling changed during upload. Prepare and review again."));
@@ -1412,7 +1444,7 @@ impl Backend for Printers {
         job: Option<&'a str>,
     ) -> Reply<'a, ()> {
         Box::pin(async move {
-            if action == "clear" {
+            if matches!(action, "clear" | "stop") {
                 return Ok(());
             }
             self.check_control(printer)?;
@@ -1830,6 +1862,7 @@ impl Backend for Printers {
                     id.into(),
                     Prepared {
                         job: Job {
+                            detail: None,
                             id: id.into(),
                             printer: printer.into(),
                             name: options.name.unwrap_or_else(|| "Print job".into()),
@@ -1846,6 +1879,7 @@ impl Backend for Printers {
                         filename,
                         profiles: self.profiles(printer)?,
                         history: Value::Null,
+                        staged: None,
                         cancelling: false,
                         revision: 0,
                         incarnation: Arc::new(()),
@@ -1893,6 +1927,7 @@ impl Backend for Printers {
             check_nozzle(&bytes, &info)?;
             let filename = format!("dutchman-{}.gcode", hash(id.as_bytes()));
             let job = Job {
+                detail: None,
                 id: id.into(),
                 printer: printer.into(),
                 name: options.name.unwrap_or_else(|| "Print job".into()),
@@ -1917,6 +1952,7 @@ impl Backend for Printers {
                     filename,
                     profiles: self.profiles(printer)?,
                     history: Value::Null,
+                    staged: None,
                     cancelling: false,
                     revision: 0,
                     incarnation: Arc::new(()),
@@ -1939,6 +1975,13 @@ impl Backend for Printers {
             let mut target = self.tracked(id).await?;
             let result = self.start_job(&mut target, &mut guard).await;
             self.publish(&mut target).await?;
+            if guard.is_none() {
+                guard = self.machine(&printer).await?;
+                target = self.tracked(id).await?;
+            }
+            self.cleanup_staged(&mut target).await;
+            self.publish(&mut target).await?;
+            drop(guard);
             if target.job.state == JobState::Cancelled {
                 Ok(target.job)
             } else {
@@ -1963,12 +2006,28 @@ impl Backend for Printers {
                     .await
             };
             self.publish(&mut target).await?;
+            if guard.is_none() {
+                guard = self.machine(&printer).await?;
+                target = self.tracked(id).await?;
+            }
+            self.cleanup_staged(&mut target).await;
+            self.publish(&mut target).await?;
+            drop(guard);
             if target.job.state == JobState::Cancelled {
                 Ok(target.job)
             } else {
                 result.map(|_| target.job)
             }
         })
+    }
+    fn stop<'a>(
+        &'a self,
+        printer: &'a str,
+        identity: &'a str,
+        name: &'a str,
+        path: Option<&'a str>,
+    ) -> Reply<'a, Printer> {
+        Box::pin(async move { self.stop_live(printer, identity, name, path).await })
     }
     fn pause<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
         Box::pin(async move { self.control(printer, "pause", JobState::Printing).await })
@@ -1979,7 +2038,7 @@ impl Backend for Printers {
     fn job<'a>(&'a self, id: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {
             let mut target = self.tracked(id).await?;
-            if target.attempted {
+            if target.attempted || target.staged.is_some() && target.job.state != JobState::Ready {
                 self.reconcile_job(&mut target).await?;
             }
             Ok(target.job)
@@ -1998,6 +2057,12 @@ impl Backend for Printers {
             } else {
                 None
             };
+            if let Ok(mut target) = self.tracked(id).await {
+                if target.job.state == JobState::Ready && !target.attempted {
+                    target.job.state = JobState::Cancelled;
+                }
+                self.cleanup_staged(&mut target).await;
+            }
             let mut jobs = self.jobs.lock().await;
             jobs.remove(id);
             self.checkpoint(&jobs).await?;

@@ -64,6 +64,8 @@ pub enum JobState {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Printer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_path: Option<String>,
     pub id: String,
     pub name: String,
     pub model: String,
@@ -139,6 +141,8 @@ pub struct Estimate {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Job {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub id: String,
     pub printer: String,
     pub name: String,
@@ -203,6 +207,20 @@ pub trait Backend: Send + Sync {
     ) -> Reply<'a, Estimate>;
     fn start<'a>(&'a self, job: &'a str) -> Reply<'a, Job>;
     fn cancel<'a>(&'a self, job: &'a str) -> Reply<'a, Job>;
+    /// Stop exactly the freshly confirmed live execution, including external jobs.
+    fn stop<'a>(
+        &'a self,
+        _printer: &'a str,
+        _identity: &'a str,
+        _name: &'a str,
+        _path: Option<&'a str>,
+    ) -> Reply<'a, Printer> {
+        Box::pin(async {
+            Err(Error::Refused(
+                "Printer Stop is unavailable for this backend.".into(),
+            ))
+        })
+    }
     fn pause<'a>(&'a self, printer: &'a str) -> Reply<'a, Job>;
     fn resume<'a>(&'a self, printer: &'a str) -> Reply<'a, Job>;
     fn job<'a>(&'a self, job_id: &'a str) -> Reply<'a, Job>;

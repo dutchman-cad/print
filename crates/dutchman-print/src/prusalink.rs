@@ -110,6 +110,38 @@ impl Client {
         upload: bool,
         deadline: Duration,
     ) -> Result<(StatusCode, HeaderMap, Bytes), Error> {
+        let read = method == Method::GET && !upload;
+        let (result, stale) = self
+            .raw_once(
+                method.clone(),
+                path,
+                body.clone(),
+                auth.clone(),
+                upload,
+                deadline,
+            )
+            .await;
+        if stale && read {
+            // The printer closed the idle keep-alive socket before this request reached it.
+            // A read is safe to repeat once on a fresh connection; controls are never repeated.
+            return self
+                .raw_once(method, path, body, auth, upload, deadline)
+                .await
+                .0;
+        }
+        result
+    }
+    /// Sends one request. The flag is true when a reused connection failed before any reply.
+    async fn raw_once(
+        &self,
+        method: Method,
+        path: &str,
+        body: Bytes,
+        auth: Option<String>,
+        upload: bool,
+        deadline: Duration,
+    ) -> (Result<(StatusCode, HeaderMap, Bytes), Error>, bool) {
+        let stale = std::sync::atomic::AtomicBool::new(false);
         let mut cached = self.connection.lock().await;
         let mut active = cached.take();
         if active.as_ref().is_some_and(|c| c.sender.is_closed()) {
@@ -127,6 +159,7 @@ impl Client {
             if active.as_ref().is_some_and(|c| c.sender.is_closed()) {
                 active = None;
             }
+            let reused = active.is_some();
             if active.is_none() {
                 let host = self.uri.host().ok_or(Error::Unavailable)?;
                 let host = host.trim_start_matches('[').trim_end_matches(']');
@@ -174,11 +207,10 @@ impl Client {
             let request = request
                 .body(Full::new(body))
                 .map_err(|_| refused("Check printer credentials."))?;
-            let response = connection
-                .sender
-                .send_request(request)
-                .await
-                .map_err(|_| Error::Unavailable)?;
+            let response = connection.sender.send_request(request).await.map_err(|_| {
+                stale.store(reused, std::sync::atomic::Ordering::Relaxed);
+                Error::Unavailable
+            })?;
             let (parts, body) = response.into_parts();
             let bytes = Limited::new(body, 1 << 20)
                 .collect()
@@ -197,13 +229,14 @@ impl Client {
                 .await
                 .map_err(|_| Error::Unavailable)
         };
-        match result {
+        let result = match result {
             Ok(Ok(value)) => {
                 *cached = active;
                 Ok(value)
             }
             Ok(Err(error)) | Err(error) => Err(error),
-        }
+        };
+        (result, stale.into_inner())
     }
     pub async fn request(
         &self,
@@ -341,6 +374,7 @@ impl Client {
             state,
             detail: Some(detail.into()),
             needs_clearing: matches!(detail, "FINISHED" | "STOPPED" | "ERROR").then_some(true),
+            job_path: None,
             job_id: job
                 .as_ref()
                 .and_then(|j| j.get("id"))
@@ -409,6 +443,7 @@ impl Client {
                 .into(),
             ),
             needs_clearing: None,
+            job_path: None,
             job_id: None,
             job_name: None,
             progress: None,
@@ -514,6 +549,89 @@ fn digest(
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    /// Reads one request head, which these tests send without a body.
+    async fn head(socket: &mut BufReader<tokio::net::TcpStream>) -> bool {
+        loop {
+            let mut line = String::new();
+            if socket.read_line(&mut line).await.unwrap_or(0) == 0 {
+                return false;
+            }
+            if line == "\r\n" {
+                return true;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_keep_alive_retries_reads_once_but_never_controls() {
+        for method in [Method::GET, Method::POST] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = accepted.clone();
+            let server = tokio::spawn(async move {
+                // The first connection answers once, then drops the next request unanswered,
+                // as a printer does when it closes an idle keep-alive socket.
+                let (socket, _) = listener.accept().await.unwrap();
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut socket = BufReader::new(socket);
+                assert!(head(&mut socket).await);
+                socket
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                    .await
+                    .unwrap();
+                head(&mut socket).await;
+                drop(socket);
+                while let Ok((socket, _)) = listener.accept().await {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut socket = BufReader::new(socket);
+                    if head(&mut socket).await {
+                        let _ = socket
+                            .get_mut()
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                            .await;
+                    }
+                }
+            });
+            let client = Client::new(crate::config::Printer {
+                url: Some(url),
+                api_key: Some("synthetic".into()),
+                ..Default::default()
+            })
+            .unwrap();
+            let first = client
+                .raw(
+                    Method::GET,
+                    "/api/v1/status",
+                    Bytes::new(),
+                    None,
+                    false,
+                    STATUS_TIMEOUT,
+                )
+                .await;
+            assert!(first.is_ok());
+            let second = client
+                .raw(
+                    method.clone(),
+                    "/api/v1/status",
+                    Bytes::new(),
+                    None,
+                    false,
+                    STATUS_TIMEOUT,
+                )
+                .await;
+            if method == Method::GET {
+                assert!(second.is_ok());
+                assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
+            } else {
+                assert!(second.is_err());
+                assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+            server.abort();
+        }
+    }
 
     #[tokio::test]
     async fn terminal_observations_survive_later_idle_reads() {

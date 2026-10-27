@@ -398,3 +398,70 @@ fn historical_error_stays_historical_until_its_value_changes() {
     s.report(br#"{"print":{"print_error":42}}"#);
     assert_eq!(s.printer(&p, FRESH).state, PrinterState::Error);
 }
+
+#[tokio::test]
+async fn commands_share_monitor_and_require_their_own_sequence_reply() {
+    let fake = Fake::new().await;
+    fake.ready.store(true, Ordering::SeqCst);
+    let mut config = config(&fake);
+    config.lan_control = true;
+    let c = Arc::new(Client::new(config, false).unwrap());
+    c.snapshot().await;
+    fake.reports.send(json!({"print":{"gcode_state":"RUNNING","gcode_start_time":123,"subtask_name":"external"}})).unwrap();
+    state(&c, PrinterState::Printing, "RUNNING").await;
+    fake.wrong_sequence.store(true, Ordering::SeqCst);
+    let command = tokio::spawn({
+        let c = c.clone();
+        async move {
+            c.command(
+                json!({"print":{"command":"pause","param":""}}),
+                "external",
+                "PAUSE",
+                Some("external:123"),
+                &mut None,
+            )
+            .await
+        }
+    });
+    state(&c, PrinterState::Paused, "PAUSE").await;
+    assert!(!command.is_finished());
+    let sequence = fake.commands.lock().await[0]["print"]["sequence_id"].clone();
+    fake.reports
+        .send(json!({"print":{"sequence_id":sequence,"result":"SUCCESS"}}))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), command)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(fake.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.commands.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn stages_and_dual_nozzle_deltas_are_bounded_and_visible() {
+    let fake = Fake::new().await;
+    let c = Client::new(config(&fake), false).unwrap();
+    c.snapshot().await;
+    for (stage, label) in [
+        (1, "Bed leveling"),
+        (7, "Heating nozzle"),
+        (13, "Homing"),
+        (987, "Stage 987"),
+    ] {
+        fake.reports.send(json!({"print":{"gcode_state":"PREPARE","stg_cur":stage,"device":{"extruder":{"info":[{"id":0,"temp":(220 << 16) | 201},{"id":1,"temp":(230 << 16) | 205}]}}}})).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let p = c.snapshot().await;
+                if p.detail.as_deref().is_some_and(|d| d.contains(label)) {
+                    assert_eq!(p.nozzle_temperature, Some(201.0));
+                    assert!(p.detail.unwrap().contains("Nozzle 1: 205"));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+}

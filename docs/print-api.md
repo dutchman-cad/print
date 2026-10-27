@@ -22,6 +22,7 @@ response fields. Breaking changes require a new path version such as `/api/v2`.
 | `POST /api/v1/confirmations` | Action, printer, optional job JSON | 201, confirmation challenge |
 | `POST /api/v1/jobs/{id}/start` | Confirmation id in JSON or query; confirmation header | 200, resulting job object |
 | `POST /api/v1/jobs/{id}/cancel` | Confirmation id in JSON or query; confirmation header | 200, resulting job object |
+| `POST /api/v1/printers/{id}/stop` | Confirmation id in JSON or query; confirmation header | 200, fresh printer object |
 | `POST /api/v1/printers/{id}/pause` | Confirmation id in JSON or query; confirmation header | 200, resulting active job object |
 | `POST /api/v1/printers/{id}/resume` | Confirmation id in JSON or query; confirmation header | 200, resulting active job object |
 | `POST /api/v1/printers/{id}/clear` | Confirmation id in JSON or query; confirmation header | 204, bed clearance acknowledged |
@@ -88,6 +89,7 @@ storage and removed on failure.
 | `state` | string | Required: `idle`, `printing`, `paused`, `attention`, `busy`, `error`, or `offline` |
 | `job_id` | string | Optional; active job ID |
 | `job_name` | string | Optional; active job name |
+| `job_path` | string | Optional; backend relative live file path, currently OctoPrint |
 | `progress` | number | Optional; fraction from 0 to 1 |
 | `seconds_left` | nonnegative integer | Optional |
 | `nozzle_temperature` | number | Optional; degrees Celsius |
@@ -201,6 +203,7 @@ replace a newer cancellation or restore a forgotten job.
 | `name` | string | Required |
 | `state` | string | Required: `ready`, `printing`, `paused`, `done`, `cancelled`, `failed`, or `ended` |
 | `estimate` | object | Required; may be empty |
+| `detail` | string | Optional; safe staged-file cleanup failure explanation |
 | `progress` | number or null | Required; fraction from 0 to 1, null when unavailable |
 | `seconds_left` | nonnegative integer or null | Required; null when unavailable |
 
@@ -224,11 +227,11 @@ require live reconciliation. Clients must still handle expired jobs disappearing
 
 Before each machine action, request a server-issued challenge with
 `POST /api/v1/confirmations` and JSON `{"action":"start","printer":"workbench","job":"JOB_ID"}`.
-Actions are `start`, `cancel`, `pause`, `resume`, and `clear`; `job` is required for start
+Actions are `start`, `cancel`, `stop`, `pause`, `resume`, and `clear`; `job` is required for start
 and cancel and omitted for printer actions. Issuance re-reads the printer and refuses
 incompatible actions with 409. Success is 201 with `id`, `action`, `printer`, nullable `job`,
 `summary`, `observed`, and `expires_at` (Unix seconds). `observed` contains normalized `state`,
-nullable vendor `detail`, `job_id`, `job_name`, `progress` (fraction rounded down to a whole
+nullable vendor `detail`, `job_id`, `job_name`, optional `job_path`, `progress` (fraction rounded down to a whole
 percent), and `needs_clearing`.
 
 Show the returned summary verbatim, for example:
@@ -245,6 +248,8 @@ Every machine route still requires exactly one `Plugin-Confirmation` header cont
 challenge ids return 403. A challenge must be unused, unexpired, and match the action,
 printer, job, and reviewed input digest. Current state, vendor detail, job identity, whole
 percent progress, bed clearance, and tracked job state must still match the observation.
+For cancel, Stop, pause, and resume, progress and detail may advance; state, live identity,
+live name, and optional live file path must still match.
 A changed observation returns 409 with
 "The printer changed since you confirmed; confirm again." Invalid, expired, or consumed
 challenges and reused header values also return 409. Obtain a new challenge and confirmation;
@@ -322,3 +327,36 @@ buffers moves no bytes. Failed or
 uncertain PrusaLink and Bambu uploads attempt deletion of the staged remote file before
 returning an error and never send Start. Unconfirmed cleanup requires inspection and
 removal in the printer's storage before preparing again.
+
+## Printer Stop and staged file cleanup
+
+`POST /api/v1/printers/{id}/stop` stops the freshly challenged live execution, including
+work started from a printer screen or another client. Request a `stop` challenge without
+`job`; show its summary including the live name, identity, state and progress. Stop is
+available in printing, paused and attention, requires no bed acknowledgement, and withdraws
+clearance even if its result is uncertain. Identity or name replacement refuses the
+command; progress changes are allowed. The backend rechecks the identity before sending.
+Success returns fresh Printer JSON and updates a matching tracked job to its confirmed
+outcome. External jobs are not added to the prepared-job list.
+
+PrusaLink addresses the live job ID; OctoPrint cancels only the same live origin/file path;
+Moonraker requires the same history execution and filename; Bambu requires the same
+subtask name and positive start time. OctoPrint cannot distinguish another execution of
+the same file. Stop waits up to 25 seconds, sends once, and returns 409 when unconfirmed.
+The same per-printer command locking and pending-wait preemption apply as for cancel.
+
+After done, cancelled, failed or ended, Dutchman deletes its recorded unique staged file
+once fresh status establishes that the file is no longer live. It also cleans an uploaded
+ready job when cancelled before Start or forgotten. External files are never removed.
+Unavailable status, a live file, or a deletion failure leaves a safe explanation in the
+job's optional `detail`; the terminal job outcome is retained. Later status reads may
+retry cleanup. The stored terminal result remains readable after deletion.
+
+Bambu commands share the monitoring MQTT connection. Replies are matched by `sequence_id`;
+a matching acknowledgement still requires fresh execution telemetry. Reconnect does not
+replay commands. Bambu upload refuses an explicit `sdcard: false` report. During PREPARE
+and RUNNING, `detail` adds the activity from `stg_cur`, with unknown codes shown numerically.
+If `nozzle_temper` is unavailable, the scalar nozzle temperature uses extruder 0, falling
+back to extruder 1; `detail` lists the available per-extruder temperatures. Packed temperatures
+use the low sixteen bits for current temperature. Bed leveling defaults on and can be
+disabled explicitly with `start_profile.bed_leveling = false`.

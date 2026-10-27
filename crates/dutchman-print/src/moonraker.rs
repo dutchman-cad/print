@@ -607,6 +607,7 @@ impl Client {
                 .into(),
             ),
             needs_clearing: None,
+            job_path: None,
             job_id: None,
             job_name: None,
             progress: None,

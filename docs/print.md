@@ -725,7 +725,8 @@ Commands wait for matching live state for up to 25 seconds for start/stop and 10
 for pause/resume. Pending is announced on stderr before “not confirmed”; waiting never
 resends a command. Failed or uncertain FTPS uploads delete the staged file before returning
 an error. If cleanup is not confirmed, inspect storage and remove it before preparing again.
-Pause, resume, and stop apply only to the matching live job started by this companion.
+Pause, resume, and job cancel require a matching tracked execution. Printer Stop also
+applies to an external live execution after a fresh identity-bound confirmation.
 Matching requires both the unique subtask name and a positive `gcode_start_time`; missing
 execution identity blocks control. A later execution of the same file is a different job.
 FINISH and FAILED consume bed clearance even between status polls. Stop requires FAILED
@@ -733,7 +734,7 @@ for the matching job before reporting cancellation; idle alone proves no outcome
 
 The single start profile is `lan-project-1`, a local plate-1 project profile. It uses
 `Metadata/plate_1.gcode`, local identifiers of zero, automatic bed type, and no timelapse.
-Calibration options default off. It requires `Metadata/project_settings.config` with
+Bed leveling defaults on; the other calibration options default off. It requires `Metadata/project_settings.config` with
 an explicit `filament_type` array. Missing metadata or tool selections outside that list
 are refused. Prepare and review again after changing any start setting.
 
@@ -756,7 +757,7 @@ archive_url = "sdcard"          # Alternative: "ftp"
 md5_target = "plate"            # Alternative: "empty"
 leveling_field = "bed_leveling" # Alternative: "bed_levelling"
 ams_convention = "per-filament" # Alternative: "right-aligned-five"
-bed_leveling = false
+bed_leveling = true # Set false explicitly to disable bed leveling.
 flow_cali = false
 vibration_cali = false
 layer_inspect = false
@@ -872,3 +873,33 @@ and [job history](https://moonraker.readthedocs.io/en/latest/external_api/histor
 
 Testing uses synthetic responses on test-owned loopback servers. Physical printer and
 macro commissioning remains an installation step.
+
+## Stop a printer and clean staged files
+
+Run `dutchman-print --config config.toml stop <printer>` to review the current live job's
+name, identity, state and progress, then confirm Stop. `--yes` uses the same fresh challenge
+without an interactive prompt. No bed-clear acknowledgement is needed. Stop is available
+while printing, paused or awaiting attention, including work started outside Dutchman.
+A changed live identity or name requires another confirmation; progress may advance.
+Stop sends one command and waits up to 25 seconds. An unconfirmed result requires a fresh
+status read. It never resends the command automatically. Check and acknowledge the bed
+again afterwards. Printer Stop can overtake that printer's pending command outcome wait;
+other printers' uploads and waits do not block it.
+
+The running service already saves tracked jobs in its private data folder and reloads
+them on restart. It reconciles attempted executions with fresh status before control.
+After a terminal outcome, only the recorded unique file staged by Dutchman is deleted,
+and only after fresh status establishes it is no longer live. Uploaded ready jobs are
+also cleaned when cancelled before Start or forgotten. A cleanup failure is reported in
+job `detail` while preserving its outcome; inspect printer storage before removing a file.
+
+Bambu commands use the existing monitoring MQTT connection and match replies by sequence
+number. Reconnect never replays a command. Upload is refused when telemetry reports no SD
+card. Preparation and printing status show the current stage in `detail`; unknown stage
+codes remain visible as numbers. Dual-extruder reports without `nozzle_temper` use extruder
+0 (or 1 when 0 is absent) for the scalar temperature and list both available readings in
+`detail`. Bed leveling stays enabled unless `bed_leveling = false` is explicitly set in
+that printer's `start_profile` table. These details use
+[Bambu's temperature field documentation](https://portal.bblmw.com/fleet-hub/wb76oog4i8k/files/Bambu%20Fleet%20Hub%20HTTP%20API%20EN%20v1.0.0.pdf),
+[community MQTT field notes](https://github.com/Doridian/OpenBambuAPI/blob/main/mqtt.md)
+and [community activity code notes](https://github.com/Doridian/OpenBambuAPI/blob/main/gcode.md#m1002).

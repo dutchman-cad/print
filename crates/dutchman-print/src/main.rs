@@ -68,6 +68,12 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Stop the printer's live job after confirmation.
+    Stop {
+        printer: String,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Show bed acknowledgement status; clearance is kept only by a running server.
     Clear {
         printer: String,
@@ -421,6 +427,17 @@ async fn command(
                     let job = backend.cancel(&job).await?;
                     dutchman_print::log_action("cancel", &job);
                     output(&job).map_err(dutchman_print::backend::Error::Failed)?;
+                }
+            }
+            Command::Stop { printer, yes } => {
+                let intent = dutchman_print::confirmation::Intent { action: "stop".into(), printer: printer.clone(), job: None };
+                let challenge = confirmations.issue(backend, intent.clone(), WallClock.now(), Duration::from_secs(60)).await?;
+                if yes { eprintln!("{}", challenge.summary); }
+                if confirm(&challenge.summary, yes).map_err(dutchman_print::backend::Error::Refused)? {
+                    let observed = confirmations.consume(backend, &challenge.id, &intent, None, WallClock.now()).await?;
+                    let identity = observed.job_id.as_deref().ok_or(dutchman_print::backend::Error::Unavailable)?;
+                    let name = observed.job_name.as_deref().ok_or(dutchman_print::backend::Error::Unavailable)?;
+                    output(&backend.stop(&printer, identity, name, observed.job_path.as_deref()).await?).map_err(dutchman_print::backend::Error::Failed)?;
                 }
             }
             Command::Clear { printer, yes: _ } => {
