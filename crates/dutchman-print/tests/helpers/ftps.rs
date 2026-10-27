@@ -14,6 +14,7 @@ pub struct Fake {
     pub credentials: Arc<AtomicUsize>,
     pub received: Arc<AtomicUsize>,
     pub resumed: Arc<AtomicUsize>,
+    pub deleted: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Fake {
@@ -72,6 +73,8 @@ impl Fake {
         let credentials = Arc::new(AtomicUsize::new(0));
         let received = Arc::new(AtomicUsize::new(0));
         let resumed = Arc::new(AtomicUsize::new(0));
+        let deleted = Arc::new(AtomicUsize::new(0));
+        let deletion = deleted.clone();
         let (auth, length, reuse) = (credentials.clone(), received.clone(), resumed.clone());
         let task = tokio::spawn(async move {
             loop {
@@ -128,14 +131,38 @@ impl Fake {
                                     reuse.fetch_add(1, Ordering::SeqCst);
                                 }
                                 let mut bytes = Vec::new();
-                                let _ = data.read_to_end(&mut bytes).await;
+                                if data_mode == 4 {
+                                    let mut chunk = [0; 65536];
+                                    loop {
+                                        let n = data.read(&mut chunk).await.unwrap_or(0);
+                                        if n == 0 {
+                                            break;
+                                        }
+                                        bytes.extend_from_slice(&chunk[..n]);
+                                        // Deliberately throttle transfer progress.
+                                        tokio::time::sleep(std::time::Duration::from_millis(2))
+                                            .await;
+                                    }
+                                } else {
+                                    let _ = data.read_to_end(&mut bytes).await;
+                                }
                                 length.store(bytes.len(), Ordering::SeqCst);
+                                if data_mode == 3 {
+                                    // Withhold completion until the client closes the timed-out upload.
+                                    let mut line = String::new();
+                                    let _ = control.read_line(&mut line).await;
+                                    return;
+                                }
                                 "226 Stored\r\n".into()
                             }
                             command if command.starts_with("SIZE ") => format!(
                                 "213 {}\r\n",
                                 length.load(Ordering::SeqCst) + usize::from(wrong_size)
                             ),
+                            command if command.starts_with("DELE ") => {
+                                deletion.fetch_add(1, Ordering::SeqCst);
+                                "250 Deleted\r\n".into()
+                            }
                             "QUIT" => {
                                 control.get_mut().write_all(b"221 Bye\r\n").await.unwrap();
                                 return;
@@ -168,6 +195,7 @@ impl Fake {
             credentials,
             received,
             resumed,
+            deleted,
             task,
         }
     }

@@ -470,6 +470,8 @@ impl Telemetry {
         };
         let state = if !live {
             PrinterState::Offline
+        } else if detail == "PAUSE" && !self.hms_detail().is_empty() {
+            PrinterState::Attention
         } else if self.serious_hms() || self.active_error() {
             PrinterState::Error
         } else {
@@ -693,7 +695,14 @@ impl Client {
                 }
             }
         };
-        tokio::time::timeout(DEADLINE, operation).await.map_err(|_| Error::Refused("Command is not confirmed. Check authorization and read status to reconcile the job. Start will not be repeated.".into()))?
+        eprintln!("Bambu command is pending. Waiting for fresh status; do not repeat the command.");
+        let deadline =
+            Duration::from_secs(if matches!(command.as_str(), "project_file" | "stop") {
+                25
+            } else {
+                10
+            });
+        tokio::time::timeout(deadline, operation).await.map_err(|_| Error::Refused("Command is not confirmed. Check authorization and read status to reconcile the job. Start will not be repeated.".into()))?
     }
 
     pub fn new(config: crate::config::Printer, oneshot: bool) -> Result<Self, String> {

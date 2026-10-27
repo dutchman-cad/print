@@ -699,6 +699,7 @@ async fn failed_upload_never_sends_start() {
     c.clear().await.unwrap();
     assert!(c.start().await.is_err());
     assert!(c.fake.commands.lock().await.is_empty());
+    assert_eq!(c.ftps.deleted.load(Ordering::SeqCst), 1);
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn authorization_rejects_live_control_without_claiming_transition() {
@@ -846,13 +847,14 @@ async fn hms_severity_and_attention_pause() {
     c.clear_start().await;
     c.report(json!({"print":{"gcode_state":"PAUSE"}})).await;
     let p = c.status().await;
+    assert_eq!(p.state, PrinterState::Attention);
     assert!(p.detail.unwrap().contains("Needs attention"));
     assert!(c.action("resume").await.is_err());
     assert!(c.safety.resume("bambu").await.is_err());
     // Stop remains available even when a serious fault requires attention.
     c.report(json!({"print":{"hms":[{"attr":0x03000200,"code":0x00040007}]}}))
         .await;
-    assert_eq!(c.status().await.state, PrinterState::Error);
+    assert_eq!(c.status().await.state, PrinterState::Attention);
     assert!(c.action("cancel").await.is_ok());
 }
 
@@ -953,4 +955,38 @@ async fn reconnect_between_polls_revokes_server_clearance() {
     assert!(c.start().await.is_err());
     c.clear().await.unwrap();
     c.start().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commands_wait_for_later_reports_without_resending() {
+    use dutchman_print::backend::JobState;
+    let c = Control::new().await;
+    c.clear_start().await;
+    c.fake.no_state.store(true, Ordering::SeqCst);
+    for (action, state, expected) in [
+        ("pause", "PAUSE", JobState::Paused),
+        ("resume", "RUNNING", JobState::Printing),
+        ("cancel", "FAILED", JobState::Cancelled),
+    ] {
+        let count = c.fake.commands.lock().await.len();
+        let transition = async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if c.fake.commands.lock().await.len() > count {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            c.fake
+                .reports
+                .send(json!({"print":{"gcode_state":state}}))
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(c.action(action), transition);
+        assert_eq!(result.unwrap().state, expected);
+        assert_eq!(c.fake.commands.lock().await.len(), count + 1);
+    }
 }

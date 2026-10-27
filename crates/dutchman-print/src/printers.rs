@@ -279,32 +279,61 @@ impl Printers {
     }
     async fn reconcile(&self, prepared: &mut Prepared) -> Result<Snapshot, Error> {
         let snapshot = self.client(&prepared.job.printer)?.snapshot().await?;
-        let filename = snapshot
-            .job
-            .as_ref()
-            .and_then(|j| {
-                j.pointer("/file/display_name")
-                    .or_else(|| j.pointer("/file/name"))
-            })
-            .and_then(Value::as_str);
-        if filename == Some(prepared.filename.as_str()) && prepared.attempted {
+        self.observe_prusalink(prepared, &snapshot.printer);
+        Ok(snapshot)
+    }
+    fn observe_prusalink(&self, prepared: &mut Prepared, live: &Printer) {
+        if live.job_name.as_deref() == Some(prepared.filename.as_str())
+            && prepared.attempted
+            && matches!(
+                prepared.job.state,
+                JobState::Ready | JobState::Printing | JobState::Paused
+            )
+        {
             if prepared.remote.is_none() {
-                prepared.remote = snapshot.printer.job_id.clone();
+                prepared.remote = live.job_id.clone();
             }
-            if prepared.remote == snapshot.printer.job_id {
-                prepared.job.state = match snapshot.printer.detail.as_deref() {
-                    Some("PRINTING" | "BUSY") => JobState::Printing,
-                    Some("PAUSED" | "ATTENTION") => JobState::Paused,
+            if prepared.remote == live.job_id {
+                prepared.job.state = match live.detail.as_deref() {
+                    Some("PRINTING") => JobState::Printing,
+                    Some("PAUSED") => JobState::Paused,
                     Some("FINISHED") => JobState::Done,
                     Some("STOPPED") => JobState::Cancelled,
                     Some("ERROR") => JobState::Failed,
                     _ => prepared.job.state,
                 };
-                prepared.job.progress = snapshot.printer.progress;
-                prepared.job.seconds_left = snapshot.printer.seconds_left;
+                prepared.job.progress = live.progress;
+                prepared.job.seconds_left = live.seconds_left;
             }
         }
-        Ok(snapshot)
+        if prepared.attempted
+            && prepared.remote.is_some()
+            && prepared.remote != live.job_id
+            && live.state == crate::backend::PrinterState::Idle
+            && matches!(
+                prepared.job.state,
+                JobState::Ready | JobState::Printing | JobState::Paused
+            )
+        {
+            prepared.job.state = match live.detail.as_deref() {
+                Some("FINISHED") if live.job_id.is_none() => JobState::Done,
+                Some("STOPPED") if live.job_id.is_none() => JobState::Cancelled,
+                _ => JobState::Ended,
+            };
+            prepared.job.seconds_left = None;
+        }
+        if matches!(
+            prepared.job.state,
+            JobState::Ready | JobState::Printing | JobState::Paused | JobState::Ended
+        ) {
+            if let Some(outcome) = prepared.remote.as_deref().and_then(|id| {
+                self.client(&prepared.job.printer)
+                    .ok()?
+                    .terminal(id, &prepared.filename)
+            }) {
+                prepared.job.state = outcome;
+            }
+        }
     }
     async fn control(&self, printer: &str, action: &str, expected: JobState) -> Result<Job, Error> {
         if self.moonraker.contains_key(printer) {
@@ -401,36 +430,65 @@ impl Printers {
             Method::PUT
         };
         let response = client.request(method, &path, Bytes::new(), false).await;
-        let fresh = self.reconcile(target).await;
         let (code, _) = response?;
         if code != StatusCode::NO_CONTENT {
             return Err(refuse(
                 "Printer refused the job command. Read status before another action.",
             ));
         }
-        let fresh = fresh?;
-        // A vanished job is not proof of cancellation.
-        if action == "cancel"
-            && (fresh.printer.job_id != target.remote || target.job.state != JobState::Cancelled)
-        {
-            return Err(refuse(
-                "Cancellation is not confirmed. Read status to reconcile the job.",
-            ));
-        }
-        let expected_state = match action {
-            "pause" => JobState::Paused,
-            "resume" => JobState::Printing,
-            _ => JobState::Cancelled,
-        };
-        if target.job.state != expected_state {
-            return Err(refuse(
-                "Command outcome is not confirmed. Read fresh status.",
-            ));
-        }
+        self.wait_prusalink(target, action).await?;
         Ok(target.job.clone())
     }
 }
 impl Printers {
+    async fn wait_prusalink(&self, target: &mut Prepared, action: &str) -> Result<(), Error> {
+        use std::time::Duration;
+        use tokio::time::{sleep, timeout_at, Instant};
+        let deadline = Instant::now()
+            + Duration::from_secs(if matches!(action, "start" | "cancel") {
+                25
+            } else {
+                10
+            });
+        let expected = match action {
+            "pause" => JobState::Paused,
+            "cancel" => JobState::Cancelled,
+            _ => JobState::Printing,
+        };
+        let mut pending = false;
+        loop {
+            if let Ok(Ok(live)) = timeout_at(deadline, self.reconcile(target)).await {
+                if target.job.state == expected
+                    && target.remote.is_some()
+                    && target.remote == live.printer.job_id
+                {
+                    return Ok(());
+                }
+                if live
+                    .printer
+                    .job_name
+                    .as_deref()
+                    .is_some_and(|name| name != target.filename)
+                    || target.remote.is_some() && target.remote != live.printer.job_id
+                {
+                    return Err(refuse(
+                        "Live job changed while the command was pending. Read fresh status.",
+                    ));
+                }
+            }
+            if !pending {
+                eprintln!("PrusaLink {action} is pending. Waiting for fresh status; do not repeat the command.");
+                pending = true;
+            }
+            if Instant::now() >= deadline {
+                return Err(refuse("PrusaLink command is not confirmed after waiting. Read fresh status to reconcile the pending outcome; do not repeat the command."));
+            }
+            sleep(
+                Duration::from_millis(250).min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
+        }
+    }
     async fn reconcile_octoprint(
         &self,
         target: &mut Prepared,
@@ -1201,10 +1259,23 @@ impl Backend for Printers {
                 });
             }
             let client = self.client(id)?;
-            Ok(match client.snapshot().await {
+            let mut jobs = self.jobs.try_lock().ok();
+            let live = match client.snapshot().await {
                 Ok(snapshot) => snapshot.printer,
                 Err(e) => client.offline(&e),
-            })
+            };
+            if let Some(jobs) = jobs.as_mut() {
+                let mut changed = false;
+                for target in jobs.values_mut().filter(|j| j.job.printer == id) {
+                    let before = target.job.state;
+                    self.observe_prusalink(target, &live);
+                    changed |= target.job.state != before;
+                }
+                if changed {
+                    self.checkpoint(jobs).await?;
+                }
+            }
+            Ok(live)
         })
     }
     fn restore_jobs<'a>(&'a self, path: &'a Path) -> Reply<'a, ()> {
@@ -1249,6 +1320,9 @@ impl Backend for Printers {
     }
     fn printers(&self) -> Reply<'_, Vec<Printer>> {
         Box::pin(async {
+            // Keep observations ordered with actions without delaying status behind an upload.
+            // Commands reconcile their own observations while they hold the job lock.
+            let mut jobs = self.jobs.try_lock().ok();
             let mut tasks = tokio::task::JoinSet::new();
             for (index, config) in self.configs.iter().enumerate() {
                 if let Some(client) = self.moonraker.get(&config.id).cloned() {
@@ -1293,6 +1367,19 @@ impl Backend for Printers {
             }
             if printers.len() != self.configs.len() {
                 return Err(Error::Unavailable);
+            }
+            if let Some(jobs) = jobs.as_mut() {
+                let mut changed = false;
+                for printer in printers.values().filter(|p| self.client(&p.id).is_ok()) {
+                    for target in jobs.values_mut().filter(|j| j.job.printer == printer.id) {
+                        let before = target.job.state;
+                        self.observe_prusalink(target, printer);
+                        changed |= target.job.state != before;
+                    }
+                }
+                if changed {
+                    self.checkpoint(jobs).await?;
+                }
             }
             Ok(printers.into_values().collect())
         })
@@ -1567,35 +1654,41 @@ impl Backend for Printers {
             }
             let path = format!("/api/v1/files/{storage}/{}", target.filename);
             ready(&client.snapshot().await?)?;
-            let upload = client
-                .request(Method::PUT, &path, bytes.clone(), true)
-                .await;
-            let (code, _) = match upload {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = client.snapshot().await;
-                    return Err(e);
+            let staged = async {
+                let (code, _) = client
+                    .request(Method::PUT, &path, bytes.clone(), true)
+                    .await?;
+                if code != StatusCode::CREATED {
+                    return Err(refuse(
+                        "Printer refused the upload. Check storage before preparing again.",
+                    ));
                 }
-            };
-            if code != StatusCode::CREATED {
-                let _ = client.snapshot().await;
-                let _ = client.json("/api/v1/storage").await;
-                return Err(refuse(
-                    "Printer refused the upload. Check storage and existing files before retrying.",
-                ));
+                let uploaded = client.json(&path).await?;
+                if uploaded.get("type").and_then(Value::as_str) != Some("PRINT_FILE")
+                    || uploaded.get("size").and_then(Value::as_u64) != Some(bytes.len() as u64)
+                    || uploaded
+                        .get("display_name")
+                        .or_else(|| uploaded.get("name"))
+                        .and_then(Value::as_str)
+                        != Some(target.filename.as_str())
+                {
+                    return Err(refuse(
+                        "Uploaded file validation failed. Prepare and review again.",
+                    ));
+                }
+                Ok(())
             }
-            let uploaded = client.json(&path).await?;
-            if uploaded.get("type").and_then(Value::as_str) != Some("PRINT_FILE")
-                || uploaded.get("size").and_then(Value::as_u64) != Some(bytes.len() as u64)
-                || uploaded
-                    .get("display_name")
-                    .or_else(|| uploaded.get("name"))
-                    .and_then(Value::as_str)
-                    != Some(target.filename.as_str())
-            {
-                return Err(refuse(
-                    "Uploaded file validation failed. Review the stored file before starting.",
-                ));
+            .await;
+            if let Err(error) = staged {
+                let cleanup = client
+                    .request(Method::DELETE, &path, Bytes::new(), false)
+                    .await;
+                if !cleanup.is_ok_and(|(code, _)| {
+                    matches!(code, StatusCode::NO_CONTENT | StatusCode::NOT_FOUND)
+                }) {
+                    return Err(refuse("Upload failed and cleanup is not confirmed. Inspect printer storage and remove the staged file before preparing again. No print was started."));
+                }
+                return Err(error);
             }
             ready(&client.snapshot().await?)?;
             if self.review_info(client).await? != target.info {
@@ -1618,12 +1711,8 @@ impl Backend for Printers {
                 let _ = client.json("/api/v1/storage").await;
                 return Err(refuse("Printer refused Start. Read status to reconcile the job. Start will not be repeated."));
             }
-            fresh?;
-            if target.job.state != JobState::Printing {
-                return Err(refuse(
-                    "Start is not confirmed. Read status to reconcile the intended file and job.",
-                ));
-            }
+            let _ = fresh;
+            self.wait_prusalink(target, "start").await?;
             Ok(target.job.clone())
         })
     }

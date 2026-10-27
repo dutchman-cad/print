@@ -113,11 +113,12 @@ impl Client {
         upload: bool,
     ) -> Result<(StatusCode, Bytes), Error> {
         let deadline = if upload {
-            Duration::from_secs(30 + body.len() as u64 / (32 * 1024))
+            Duration::from_secs(30)
         } else {
             STATUS_TIMEOUT
         };
-        tokio::time::timeout(deadline, async {
+        let (progress, updates) = tokio::sync::watch::channel(tokio::time::Instant::now());
+        let operation = async {
             let host = self
                 .uri
                 .host()
@@ -142,10 +143,11 @@ impl Client {
             } else {
                 Box::new(socket)
             };
-            let (mut sender, connection) =
-                hyper::client::conn::http1::handshake(TokioIo::new(stream))
-                    .await
-                    .map_err(|_| Error::Unavailable)?;
+            let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(
+                crate::progress::Stream::new(stream, progress),
+            ))
+            .await
+            .map_err(|_| Error::Unavailable)?;
             struct Driver(tokio::task::JoinHandle<()>);
             impl Drop for Driver {
                 fn drop(&mut self) {
@@ -186,9 +188,16 @@ impl Client {
                 .map_err(|_| Error::Unavailable)?
                 .to_bytes();
             Ok((code, bytes))
-        })
-        .await
-        .map_err(|_| Error::Unavailable)?
+        };
+        if upload {
+            crate::progress::timeout(deadline, updates, operation)
+                .await
+                .map_err(|_| Error::Unavailable)?
+        } else {
+            tokio::time::timeout(deadline, operation)
+                .await
+                .map_err(|_| Error::Unavailable)?
+        }
     }
     pub async fn json(&self, path: &str) -> Result<Value, Error> {
         let (code, bytes) = self
@@ -300,12 +309,13 @@ impl Client {
         let connected = server.get("klippy_connected").and_then(Value::as_bool);
         let klippy = server.get("klippy_state").and_then(Value::as_str);
         if connected != Some(true) || klippy != Some("ready") {
-            printer.state =
-                if connected == Some(false) || matches!(klippy, Some("disconnected" | "startup")) {
-                    PrinterState::Offline
-                } else {
-                    PrinterState::Error
-                };
+            printer.state = if klippy == Some("startup") {
+                PrinterState::Busy
+            } else if connected == Some(false) || klippy == Some("disconnected") {
+                PrinterState::Offline
+            } else {
+                PrinterState::Error
+            };
             printer.detail = Some(
                 match klippy {
                     Some("disconnected") => "Klippy disconnected. Restore the printer connection.",
@@ -379,7 +389,7 @@ impl Client {
             .pointer("/virtual_sdcard/is_active")
             .and_then(Value::as_bool);
         printer.state = if webhook == Some("startup") {
-            PrinterState::Offline
+            PrinterState::Busy
         } else if webhook != Some("ready") {
             PrinterState::Error
         } else {

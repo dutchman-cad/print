@@ -62,7 +62,7 @@ async fn mapping_klippy_states_auth_and_optional_telemetry() {
         );
     }
     for (klippy, expected) in [
-        ("startup", PrinterState::Offline),
+        ("startup", PrinterState::Busy),
         ("shutdown", PrinterState::Error),
         ("error", PrinterState::Error),
         ("disconnected", PrinterState::Offline),

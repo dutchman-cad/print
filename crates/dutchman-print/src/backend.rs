@@ -30,6 +30,8 @@ pub enum PrinterState {
     Idle,
     Printing,
     Paused,
+    Attention,
+    Busy,
     Error,
     Offline,
 }
@@ -40,6 +42,8 @@ impl std::fmt::Display for PrinterState {
             Self::Idle => "idle",
             Self::Printing => "printing",
             Self::Paused => "paused",
+            Self::Attention => "attention",
+            Self::Busy => "busy",
             Self::Error => "error",
             Self::Offline => "offline",
         })
@@ -53,6 +57,7 @@ pub enum JobState {
     Printing,
     Paused,
     Done,
+    Ended,
     Cancelled,
     Failed,
 }

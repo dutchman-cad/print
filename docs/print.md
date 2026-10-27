@@ -232,12 +232,12 @@ nonempty plain UTF-8, at most 256 bytes. Duplicate or unknown fields are refused
 companion checks paths, entry counts, and actual expanded sizes before calling the backend.
 The simulator supplies previews only when slicing produces one.
 
-Printer objects have `id`, `name`, `model`, and `state`: `idle`, `printing`, `paused`, `error`,
-or `offline`. While printing or paused they may include `job_id`, `job_name`, `progress`
+Printer objects have `id`, `name`, `model`, and `state`: `idle`, `printing`, `paused`,
+`attention`, `busy`, `error`, or `offline`. While printing or paused they may include `job_id`, `job_name`, `progress`
 (0–1), `seconds_left`, `nozzle_temperature`, and `bed_temperature` (degrees Celsius).
 Unavailable printer fields are omitted.
 
-Job states are `ready`, `printing`, `paused`, `done`, `cancelled`, and `failed`. Job `progress`
+Job states are `ready`, `printing`, `paused`, `done`, `cancelled`, `failed`, and `ended`. Job `progress`
 and `seconds_left` may be null. Estimate fields `seconds`, `filament_mm`, `filament_g`, and
 `layers` are optional and omitted when unavailable. Local preview paths are never returned.
 Not found maps to 404, busy or refused to 409, unavailable/offline to 503, and backend failure
@@ -438,18 +438,32 @@ profile diameter must match `/api/v1/info` `nozzle_diameter`; a mismatch names b
 Fit a matching nozzle or slice with the matching profile. No mismatch override is offered.
 Before upload and again before Start, Dutchman requires fresh `IDLE` or `READY` status,
 with no job or transfer reported. `BUSY`, `ATTENTION`, terminal, unknown, and unavailable
-states block Start. Status reads have a four-second deadline. Missing estimates stay absent;
+states block Start. ATTENTION reports `attention` (waiting for a person); BUSY reports
+`busy` (a non-print operation). Start, clear, and resume are refused in both states.
+Pause requires printing and resume requires paused; cancel remains available for a
+matching tracked job in attention. Status reads have a four-second deadline. Control
+requests allow 15 seconds. One keep-alive HTTP connection per printer is reused, with
+cached Digest challenges and incrementing nonce counts. Only reads may retry once on
+a stale Digest challenge; controls are never resent. Commands poll matching status for
+25 seconds for start/stop and 10 seconds for pause/resume, announcing pending on stderr
+before reporting an unconfirmed outcome. Missing estimates stay absent;
 authentication failures appear separately in the safe availability detail.
 
 Dutchman checks prepared input and G-code bytes, configured profiles, machine information,
 and firmware against the preparation review. It selects available writable storage with enough
 reported free space, uploads without overwrite or automatic printing, and checks the stored
-file's name, print-file type, and size. Upload deadlines allow 30 seconds plus one second per
-32 KiB. Start is sent once and confirmed by fresh status matching the intended file and job.
+file's name, print-file type, and size. Uploads stop after 30 seconds without transport
+progress; continuing transfers have no fixed total deadline. Failed or uncertain uploads
+and failed stored-file validation delete the staged file before returning an error. If cleanup
+is not confirmed, inspect storage and remove it before preparing again. These failures never
+send Start. Start is sent once and confirmed by fresh status matching the intended file and job.
 A lost reply or conflict requires reconciliation through status; Start is never automatically
 retried. Pause, resume, and cancel re-read and verify the live job ID before sending a command.
 Only explicit matching terminal reports establish done, cancelled, or failed; idle alone never
-proves completion. The endpoint contract comes from Prusa's
+proves success. When an attempted execution is no longer live on an idle printer, the
+job becomes terminal `ended` (outcome unknown), unless FINISHED or STOPPED was seen,
+which establish `done` or `cancelled`. BUSY never moves a tracked job back to printing.
+The endpoint contract comes from Prusa's
 [public API documentation](https://github.com/prusa3d/Prusa-Link-Web/blob/master/spec/openapi.yaml).
 
 Check the bed before starting, then acknowledge and start within the same CLI run:
@@ -531,7 +545,7 @@ states block control. Summary states prefer the documented flags over display te
 Starting, Resuming, Printing from SD, Pausing, Cancelling, and Finishing report printing;
 Finishing remains unresolved until newer history establishes the terminal result. Paused
 reports paused. Error and Offline after error report error. Connection/detection phases and
-SD/file transfers report offline with their phase in detail, since API v1 has no busy state.
+SD/file transfers report busy with their phase in detail.
 Starting still requires complete flags and consistent Operational readiness. Progress, remaining time,
 temperatures, and selected file name are reported when available. Missing values stay absent.
 
@@ -554,8 +568,8 @@ Before starting, Dutchman checks input and G-code bytes, configured profiles, th
 OctoPrint connection and printer profile, and server version against preparation. It checks
 fresh readiness before upload and again before start. It stages a uniquely named local file
 using [file operations](https://docs.octoprint.org/en/main/api/files.html), with select and print
-disabled, refusing an existing name. Uploads are capped at 200 MiB with a deadline of 30 seconds
-plus one second per 32 KiB. It requires a completed upload and validates the stored name,
+disabled, refusing an existing name. Uploads are capped at 200 MiB with a 30-second transport
+idle timeout, reset by byte progress. It requires a completed upload and validates the stored name,
 origin, machine-code type, and size. Failed or uncertain uploads, including failed stored-file
 validation, trigger deletion of the staged remote file before the error is returned. If
 deletion cannot be confirmed, inspect OctoPrint storage and remove it before preparing again.
@@ -679,7 +693,7 @@ terminal transition is active and blocks readiness. Idle never establishes succe
 Up to 64 active HMS entries are retained. Severity comes from bits 8–11 of `attr`:
 1 (fatal) and 2 (serious) block Start; 3 (common) and 4 (info) do not. Unknown severity
 or malformed/oversized HMS data blocks Start. Active codes and their Bambu HMS wiki
-links appear in `detail`. Any HMS alert accompanying PAUSE adds “Needs attention”
+links appear in `detail`. Any HMS alert accompanying PAUSE reports `attention`, adds “Needs attention”
 and prevents Resume. Stop remains available for the matching live execution.
 
 Freshness requires an established MQTT connection and an incoming message within
@@ -700,7 +714,10 @@ after a separate bed acknowledgement through the running server. The attempt is 
 sending, so a lost reply or restart cannot cause an automatic second Start. Read job
 status to reconcile an uncertain outcome. A reply reporting rejection names authorization
 as a possible cause; delivery or an acknowledgement alone never means execution.
-A matching live state must arrive within four seconds or the result is “not confirmed”.
+Commands wait for matching live state for up to 25 seconds for start/stop and 10 seconds
+for pause/resume. Pending is announced on stderr before “not confirmed”; waiting never
+resends a command. Failed or uncertain FTPS uploads delete the staged file before returning
+an error. If cleanup is not confirmed, inspect storage and remove it before preparing again.
 Pause, resume, and stop apply only to the matching live job started by this companion.
 Matching requires both the unique subtask name and a positive `gcode_start_time`; missing
 execution identity blocks control. A later execution of the same file is a different job.
@@ -796,7 +813,7 @@ checking that this printer's installed pause/resume macros behave safely. A chan
 machine configuration, including macros, requires fresh preparation and review.
 
 Status polls server connectivity and available printer objects, then reads a full object
-snapshot. Klippy startup reports offline while it connects; shutdown, error, missing objects,
+snapshot. Klippy startup reports busy while it connects; shutdown, error, missing objects,
 and contradictory states block movement; disconnection or unavailable telemetry reports offline. `print_stats` standby,
 complete, and cancelled map to idle; printing and paused retain those states; unknown
 states map to error. `detail` contains the known state or a safe explanation. Raw fault
@@ -824,8 +841,8 @@ and unchanged machine identity, firmware, configuration, and profiles. A unique 
 staged under `gcodes` with `print=false` and a SHA256 checksum; existing staging names are
 refused. The upload must report neither printing nor queueing. Stored metadata must match
 the reviewed filename and size before an explicit print start. Prepared files are limited
-to 200 MiB, response bodies to 1 MiB, status snapshots to four seconds, and upload time to
-30 seconds plus one second per 32 KiB. Metadata that is not ready within these checks
+to 200 MiB, response bodies to 1 MiB, status snapshots to four seconds, and upload inactivity to
+30 seconds, reset by transport byte progress. Metadata that is not ready within these checks
 blocks start; it does not cause a start retry. Failed or uncertain uploads and failed
 stored-file validation trigger deletion of the staged file before returning an error.
 If cleanup cannot be confirmed, inspect Moonraker storage and remove the file before preparing again.
