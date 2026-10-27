@@ -108,6 +108,7 @@ impl Printers {
                             | "moonraker"
                             | "snapmaker-u1"
                             | "duet"
+                            | "duet-sbc"
                             | "repetier"
                             | "elegoo-sdcp"
                             | "snapmaker-2"
@@ -149,7 +150,7 @@ impl Printers {
         let duet = config
             .printers
             .iter()
-            .filter(|p| p.kind.as_deref() == Some("duet"))
+            .filter(|p| matches!(p.kind.as_deref(), Some("duet" | "duet-sbc")))
             .map(|p| crate::duet::Client::new(p.clone()).map(|c| (p.id.clone(), Arc::new(c))))
             .collect::<Result<_, _>>()?;
         let repetier = config

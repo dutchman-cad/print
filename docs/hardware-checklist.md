@@ -449,6 +449,22 @@ Only for a Duet without a single-board computer.
 
 - [ ] Save every read and record the firmware version beside each result.
 
+### Duet with SBC (Duet Software Framework)
+
+Simulated only. A real SBC and Duet board are needed for these checks, in addition to the
+standalone Duet machine checks above, using `kind = "duet-sbc"`:
+
+- [ ] Record DSF and RepRapFirmware versions. Check password and password-free access,
+  authentication renewal after idle time or 403, and disconnect on release.
+- [ ] Confirm the full model's file paths, last-file timing, progress, heaters, board identity,
+  axis limits, and tools match the displayed machine. Check configured nozzle physically.
+- [ ] Verify PUT upload returns 201, parsed file-info and directory sizes match, and DELETE
+  plus directory confirmation removes only the staged file after failures and terminal jobs.
+- [ ] Record text replies and timing for `M32`, `M25`, `M24`, and `M0`; verify pause macros
+  finish before cancellation and Stop, including an external job. Check lost replies without
+  repeating Start, and uncertain pause without sending `M0`.
+- [ ] Check trusted HTTPS through the deployed gateway and reconnection/clearance behaviour.
+
 ## Elegoo SDCP: resin and Centauri Carbon
 
 Only for someone with an Elegoo SDCP printer. Dutchman never prepares or starts jobs on

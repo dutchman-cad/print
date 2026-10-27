@@ -103,7 +103,7 @@ struct Kind {
     model: &'static str,
 }
 
-const KINDS: [Kind; 11] = [
+const KINDS: [Kind; 12] = [
     Kind {
         name: "simulated",
         about: "A built-in demo printer for trying Print. Contacts nothing.",
@@ -142,6 +142,13 @@ const KINDS: [Kind; 11] = [
     Kind {
         name: "duet",
         about: "Duet boards running RepRapFirmware without a single-board computer.",
+        address: Address::Url,
+        slicing: Slicing::Either,
+        model: "Duet printer",
+    },
+    Kind {
+        name: "duet-sbc",
+        about: "Duet boards run from a single-board computer (Duet Software Framework).",
         address: Address::Url,
         slicing: Slicing::Either,
         model: "Duet printer",
@@ -552,7 +559,7 @@ fn check_flags(flags: &Flags, kind: &Kind) -> Result<(), String> {
         ("username", flags.username.is_some() && name != "prusalink"),
         (
             "password",
-            flags.password.is_some() && !matches!(name, "prusalink" | "duet"),
+            flags.password.is_some() && !matches!(name, "prusalink" | "duet" | "duet-sbc"),
         ),
         ("serial", flags.serial.is_some() && name != "bambu"),
         (
@@ -567,7 +574,7 @@ fn check_flags(flags: &Flags, kind: &Kind) -> Result<(), String> {
         ("profile", flags.profile.is_some() && name != "elegoo-sdcp"),
         (
             "nozzle-diameter",
-            flags.nozzle_diameter.is_some() && !matches!(name, "duet" | "repetier"),
+            flags.nozzle_diameter.is_some() && !matches!(name, "duet" | "duet-sbc" | "repetier"),
         ),
         ("slug", flags.slug.is_some() && name != "repetier"),
         ("slicer", flags.slicer.is_some() && !slices),
@@ -664,7 +671,7 @@ pub fn build(flags: &Flags, ask: Option<&mut dyn Ask>) -> Result<Setup, String> 
             None,
         )?);
     }
-    if matches!(kind.name, "duet" | "repetier") {
+    if matches!(kind.name, "duet" | "duet-sbc" | "repetier") {
         answers.nozzle_diameter = Some(nozzle(flags, &mut session)?);
     }
     let default_name = if kind.name == "simulated" {
@@ -768,7 +775,7 @@ fn secrets(
                 true,
             )?;
         }
-        "duet" => {
+        "duet" | "duet-sbc" => {
             answers.password = session.secret(
                 flags.password.as_ref(),
                 "password",
@@ -1147,7 +1154,7 @@ fn printer_fields(t: &mut Text, kind: &Kind, a: &Answers) {
                  a job, so a job the server starts by itself at that moment would be stopped.",
             );
         }
-        "duet" => {
+        "duet" | "duet-sbc" => {
             t.comment("The Duet board's address, such as http://duet.local.");
             t.string("url", url);
             t.comment("Machine password set with M551. Leave it out when none is set.");
@@ -1347,9 +1354,9 @@ mod tests {
         assert_eq!(setup.kind, "prusalink");
         assert_eq!(setup.id, "workbench-mini");
         assert!(!setup.needs_trust);
-        assert!(script.shown.contains("Choose a number from 1 to 11"));
-        assert!(script.shown.contains("  7. repetier"));
-        assert!(script.shown.contains("  8. bambu"));
+        assert!(script.shown.contains("Choose a number from 1 to 12"));
+        assert!(script.shown.contains("  8. repetier"));
+        assert!(script.shown.contains("  9. bambu"));
         assert_eq!(script.secrets.len(), 1);
         assert!(script.secrets[0].contains("API key"));
         let config = crate::config::Config::from_text(&setup.text, None).unwrap();
@@ -1442,7 +1449,7 @@ mod tests {
 
     #[test]
     fn interactive_elegoo_and_end_of_input() {
-        let mut script = Script::new(&["9", "2", "192.168.1.41", "", "", ""]);
+        let mut script = Script::new(&["10", "2", "192.168.1.41", "", "", ""]);
         let setup = build(&Flags::default(), Some(&mut script)).unwrap();
         let config = crate::config::Config::from_text(&setup.text, None).unwrap();
         assert_eq!(config.printers[0].profile.as_deref(), Some("resin"));

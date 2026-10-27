@@ -233,6 +233,21 @@ Standalone firmware does not report how a file ended: a companion cancellation y
 `cancelled`, a halt `failed`, and other endings `ended`. See
 [Duet configuration and checks](print.md#duet-reprapfirmware-standalone).
 
+Duet with SBC (`kind = "duet-sbc"`, Duet Software Framework) uses the same API fields,
+confirmation challenges, readiness checks, configured nozzle check, file identity,
+`ended` outcome, waits, pause-before-`M0` rule, and cleanup as standalone Duet.
+Its transport reads the full shared object model from `GET /machine/model`, stages with
+`PUT /machine/file/{path}` (201), verifies directory and parsed file-info sizes, and
+sends raw text G-code once with `POST /machine/code?async=true`. Nonempty G-code replies are treated
+as uncertain; status must reconcile the outcome. Cleanup uses `DELETE /machine/file/{path}`
+and confirms absence in the directory. Authentication uses `GET /machine/connect` with
+an optional password and the returned `X-Session-Key`; 403 renews reads and refused uploads
+once but never resends G-code. Release attempts `GET /machine/disconnect` while a runtime
+is available. No new v1 fields are required. See the
+[SBC configuration](print.md#duet-with-sbc-duet-software-framework) and
+[vendor REST documentation](https://github.com/Duet3D/DuetSoftwareFramework/wiki/REST-API).
+
+
 Repetier-Server (`kind = "repetier"`) uses the same routes, server-issued challenges,
 reviewed-byte checks, and bed-clear policy. Each entry names one printer on the server by
 `slug`, and the API key is sent only as the `x-api-key` header. Status comes from the

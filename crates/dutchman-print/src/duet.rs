@@ -1,4 +1,4 @@
-//! Duet standalone (RepRapFirmware HTTP) transport, handwritten from its public documentation.
+//! Shared Duet object model with standalone and DSF HTTP transports, handwritten from public documentation.
 
 use crate::backend::{Error, Printer, PrinterState};
 use axum::body::Bytes;
@@ -10,7 +10,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::time::Instant;
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(4);
-/// Used only when a successful login omits its documented idle timeout.
+/// Conservative DSF lifetime, also used when standalone omits its documented idle timeout.
 const DEFAULT_SESSION: Duration = Duration::from_secs(8);
 pub const SESSIONS_FULL: &str = "Duet has no free sessions. Close another connected client or wait for its session to expire, then read status again.";
 const EXPIRED: &str = "The Duet session expired before the command was accepted. It was not resent; read fresh status before another action.";
@@ -24,10 +24,19 @@ struct Session {
     timeout: Duration,
     generation: u64,
 }
-pub struct Client {
-    config: crate::config::Printer,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Standalone,
+    Sbc,
+}
+struct Http {
     uri: Uri,
     tls: Arc<rustls::ClientConfig>,
+}
+pub struct Client {
+    config: crate::config::Printer,
+    transport: Transport,
+    http: Arc<Http>,
     session: tokio::sync::Mutex<Session>,
     observation: tokio::sync::Mutex<Option<Value>>,
     changed: std::sync::atomic::AtomicBool,
@@ -173,9 +182,16 @@ impl Client {
         .with_root_certificates(roots)
         .with_no_client_auth();
         Ok(Self {
+            transport: if config.kind.as_deref() == Some("duet-sbc") {
+                Transport::Sbc
+            } else {
+                Transport::Standalone
+            },
             config,
-            uri,
-            tls: Arc::new(tls),
+            http: Arc::new(Http {
+                uri,
+                tls: Arc::new(tls),
+            }),
             session: tokio::sync::Mutex::new(Session {
                 key: None,
                 connected: false,
@@ -187,6 +203,8 @@ impl Client {
             changed: std::sync::atomic::AtomicBool::new(false),
         })
     }
+}
+impl Http {
     async fn raw(
         &self,
         method: Method,
@@ -247,8 +265,18 @@ impl Client {
                     "Host",
                     self.uri.authority().ok_or(Error::Unavailable)?.as_str(),
                 )
-                .header("Accept", "application/json")
+                .header(
+                    "Accept",
+                    if target.starts_with("/machine/code") {
+                        "text/plain"
+                    } else {
+                        "application/json"
+                    },
+                )
                 .header("Content-Length", body.len());
+            if target.starts_with("/machine/code") {
+                request = request.header("Content-Type", "text/plain");
+            }
             if upload {
                 request = request.header("Content-Type", "application/octet-stream");
             }
@@ -287,6 +315,8 @@ impl Client {
                 .map_err(|_| Error::Unavailable)?
         }
     }
+}
+impl Client {
     /// Returns the current session key, logging in first when the session is absent or idle
     /// beyond the printer's reported timeout.
     async fn login(&self) -> Result<(Option<String>, u64), Error> {
@@ -294,25 +324,37 @@ impl Client {
         if session.connected && session.last.elapsed() < session.timeout {
             return Ok((session.key.clone(), session.generation));
         }
-        let mut target = String::from("/rr_connect?");
+        let mut target = String::from(if self.transport == Transport::Sbc {
+            "/machine/connect?"
+        } else {
+            "/rr_connect?"
+        });
         if let Some(password) = &self.config.password {
             target.push_str("password=");
             target.push_str(&encode(password));
             target.push('&');
         }
-        target.push_str("sessionKey=yes");
+        if self.transport == Transport::Standalone {
+            target.push_str("sessionKey=yes");
+        }
         let (code, bytes) = self
+            .http
             .raw(Method::GET, &target, Bytes::new(), None, false)
             .await?;
+        if self.transport == Transport::Sbc && code == StatusCode::FORBIDDEN {
+            return Err(Error::Authentication);
+        }
         if code != StatusCode::OK {
             return Err(Error::Unavailable);
         }
         let reply: Value = serde_json::from_slice(&bytes).map_err(|_| Error::Unavailable)?;
-        match reply.get("err").and_then(Value::as_u64) {
-            Some(0) => {}
-            Some(1) => return Err(Error::Authentication),
-            Some(2) => return Err(refuse(SESSIONS_FULL)),
-            _ => return Err(Error::Unavailable),
+        if self.transport == Transport::Standalone {
+            match reply.get("err").and_then(Value::as_u64) {
+                Some(0) => {}
+                Some(1) => return Err(Error::Authentication),
+                Some(2) => return Err(refuse(SESSIONS_FULL)),
+                _ => return Err(Error::Unavailable),
+            }
         }
         let key = match reply.get("sessionKey") {
             None | Some(Value::Null) => None,
@@ -324,11 +366,18 @@ impl Client {
             }
             Some(_) => return Err(Error::Unavailable),
         };
-        session.timeout = reply
-            .get("sessionTimeout")
-            .and_then(Value::as_u64)
-            .filter(|t| *t > 0)
-            .map_or(DEFAULT_SESSION, |t| Duration::from_millis(t.min(3_600_000)));
+        if self.transport == Transport::Sbc && key.is_none() {
+            return Err(Error::Unavailable);
+        }
+        session.timeout = if self.transport == Transport::Sbc {
+            DEFAULT_SESSION
+        } else {
+            reply
+                .get("sessionTimeout")
+                .and_then(Value::as_u64)
+                .filter(|t| *t > 0)
+                .map_or(DEFAULT_SESSION, |t| Duration::from_millis(t.min(3_600_000)))
+        };
         session.key = key;
         session.connected = true;
         session.last = Instant::now();
@@ -347,8 +396,8 @@ impl Client {
             session.last = Instant::now();
         }
     }
-    /// Sends a request within a session. Reads and uploads that the printer refused with 401
-    /// are sent once more after logging in again; G-code is never resent.
+    /// Sends a request within a session. Reads and uploads refused with 401 (standalone)
+    /// or 403 (DSF) are sent once more after logging in again; G-code is never resent.
     async fn call(
         &self,
         method: Method,
@@ -360,9 +409,16 @@ impl Client {
         for attempt in 0..2 {
             let (key, generation) = self.login().await?;
             let (code, bytes) = self
+                .http
                 .raw(method.clone(), target, body.clone(), key.as_deref(), upload)
                 .await?;
-            if code == StatusCode::UNAUTHORIZED {
+            if code
+                == if self.transport == Transport::Sbc {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            {
                 self.expire(generation).await;
                 if !resend {
                     return Err(refuse(EXPIRED));
@@ -372,7 +428,18 @@ impl Client {
                 }
                 return Err(Error::Authentication);
             }
-            if code != StatusCode::OK {
+            let expected = if self.transport == Transport::Sbc && method == Method::PUT {
+                StatusCode::CREATED
+            } else if self.transport == Transport::Sbc && method == Method::DELETE {
+                StatusCode::NO_CONTENT
+            } else {
+                StatusCode::OK
+            };
+            if code != expected
+                && !(self.transport == Transport::Sbc
+                    && method == Method::DELETE
+                    && code == StatusCode::NOT_FOUND)
+            {
                 return Err(Error::Unavailable);
             }
             self.touch(generation).await;
@@ -386,8 +453,15 @@ impl Client {
             .await?;
         serde_json::from_slice(&bytes).map_err(|_| Error::Unavailable)
     }
-    /// Reads one object model subtree with `rr_model`.
+    /// Reads a shared object model subtree through the selected transport.
     pub async fn model(&self, key: &str) -> Result<Value, Error> {
+        if self.transport == Transport::Sbc {
+            let model = self.json("/machine/model").await?;
+            return model
+                .pointer(&format!("/{}", key.replace('.', "/")))
+                .cloned()
+                .ok_or(Error::Unavailable);
+        }
         let reply = self
             .json(&format!("/rr_model?key={}&flags=d99v", encode(key)))
             .await?;
@@ -396,8 +470,42 @@ impl Client {
         }
         reply.get("result").cloned().ok_or(Error::Unavailable)
     }
+    async fn models<const N: usize>(&self, keys: [&str; N]) -> Result<[Value; N], Error> {
+        let mut values = std::array::from_fn(|_| Value::Null);
+        if self.transport == Transport::Sbc {
+            let model = self.json("/machine/model").await?;
+            for (slot, key) in values.iter_mut().zip(keys) {
+                *slot = model
+                    .pointer(&format!("/{}", key.replace('.', "/")))
+                    .cloned()
+                    .ok_or(Error::Unavailable)?;
+            }
+        } else {
+            for (slot, key) in values.iter_mut().zip(keys) {
+                *slot = self.model(key).await?;
+            }
+        }
+        Ok(values)
+    }
     /// Sends G-code once. Acceptance only means it was queued; read status for the outcome.
     pub async fn gcode(&self, code: &str) -> Result<(), Error> {
+        if self.transport == Transport::Sbc {
+            let reply = self
+                .call(
+                    Method::POST,
+                    "/machine/code?async=true",
+                    Bytes::copy_from_slice(code.as_bytes()),
+                    false,
+                    false,
+                )
+                .await?;
+            // The documented reply is plain text. Never expose backend output.
+            let reply = std::str::from_utf8(&reply).map_err(|_| Error::Unavailable)?;
+            if !reply.trim().is_empty() {
+                return Err(refuse("Duet returned an unconfirmed command reply. Read fresh status to reconcile the job; the command will not be repeated."));
+            }
+            return Ok(());
+        }
         let bytes = self
             .call(
                 Method::GET,
@@ -415,6 +523,30 @@ impl Client {
     }
     /// The stored size of a file in `0:/gcodes`, or None when the listing omits it.
     pub async fn stored(&self, name: &str) -> Result<Option<u64>, Error> {
+        if !safe_filename(name) {
+            return Err(Error::Unavailable);
+        }
+        if self.transport == Transport::Sbc {
+            let listing = self.json("/machine/directory/0:/gcodes").await?;
+            let files = listing.as_array().ok_or(Error::Unavailable)?;
+            let Some(file) = files.iter().find(|f| {
+                f.get("name").and_then(Value::as_str) == Some(name)
+                    && f.get("type").and_then(Value::as_str) == Some("f")
+            }) else {
+                return Ok(None);
+            };
+            let size = file
+                .get("size")
+                .and_then(Value::as_u64)
+                .ok_or(Error::Unavailable)?;
+            let info = self
+                .json(&format!("/machine/fileinfo/{}", encode(&staged_path(name))))
+                .await?;
+            if info.get("size").and_then(Value::as_u64) != Some(size) {
+                return Err(Error::Unavailable);
+            }
+            return Ok(Some(size));
+        }
         let mut first = 0u64;
         for _ in 0..64 {
             let reply = self
@@ -449,6 +581,17 @@ impl Client {
         if !safe_filename(name) || bytes.len() > 200 << 20 {
             return Err(Error::Unavailable);
         }
+        if self.transport == Transport::Sbc {
+            self.call(
+                Method::PUT,
+                &format!("/machine/file/{}", encode(&staged_path(name))),
+                Bytes::copy_from_slice(bytes),
+                true,
+                true,
+            )
+            .await?;
+            return Ok(());
+        }
         let reply = self
             .call(
                 Method::POST,
@@ -475,10 +618,21 @@ impl Client {
         if !safe_filename(name) {
             return Err(Error::Unavailable);
         }
-        // A missing file also reports an error, so the listing decides.
-        let _ = self
-            .json(&format!("/rr_delete?name={}", encode(&staged_path(name))))
+        if self.transport == Transport::Sbc {
+            self.call(
+                Method::DELETE,
+                &format!("/machine/file/{}", encode(&staged_path(name))),
+                Bytes::new(),
+                false,
+                true,
+            )
             .await?;
+        } else {
+            // A missing file also reports an error, so the listing decides.
+            let _ = self
+                .json(&format!("/rr_delete?name={}", encode(&staged_path(name))))
+                .await?;
+        }
         match self.stored(name).await? {
             None => Ok(()),
             Some(_) => Err(Error::Unavailable),
@@ -494,10 +648,7 @@ impl Client {
             .map_err(|_| Error::Unavailable)?
     }
     async fn snapshot_in(&self) -> Result<Snapshot, Error> {
-        let state = self.model("state").await?;
-        let job = self.model("job").await?;
-        let heat = self.model("heat").await?;
-        let tools = self.model("tools").await?;
+        let [state, job, heat, tools] = self.models(["state", "job", "heat", "tools"]).await?;
         let raw = state.get("status").and_then(Value::as_str);
         let mut printer = self.offline(&Error::Unavailable);
         let (mapped, status) = match raw {
@@ -581,10 +732,9 @@ impl Client {
     }
     /// Machine identity, tooling, and build volume reviewed before upload and start.
     pub async fn review(&self) -> Result<Value, Error> {
-        let boards = self.model("boards").await?;
-        let network = self.model("network").await?;
-        let axes = self.model("move.axes").await?;
-        let tools = self.model("tools").await?;
+        let [boards, network, axes, tools] = self
+            .models(["boards", "network", "move.axes", "tools"])
+            .await?;
         let board = boards.as_array().and_then(|b| b.first());
         let tools = tools.as_array().ok_or(Error::Unavailable)?;
         let [tool] = tools.as_slice() else {
@@ -674,6 +824,33 @@ pub fn ready(live: &Snapshot) -> Result<(), Error> {
         return Err(refuse("Duet readiness is unknown or the printer is busy. Wait for fresh idle status before starting."));
     }
     Ok(())
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if self.transport != Transport::Sbc {
+            return;
+        }
+        let session = self.session.get_mut();
+        if !session.connected {
+            return;
+        }
+        let key = session.key.take();
+        let http = self.http.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = http
+                    .raw(
+                        Method::GET,
+                        "/machine/disconnect",
+                        Bytes::new(),
+                        key.as_deref(),
+                        false,
+                    )
+                    .await;
+            });
+        }
+    }
 }
 
 #[cfg(test)]
