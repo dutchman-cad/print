@@ -40,6 +40,8 @@ pub struct Printer {
     #[serde(default)]
     pub lan_control: bool,
     #[serde(default)]
+    pub resume_commissioned: bool,
+    #[serde(default)]
     pub start_profile: crate::bambu::StartProfile,
     #[serde(default)]
     pub ams_mapping: BTreeMap<String, u8>,
@@ -142,6 +144,7 @@ impl Config {
                         crate::prusalink::validate(printer)?;
                     }
                     Some("octoprint") => crate::octoprint::validate(printer)?,
+                    Some("moonraker") => crate::moonraker::validate(printer)?,
                     Some("bambu") => {
                         crate::bambu::validate_enrollment(
                             printer,
@@ -150,7 +153,8 @@ impl Config {
                     }
                     _ => {
                         return Err(
-                            "Set each printer kind to prusalink, octoprint, or bambu.".into()
+                            "Set each printer kind to prusalink, octoprint, moonraker, or bambu."
+                                .into(),
                         )
                     }
                 }

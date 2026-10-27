@@ -3,7 +3,7 @@
 Dutchman Print is a local print companion for SolidCraft and a standalone command line.
 A backend prepares 3MF files, estimates jobs, and controls printers. The included
 `simulated` backend is a demo: it contacts no printers and can optionally run a local slicer.
-The `printers` backend supports individually configured local PrusaLink, OctoPrint, and Bambu printers.
+The `printers` backend supports individually configured local PrusaLink, OctoPrint, Moonraker (Klipper), and Bambu printers.
 
 Build `dutchman-print` from this checkout with Rust 1.88 or newer:
 
@@ -84,7 +84,7 @@ Configure slicers with `[slicers.<name>]` tables, each containing `kind`, option
 optional `datadir`, and `timeout_seconds`. Set each printer's `slicer = "<name>"` to choose
 one. Without a name, Dutchman selects the only slicer of the required kind: PrusaLink needs
 `prusaslicer`, Bambu needs `orcaslicer`. Missing or ambiguous choices are refused.
-OctoPrint accepts either kind; select a named slicer when more than one is configured.
+OctoPrint and Moonraker accept either kind; select a named slicer when more than one is configured.
 The simulator with `slice = true` uses the same per-printer selection; a simulated printer
 without a kind can use the only configured slicer, or select one explicitly.
 `[slicer]` remains a single-slicer shorthand; it cannot be combined with named slicers,
@@ -755,3 +755,76 @@ for the URL, plate checksum, spelling, and per-filament mapping. The alternative
 These sources disagree and provide no universal firmware contract. Select alternatives
 only after checking your model and firmware; the profile name is a version identifier,
 not a hardware certification. Unsupported values are refused before a command is sent.
+
+## Moonraker (Klipper)
+
+Configure the Moonraker address explicitly; there is no discovery. HTTP and HTTPS are
+supported, including reverse-proxy base paths. HTTPS uses system certificate trust and
+checks the configured hostname; redirects and certificate exceptions are refused.
+
+```toml
+[backend]
+kind = "printers"
+
+[slicer]
+kind = "prusaslicer" # or "orcaslicer"; use named slicers for multiple choices
+# path = "/path/to/prusa-slicer"
+
+[[printers]]
+kind = "moonraker"
+id = "klipper"
+name = "Workbench Klipper"
+model = "Commissioned Klipper printer"
+url = "http://printer.local:7125"
+api_key = "REPLACE_WITH_YOUR_MOONRAKER_KEY"
+printer_profile = "Commissioned machine"
+print_profile = "Reviewed print settings"
+filament_profile = "Loaded material"
+resume_commissioned = false
+```
+
+Obtain the API key through the installed interface's authorization controls. It is sent
+as `X-Api-Key`. Omit `api_key` only when the installation explicitly trusts this client.
+Other authentication forms are not implemented. No cloud account is required. See
+[Moonraker authorization](https://moonraker.readthedocs.io/en/latest/external_api/authorization/).
+
+Commission profiles for the actual model, build volume, nozzle, tooling, material, and
+plate. Only a single extruder is supported for control; unresolved material slots are
+refused. Loaded material and physical plate identity have no universal telemetry here:
+check them before confirming each start. Set `resume_commissioned = true` only after
+checking that this printer's installed pause/resume macros behave safely. A changed
+machine configuration, including macros, requires fresh preparation and review.
+
+Status polls server connectivity and available printer objects, then reads a full object
+snapshot. Klippy startup, shutdown, error, missing objects, and contradictory states block
+movement; disconnection or unavailable telemetry reports offline. `print_stats` standby,
+complete, and cancelled map to idle; printing and paused retain those states; unknown
+states map to error. `detail` contains the known state or a safe explanation. Raw fault
+messages are omitted because they may contain private data. Progress is a fraction;
+temperatures and job names remain absent when unavailable. Live `seconds_left` is omitted
+because these objects provide no universal time-left measurement. Preparation estimates
+still come from the slicer. See [printer objects](https://moonraker.readthedocs.io/en/latest/printer_objects/).
+
+Preparation slices locally to text G-code and reads machine configuration without uploading.
+Start requires fresh ready status, an acknowledged clear bed, unchanged input and G-code,
+and unchanged machine identity, firmware, configuration, and profiles. A unique file is
+staged under `gcodes` with `print=false` and a SHA256 checksum; existing staging names are
+refused. The upload must report neither printing nor queueing. Stored metadata must match
+the reviewed filename and size before an explicit print start. Prepared files are limited
+to 200 MiB, response bodies to 1 MiB, status snapshots to four seconds, and upload time to
+30 seconds plus one second per 32 KiB. Metadata that is not ready within these checks
+blocks start; it does not cause a start retry. See [file management](https://moonraker.readthedocs.io/en/latest/external_api/file_manager/).
+
+Every start, pause, resume, cancel, and clear uses the shared CLI/API confirmation and bed
+policy. A start attempt is saved before sending the command when CLI persistence is enabled.
+A lost reply is reconciled through fresh status, file metadata, and job history; start is
+never repeated automatically. Pause, resume, and cancel require the same live filename and
+execution ID started here. Moonraker's history component must be available for execution
+tracking and control. Completion, cancellation, and failure remain separate outcomes;
+idle alone cannot finish a tracked job. Any start attempt consumes bed clearance, and
+terminal reports require a new check. A stop requested during upload or pending start
+cancels that same job once fresh status identifies it. See [print control](https://moonraker.readthedocs.io/en/latest/external_api/printer/)
+and [job history](https://moonraker.readthedocs.io/en/latest/external_api/history/).
+
+Testing uses synthetic responses on test-owned loopback servers. Physical printer and
+macro commissioning remains an installation step.

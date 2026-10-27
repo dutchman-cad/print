@@ -148,6 +148,19 @@ Physical firmware, material, tooling, and plate changes not
 reported by OctoPrint require operator review before confirmation. See the
 [OctoPrint configuration and checks](print.md#octoprint).
 
+Moonraker (Klipper) uses the same routes, confirmation header, and bed-clear policy.
+Its `detail` contains a known `print_stats` state or a safe Klippy readiness explanation;
+startup, shutdown, unknown, and contradictory states block actions. Disconnected Klippy
+reports offline. Raw backend messages are not returned. `job_id`, when available, is the
+Moonraker history execution ID linked by file metadata; it may identify the last terminal
+job while the printer is idle. Progress is a fraction and live `seconds_left` is omitted.
+Start stages text G-code with automatic printing disabled, verifies metadata, then starts
+once. A lost reply requires reconciliation and never causes an automatic retry. Controls
+require the same tracked filename and live execution ID. Resume additionally requires
+commissioned behaviour and unchanged machine configuration. Completed, cancelled, and
+failed executions remain distinct; idle alone cannot establish completion. See
+[Moonraker configuration and checks](print.md#moonraker-klipper).
+
 ## Job JSON and states
 
 ```json

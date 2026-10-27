@@ -4,6 +4,7 @@ pub mod backend;
 pub mod bambu;
 pub mod config;
 pub mod confirmation;
+pub mod moonraker;
 pub mod octoprint;
 pub mod printers;
 pub mod prusalink;
