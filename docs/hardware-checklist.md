@@ -199,6 +199,20 @@ With the server running (see [Using the job API](#using-the-job-api)):
 - [ ] Save each `mini-*.json` file and every refusal message. For each state that read
   differently from what is listed here, record the printer screen's wording and the saved file.
 
+### PrusaLink on a Raspberry Pi
+
+- [ ] Use the Pi address and its PrusaLink username/password with Digest, plus the installed
+  MK3S/MK3S+ or MK2.5S slicer presets. Confirm the serial and firmware identify that printer.
+- [ ] Check the installed nozzle physically and configure `nozzle_diameter` if information
+  omits it. Check that MMU is reported false for the commissioned single-material setup.
+- [ ] Check `/api/v1/storage` reports available writable local storage and enough free space.
+  Set `storage = "local"` if another writable target makes selection ambiguous.
+- [ ] Stage text `.gcode`; verify printing stays off until separate bed-clear and Start
+  confirmations. Check pause, resume, cancel, Stop, execution replacement refusal, and cleanup
+  on the same local storage. A lost Start reply must never cause an automatic second Start.
+- [ ] Check idle after a print retains the bed-clear requirement, and an unobserved ending
+  reports `ended` rather than success. Disconnect the Pi and confirm controls are refused.
+
 ## Bambu Lab A1 in LAN mode
 
 Check one A1 fully before adding the second. Control is experimental and stays off until the

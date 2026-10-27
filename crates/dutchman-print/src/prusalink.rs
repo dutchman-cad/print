@@ -83,7 +83,23 @@ pub fn validate(config: &crate::config::Printer) -> Result<(), String> {
             return Err("Use credentials of at most 1024 bytes without control characters.".into());
         }
     }
+    if config
+        .nozzle_diameter
+        .is_some_and(|d| !d.is_finite() || d <= 0.0 || d > 10.0)
+    {
+        return Err("Set nozzle_diameter in millimetres, greater than 0 and at most 10.".into());
+    }
+    if config.storage.as_deref().is_some_and(|s| !storage_name(s)) {
+        return Err("Set storage to a single storage path name, such as local or usb.".into());
+    }
     Ok(())
+}
+fn storage_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 256
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 impl Client {
     /// There is no protocol logout; release the cached HTTP socket without another request.
@@ -337,6 +353,50 @@ impl Client {
             return Ok((code, bytes));
         }
         Err(Error::Authentication)
+    }
+    pub fn nozzle_diameter(&self) -> Option<f64> {
+        self.config.nozzle_diameter
+    }
+    pub fn storage<'a>(&self, report: &'a Value, size: u64) -> Result<&'a str, Error> {
+        let list = report
+            .get("storage_list")
+            .and_then(Value::as_array)
+            .ok_or_else(|| refused("Printer storage is unavailable. Read storage again."))?;
+        let mut choices = list.iter().filter(|entry| {
+            entry.get("available").and_then(Value::as_bool) == Some(true)
+                && entry.get("read_only").and_then(Value::as_bool) == Some(false)
+                && self.config.storage.as_deref().is_none_or(|selected| {
+                    entry
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .is_some_and(|path| path.trim_matches('/') == selected)
+                })
+        });
+        let entry = choices.next().ok_or_else(|| refused(
+            "No available writable storage matches the configuration. Check printer storage and the storage setting."))?;
+        if choices.next().is_some() {
+            return Err(refused("Printer storage is ambiguous. Set storage to one available writable storage path name."));
+        }
+        let name = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim_matches('/');
+        if !storage_name(name) {
+            return Err(refused(
+                "Printer storage path is not supported. Check printer storage.",
+            ));
+        }
+        if entry
+            .get("free_space")
+            .and_then(Value::as_u64)
+            .is_none_or(|free| free < size)
+        {
+            return Err(refused(
+                "Storage has insufficient or unknown free space. Check printer storage.",
+            ));
+        }
+        Ok(name)
     }
     pub async fn json(&self, path: &str) -> Result<Value, Error> {
         let (code, body) = self.request(Method::GET, path, Bytes::new(), false).await?;

@@ -45,9 +45,12 @@ pub struct Flags {
     /// Elegoo protocol profile: centauri or resin.
     #[arg(long)]
     pub profile: Option<String>,
-    /// Installed nozzle diameter in millimetres (Duet and Repetier-Server).
+    /// Installed nozzle diameter in millimetres (PrusaLink, Duet, and Repetier-Server).
     #[arg(long)]
     pub nozzle_diameter: Option<f64>,
+    /// PrusaLink storage path name, such as local or usb; omit for automatic selection.
+    #[arg(long)]
+    pub storage: Option<String>,
     /// Repetier-Server printer slug, from the server's printer settings.
     #[arg(long)]
     pub slug: Option<String>,
@@ -113,7 +116,7 @@ const KINDS: [Kind; 12] = [
     },
     Kind {
         name: "prusalink",
-        about: "Prusa printers with PrusaLink, such as MINI, MK4, and XL.",
+        about: "Prusa printers with PrusaLink, embedded or on a Raspberry Pi.",
         address: Address::Url,
         slicing: Slicing::Prusa,
         model: "Prusa printer",
@@ -396,6 +399,7 @@ struct Answers {
     ca_file: Option<String>,
     profile: Option<String>,
     nozzle_diameter: Option<f64>,
+    storage: Option<String>,
     slug: Option<String>,
     slicer: Option<&'static str>,
     profiles: Option<[String; 3]>,
@@ -556,6 +560,7 @@ fn check_flags(flags: &Flags, kind: &Kind) -> Result<(), String> {
                     "prusalink" | "octoprint" | "moonraker" | "snapmaker-u1" | "repetier"
                 ),
         ),
+        ("storage", flags.storage.is_some() && name != "prusalink"),
         ("username", flags.username.is_some() && name != "prusalink"),
         (
             "password",
@@ -574,7 +579,8 @@ fn check_flags(flags: &Flags, kind: &Kind) -> Result<(), String> {
         ("profile", flags.profile.is_some() && name != "elegoo-sdcp"),
         (
             "nozzle-diameter",
-            flags.nozzle_diameter.is_some() && !matches!(name, "duet" | "duet-sbc" | "repetier"),
+            flags.nozzle_diameter.is_some()
+                && !matches!(name, "prusalink" | "duet" | "duet-sbc" | "repetier"),
         ),
         ("slug", flags.slug.is_some() && name != "repetier"),
         ("slicer", flags.slicer.is_some() && !slices),
@@ -673,6 +679,27 @@ pub fn build(flags: &Flags, ask: Option<&mut dyn Ask>) -> Result<Setup, String> 
     }
     if matches!(kind.name, "duet" | "duet-sbc" | "repetier") {
         answers.nozzle_diameter = Some(nozzle(flags, &mut session)?);
+    }
+    if kind.name == "prusalink" {
+        answers.storage = session.optional(
+            flags.storage.as_ref(),
+            "Storage path name (leave empty for automatic selection)",
+        )?;
+        let given = flags.nozzle_diameter.map(|d| d.to_string());
+        if let Some(value) = session.optional(
+            given.as_ref(),
+            "Installed nozzle diameter in mm (leave empty if reported by the printer)",
+        )? {
+            let nozzle_flags = Flags {
+                nozzle_diameter: Some(
+                    value
+                        .parse()
+                        .map_err(|_| "Set a numeric nozzle diameter in millimetres.")?,
+                ),
+                ..Flags::default()
+            };
+            answers.nozzle_diameter = Some(nozzle(&nozzle_flags, &mut session)?);
+        }
     }
     let default_name = if kind.name == "simulated" {
         "Workbench demo"
@@ -1093,6 +1120,16 @@ fn printer_fields(t: &mut Text, kind: &Kind, a: &Answers) {
                  Find its IP address in the printer's network settings.",
             );
             t.string("url", url);
+            t.comment(
+                "Storage path name from /api/v1/storage; omit to select the only writable storage.",
+            );
+            if let Some(storage) = &a.storage {
+                t.string("storage", storage);
+            }
+            t.comment("Installed nozzle in mm, required when PrusaLink does not report it (such as on a Pi).");
+            if let Some(diameter) = a.nozzle_diameter {
+                t.line(&format!("nozzle_diameter = {diameter:?}"));
+            }
             if a.api_key.is_some() {
                 t.comment(
                     "PrusaLink API key. On MINI: Settings > Network > PrusaLink > Current API Key.\n\
@@ -1102,7 +1139,7 @@ fn printer_fields(t: &mut Text, kind: &Kind, a: &Answers) {
             } else {
                 t.comment(
                     "PrusaLink login, sent with HTTP Digest. MK4 and XL use the username \"maker\"\n\
-                     and the API key as the password.",
+                     and the API key as the password. Pi setups use their own username and password.",
                 );
                 t.maybe("username", a.username.as_ref(), "maker");
                 t.maybe("password", a.password.as_ref(), "");
@@ -1343,6 +1380,8 @@ mod tests {
             "2",
             "192.168.1.30",
             "secret-key",
+            "", // automatic storage
+            "", // reported nozzle
             "Workbench MINI",
             "",
             "",
@@ -1381,6 +1420,8 @@ mod tests {
             "maker",
             "",
             "pass\"word\\",
+            "", // automatic storage
+            "", // reported nozzle
             "",
             "",
             "",
@@ -1395,6 +1436,26 @@ mod tests {
         assert_eq!(printer.api_key, None);
         assert_eq!(printer.username.as_deref(), Some("maker"));
         assert_eq!(printer.password.as_deref(), Some("pass\"word\\"));
+    }
+
+    #[test]
+    fn interactive_pi_asks_for_storage_and_nozzle() {
+        let flags = Flags {
+            kind: Some("prusalink".into()),
+            url: Some("http://127.0.0.1:1".into()),
+            username: Some("workshop".into()),
+            password: Some("test-password".into()),
+            ..Flags::default()
+        };
+        let mut script = Script::new(&["local", "0.4", "MK3S", "", "", "", "", ""]);
+        let setup = build(&flags, Some(&mut script)).unwrap();
+        let config = crate::config::Config::from_text(&setup.text, None).unwrap();
+        let printer = &config.printers[0];
+        assert_eq!(printer.storage.as_deref(), Some("local"));
+        assert_eq!(printer.nozzle_diameter, Some(0.4));
+        assert_eq!(printer.username.as_deref(), Some("workshop"));
+        assert!(script.shown.contains("Storage path name"));
+        assert!(script.shown.contains("Installed nozzle diameter"));
     }
 
     #[test]

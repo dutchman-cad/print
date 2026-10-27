@@ -430,9 +430,16 @@ The API does not accept a slicer override. Certificate enrollment uses the stand
 
 For PrusaLink, preparation reads the resolved `nozzle_diameter` setting from PrusaSlicer's
 output text G-code comments (first and last 256 KiB). Missing, ambiguous, or multiple-nozzle
-settings are refused. Before upload it must match `/api/v1/info` `nozzle_diameter`; a
+settings are refused. When `/api/v1/info` omits `nozzle_diameter` (including null),
+PrusaLink uses the installed `nozzle_diameter` from private printer config. Missing both or
+invalid reported values block preparation. A reported diameter takes precedence. Before
+upload the sliced value must match the reported diameter or configured fallback; a
 mismatch names both diameters and requires a matching nozzle or a newly sliced profile.
-There is no per-printer mismatch override.
+There is no per-printer mismatch override. Serial, firmware, MMU capability, and all returned
+identity fields retain the same checks for embedded and Pi-hosted PrusaLink. Both use text
+G-code. Upload storage comes from `/api/v1/storage`: exactly one available writable entry,
+or the configured `storage` path name, with sufficient reported free space. Ambiguous
+selection is refused before upload. The selected path is retained for Start and cleanup.
 
 For Bambu, `detail` includes active HMS hexadecimal codes and Bambu wiki links.
 Fatal/serious HMS alerts block Start; any HMS alert during PAUSE requires attention

@@ -52,8 +52,10 @@ pub struct Printer {
     pub api_key: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
-    /// Commissioned nozzle size for printers that do not report one (Duet, Repetier-Server).
+    /// Commissioned nozzle size for printers that do not report one (PrusaLink, Duet, Repetier-Server).
     pub nozzle_diameter: Option<f64>,
+    /// PrusaLink storage path component, selected from the live storage list.
+    pub storage: Option<String>,
     /// Repetier-Server printer slug; one server can host several printers.
     pub slug: Option<String>,
     /// Elegoo SDCP protocol profile: `centauri` or `resin`.
@@ -174,13 +176,19 @@ impl Config {
                             .into(),
                     ),
                 }
+                if printer.storage.is_some() && printer.kind.as_deref() != Some("prusalink") {
+                    return Err("Set storage only for PrusaLink printers.".into());
+                }
                 let repetier = printer.kind.as_deref() == Some("repetier");
                 if printer.nozzle_diameter.is_some()
                     && !repetier
-                    && !matches!(printer.kind.as_deref(), Some("duet" | "duet-sbc"))
+                    && !matches!(
+                        printer.kind.as_deref(),
+                        Some("duet" | "duet-sbc" | "prusalink")
+                    )
                 {
                     return Err(
-                        "Set nozzle_diameter only for Duet and Repetier-Server printers.".into(),
+                        "Set nozzle_diameter only for Duet, Repetier-Server, and PrusaLink printers.".into(),
                     );
                 }
                 if printer.slug.is_some() && !repetier {

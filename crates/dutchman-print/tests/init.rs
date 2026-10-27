@@ -59,6 +59,21 @@ fn every_kind_writes_a_private_config_that_loads_without_contacting_anything() {
     let (listener, port) = listener();
     let url = format!("http://127.0.0.1:{port}");
     let cases: Vec<(&str, Vec<&str>)> = vec![
+        (
+            "prusalink",
+            vec![
+                "--url",
+                &url,
+                "--username",
+                "workshop",
+                "--password",
+                SECRET,
+                "--storage",
+                "local",
+                "--nozzle-diameter",
+                "0.4",
+            ],
+        ),
         ("simulated", vec![]),
         ("prusalink", vec!["--url", &url, "--api-key", SECRET]),
         (
@@ -459,4 +474,45 @@ fn default_and_global_config_paths_are_used() {
         .unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
     Config::load(&chosen).unwrap();
+}
+
+#[test]
+fn pi_init_writes_storage_and_nozzle_and_refuses_bad_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pi.toml");
+    for (storage, diameter, accepted) in [
+        ("local", "0.4", true),
+        ("../local", "0.4", false),
+        ("local", "0", false),
+        ("local", "NaN", false),
+    ] {
+        let out = init(
+            dir.path(),
+            &[
+                "--kind",
+                "prusalink",
+                "--url",
+                "http://127.0.0.1:1",
+                "--username",
+                "workshop",
+                "--password",
+                SECRET,
+                "--storage",
+                storage,
+                "--nozzle-diameter",
+                diameter,
+                "--output",
+                path.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(out.status.success(), accepted, "{}", text(&out.stderr));
+        if accepted {
+            let config = Config::load(&path).unwrap();
+            assert_eq!(config.printers[0].storage.as_deref(), Some("local"));
+            assert_eq!(config.printers[0].nozzle_diameter, Some(0.4));
+            std::fs::remove_file(&path).unwrap();
+        } else {
+            assert!(!path.exists());
+        }
+    }
 }
