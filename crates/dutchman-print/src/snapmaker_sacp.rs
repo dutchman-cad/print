@@ -446,6 +446,7 @@ pub struct Client {
     timing: Timing,
     state: watch::Sender<Telemetry>,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    closed: std::sync::atomic::AtomicBool,
 }
 impl Drop for Client {
     fn drop(&mut self) {
@@ -455,6 +456,21 @@ impl Drop for Client {
     }
 }
 impl Client {
+    /// No vendor disconnect command is documented; closing the worker closes its socket.
+    pub async fn shutdown(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut worker = self.worker.lock().await;
+        if let Some(task) = worker.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.state.send_modify(|t| {
+            t.connected = false;
+            t.received = None;
+            t.reason = UNAVAILABLE;
+        });
+    }
+
     pub fn new(config: crate::config::Printer) -> Result<Self, String> {
         super::validate(&config)?;
         let (state, _) = watch::channel(Telemetry {
@@ -469,6 +485,7 @@ impl Client {
             timing: Timing::default(),
             state,
             worker: Mutex::new(None),
+            closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
     /// Replaces the timing before the first status read, for simulated printers.
@@ -485,6 +502,9 @@ impl Client {
     }
     async fn begin(&self) {
         let mut worker = self.worker.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         if worker.is_none() {
             let link = Link {
                 host: self.config.host.clone().unwrap_or_default(),

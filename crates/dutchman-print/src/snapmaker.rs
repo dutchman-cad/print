@@ -113,6 +113,13 @@ pub enum Client {
     Sacp(sacp::Client),
 }
 impl Client {
+    pub async fn shutdown(&self) {
+        match self {
+            Self::Http(client) => client.shutdown().await,
+            Self::Sacp(client) => client.shutdown().await,
+        }
+    }
+
     pub fn new(config: crate::config::Printer) -> Result<Self, String> {
         match config.kind.as_deref() {
             Some("snapmaker-2") => http::Client::new(config).map(Self::Http),

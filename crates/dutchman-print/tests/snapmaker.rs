@@ -887,3 +887,84 @@ async fn api_reports_controls_and_refuses_unsupported_actions_without_reads() {
     assert!(f.machine.lock().await.requests.is_empty());
     controls::listed(&app, &[]).await;
 }
+
+#[tokio::test]
+async fn shutdown_releases_approved_http_token_once() {
+    let f = Fake2::new(Approval::Immediate).await;
+    let backend = Safety::new(Arc::new(Printers::new(f.config()).unwrap()));
+    let reports = backend.printers().await.unwrap();
+    assert_eq!(reports[0].state, PrinterState::Idle);
+    assert!(!serde_json::to_string(&reports).unwrap().contains(TOKEN));
+    backend.shutdown().await.unwrap();
+    backend.shutdown().await.unwrap();
+    assert_eq!(
+        backend.printers().await.unwrap()[0].state,
+        PrinterState::Offline
+    );
+    let requests = f.requests().await;
+    let disconnects: Vec<_> = requests
+        .iter()
+        .filter(|r| r.path == "/api/v1/disconnect")
+        .collect();
+    assert_eq!(disconnects.len(), 1);
+    assert_eq!(disconnects[0].method, "POST");
+    assert_eq!(disconnects[0].body, format!("token={TOKEN}"));
+    assert_eq!(disconnects[0].query, None);
+    assert!(requests.iter().all(|r| matches!(
+        r.path.as_str(),
+        "/api/v1/connect" | "/api/v1/status" | "/api/v1/disconnect"
+    )));
+}
+
+#[tokio::test]
+async fn cli_completion_disconnects_and_never_logs_the_token() {
+    let f = Fake2::new(Approval::Immediate).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, format!("[backend]\nkind='printers'\n[[printers]]\nkind='snapmaker-2'\nid='test'\nname='Test'\nmodel='Synthetic'\nhost='127.0.0.1'\nport={}\n", f.port)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_dutchman-print"))
+        .arg("--config")
+        .arg(&path)
+        .arg("--data-dir")
+        .arg(dir.path().join("data"))
+        .args(["printers", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(TOKEN));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(TOKEN));
+    assert_eq!(f.count("/api/v1/disconnect").await, 1);
+}
+
+#[tokio::test]
+async fn shutdown_closes_j1_socket_without_control_packets_or_reconnect() {
+    let f = FakeJ1::new(&[0]).await;
+    let backend = Printers::new(f.config()).unwrap();
+    backend.printers().await.unwrap();
+    backend.shutdown().await.unwrap();
+    backend.shutdown().await.unwrap();
+    until("J1 socket closed", || async {
+        f.machine.lock().await.closed == 1
+    })
+    .await;
+    assert_eq!(
+        backend.printers().await.unwrap()[0].state,
+        PrinterState::Offline
+    );
+    let m = f.machine.lock().await;
+    assert_eq!(m.connections, 1);
+    assert!(m
+        .requests
+        .iter()
+        .all(|p| matches!(p.id, sacp::MODULE_INFO | sacp::MACHINE_INFO)));
+}

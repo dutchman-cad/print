@@ -1311,3 +1311,48 @@ async fn disabled_controls_refuse_challenges_without_connecting() {
     assert_eq!(f.requests.load(Ordering::SeqCst), 0);
     controls::listed(&app, &[]).await;
 }
+
+#[tokio::test]
+async fn persistent_monitor_shutdown_sends_one_mqtt_disconnect() {
+    let fake = Fake::new().await;
+    let config = format!(
+        r#"
+[backend]
+kind = "printers"
+[slicer]
+kind = "orcaslicer"
+[[printers]]
+kind = "bambu"
+id = "bambu"
+name = "Test Bambu"
+model = "Synthetic"
+printer_profile = "Machine"
+print_profile = "Draft"
+filament_profile = "PLA"
+host = "127.0.0.1"
+port = {}
+serial = "TESTSERIAL"
+access_code = "test-access"
+cert_sha256 = "{}"
+"#,
+        fake.port,
+        dutchman_print::safety::hash(fake.cert.as_ref())
+    );
+    let backend = Safety::new(Arc::new(
+        Printers::new(toml::from_str(&config).unwrap()).unwrap(),
+    ));
+    assert_eq!(
+        backend.printers().await.unwrap()[0].state,
+        PrinterState::Idle
+    );
+    backend.shutdown().await.unwrap();
+    Fake::wait(&fake.disconnects, 1).await;
+    backend.shutdown().await.unwrap();
+    assert_eq!(
+        backend.printers().await.unwrap()[0].state,
+        PrinterState::Offline
+    );
+    assert_eq!(fake.disconnects.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.connections.load(Ordering::SeqCst), 1);
+    assert!(fake.commands.lock().await.is_empty());
+}

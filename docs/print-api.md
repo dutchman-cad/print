@@ -354,6 +354,8 @@ Jobs may expire; subsequent reads return 404. Dutchman Print retains jobs for on
 persists service jobs in its private data folder. Startup reloads tracked jobs and reconciles
 attempted jobs with live status before control; unavailable printers stay tracked and controls
 require live reconciliation. Clients must still handle expired jobs disappearing.
+When the service stops, it releases printer connections within three seconds without sending
+machine actions; durable job and safety checkpoints are retained.
 
 ## Confirmation for machine actions
 

@@ -1559,6 +1559,48 @@ impl Backend for Printers {
             "This printer does not support this action. Choose a supported control.",
         ))
     }
+    fn shutdown(&self) -> Reply<'_, ()> {
+        Box::pin(async move {
+            use futures_util::{stream::FuturesUnordered, StreamExt as _};
+            let pending: FuturesUnordered<Reply<'_, ()>> = FuturesUnordered::new();
+            for client in self.clients.iter().flatten() {
+                pending.push(Box::pin(async move {
+                    client.shutdown().await;
+                    Ok(())
+                }));
+            }
+            for client in self.bambu.values() {
+                pending.push(Box::pin(async move {
+                    client.shutdown().await;
+                    Ok(())
+                }));
+            }
+            for client in self.snapmaker.values() {
+                pending.push(Box::pin(async move {
+                    client.shutdown().await;
+                    Ok(())
+                }));
+            }
+            for client in self.sdcp.values() {
+                pending.push(Box::pin(async move {
+                    client.shutdown().await;
+                    Ok(())
+                }));
+            }
+            for client in self.duet.values() {
+                pending.push(Box::pin(client.shutdown()));
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let mut pending = pending;
+                while let Some(result) = pending.next().await {
+                    let _ = result;
+                }
+            })
+            .await
+            .map_err(|_| Error::Unavailable)?;
+            Ok(())
+        })
+    }
 
     fn review_action<'a>(
         &'a self,

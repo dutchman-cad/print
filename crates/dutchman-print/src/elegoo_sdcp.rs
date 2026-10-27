@@ -389,6 +389,7 @@ pub struct Client {
     commands: mpsc::Sender<Outgoing>,
     command_rx: Mutex<Option<mpsc::Receiver<Outgoing>>>,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    closed: std::sync::atomic::AtomicBool,
 }
 impl Drop for Client {
     fn drop(&mut self) {
@@ -434,6 +435,21 @@ fn envelope(profile: Profile, cmd: u64, request: &str, mainboard: &str, brand: &
 }
 
 impl Client {
+    /// No vendor disconnect command is documented; closing the worker closes its socket.
+    pub async fn shutdown(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut worker = self.worker.lock().await;
+        if let Some(task) = worker.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.state.send_modify(|t| {
+            t.connected = false;
+            t.received = None;
+            t.reason = UNAVAILABLE;
+        });
+    }
+
     pub fn new(config: crate::config::Printer) -> Result<Self, String> {
         validate(&config)?;
         let profile = Profile::parse(config.profile.as_deref())
@@ -460,6 +476,7 @@ impl Client {
             commands,
             command_rx: Mutex::new(Some(command_rx)),
             worker: Mutex::new(None),
+            closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
     /// Replaces the timing before the first status read, for simulated printers.
@@ -479,6 +496,9 @@ impl Client {
     }
     async fn begin(&self) {
         let mut worker = self.worker.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         if worker.is_none() {
             let Some(commands) = self.command_rx.lock().await.take() else {
                 return;

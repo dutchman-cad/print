@@ -172,6 +172,10 @@ pub trait Backend: Send + Sync {
             )))
         }
     }
+    /// Release connections without sending machine actions. Call after persisting state.
+    fn shutdown(&self) -> Reply<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 
     fn restore_jobs<'a>(&'a self, _path: &'a Path) -> Reply<'a, ()> {
         Box::pin(async { Ok(()) })

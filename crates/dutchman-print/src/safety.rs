@@ -270,6 +270,9 @@ impl Backend for Safety {
     fn check_action(&self, printer: &str, action: &str) -> Result<(), Error> {
         self.inner.check_action(printer, action)
     }
+    fn shutdown(&self) -> Reply<'_, ()> {
+        self.inner.shutdown()
+    }
 
     fn review_action<'a>(
         &'a self,

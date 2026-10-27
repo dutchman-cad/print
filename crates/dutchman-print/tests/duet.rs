@@ -810,3 +810,137 @@ async fn api_reports_configured_controls() {
     let (_dir, app) = controls::app(f.config());
     controls::listed(&app, controls::ALL).await;
 }
+
+#[tokio::test]
+async fn shutdown_releases_existing_key_once_without_machine_actions() {
+    let f = Fake::new().await;
+    let backend = Safety::new(Arc::new(Printers::new(f.config()).unwrap()));
+    backend.printers().await.unwrap();
+    backend.shutdown().await.unwrap();
+    backend.shutdown().await.unwrap();
+    let machine = f.shared.machine.lock().await;
+    assert_eq!(
+        machine
+            .records
+            .iter()
+            .filter(|(path, _)| path == "/rr_disconnect")
+            .count(),
+        1
+    );
+    assert!(machine.keys.is_empty());
+    assert!(machine.commands.is_empty());
+    assert_eq!(machine.connects, 1);
+}
+
+#[tokio::test]
+async fn shutdown_deadline_covers_a_printer_that_never_replies() {
+    let f = Fake::new().await;
+    let backend = Printers::new(f.config()).unwrap();
+    backend.printers().await.unwrap();
+    f.shared.machine.lock().await.block = Some("/rr_disconnect".into());
+    let started = std::time::Instant::now();
+    let _ = backend.shutdown().await;
+    assert!(started.elapsed() < Duration::from_millis(3500));
+    assert!(f.commands().await.is_empty());
+}
+
+#[tokio::test]
+async fn shutdown_of_unreachable_printer_finishes_within_deadline() {
+    let f = Fake::new().await;
+    let backend = Printers::new(f.config()).unwrap();
+    backend.printers().await.unwrap();
+    drop(f);
+    let started = std::time::Instant::now();
+    let _ = backend.shutdown().await;
+    assert!(started.elapsed() < Duration::from_millis(3500));
+}
+
+#[tokio::test]
+async fn shutdown_does_not_wait_for_an_outstanding_status_poll() {
+    let f = Fake::new().await;
+    let backend = Arc::new(Printers::new(f.config()).unwrap());
+    backend.printers().await.unwrap();
+    f.shared.machine.lock().await.block = Some("/rr_model".into());
+    let pending = tokio::spawn({
+        let backend = backend.clone();
+        async move { backend.printers().await }
+    });
+    timeout(Duration::from_secs(5), f.shared.entered.notified())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(1), backend.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        f.shared
+            .machine
+            .lock()
+            .await
+            .records
+            .iter()
+            .filter(|(path, _)| path == "/rr_disconnect")
+            .count(),
+        1
+    );
+    assert!(f.commands().await.is_empty());
+    f.shared.release.notify_one();
+    pending.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn cli_saves_state_and_keeps_lock_until_disconnect_finishes() {
+    let f = Fake::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, format!(
+        "[backend]\nkind='printers'\n[slicer]\nkind='prusaslicer'\n[[printers]]\nkind='duet'\nid='test'\nname='Test'\nmodel='Synthetic'\nprinter_profile='Machine'\nprint_profile='Draft'\nfilament_profile='PLA'\nurl='{}'\npassword='secret'\nnozzle_diameter=0.4\n", f.url
+    )).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let data = dir.path().join("data");
+    f.shared.machine.lock().await.block = Some("/rr_disconnect".into());
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_dutchman-print"));
+    command
+        .arg("--config")
+        .arg(&config)
+        .arg("--data-dir")
+        .arg(&data)
+        .args(["clear", "test", "--yes"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let first = command.spawn().unwrap();
+    timeout(Duration::from_secs(5), f.shared.entered.notified())
+        .await
+        .unwrap();
+    let files: Vec<_> = std::fs::read_dir(&data)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    for ending in ["printers.json", "printers.safety.json"] {
+        let path = files
+            .iter()
+            .find(|path| path.to_string_lossy().ends_with(ending))
+            .unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(saved.is_object());
+    }
+    let second = timeout(Duration::from_secs(1), command.output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!second.status.success());
+    assert!(String::from_utf8_lossy(&second.stderr).contains("Another CLI command"));
+    f.shared.release.notify_one();
+    let first = first.wait_with_output().await.unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(f.commands().await.is_empty());
+}

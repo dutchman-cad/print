@@ -651,3 +651,22 @@ async fn api_reports_controls_and_refuses_unsupported_actions_without_reads() {
         controls::listed(&app, &expected).await;
     }
 }
+
+#[tokio::test]
+async fn shutdown_closes_sdcp_socket_without_machine_commands() {
+    let f = Fake::new(resin(&[0], 9, "task-a", "part.ctb", 0)).await;
+    let backend = Printers::new(f.config("resin")).unwrap();
+    backend.printers().await.unwrap();
+    backend.shutdown().await.unwrap();
+    backend.shutdown().await.unwrap();
+    until("SDCP socket closed", || async {
+        f.machine.lock().await.closed == 1
+    })
+    .await;
+    assert_eq!(
+        backend.printers().await.unwrap()[0].state,
+        PrinterState::Offline
+    );
+    assert_eq!(f.machine.lock().await.connections, 1);
+    assert_eq!(f.controls().await, 0);
+}
