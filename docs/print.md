@@ -3,7 +3,7 @@
 Dutchman Print is a local print companion for SolidCraft and a standalone command line.
 A backend prepares 3MF files, estimates jobs, and controls printers. The included
 `simulated` backend is a demo: it contacts no printers and can optionally run a local slicer.
-The `printers` backend supports individually configured local PrusaLink and Bambu printers.
+The `printers` backend supports individually configured local PrusaLink, OctoPrint, and Bambu printers.
 
 Build `dutchman-print` from this checkout with Rust 1.88 or newer:
 
@@ -84,6 +84,7 @@ Configure slicers with `[slicers.<name>]` tables, each containing `kind`, option
 optional `datadir`, and `timeout_seconds`. Set each printer's `slicer = "<name>"` to choose
 one. Without a name, Dutchman selects the only slicer of the required kind: PrusaLink needs
 `prusaslicer`, Bambu needs `orcaslicer`. Missing or ambiguous choices are refused.
+OctoPrint accepts either kind; select a named slicer when more than one is configured.
 The simulator with `slice = true` uses the same per-printer selection; a simulated printer
 without a kind can use the only configured slicer, or select one explicitly.
 `[slicer]` remains a single-slicer shorthand; it cannot be combined with named slicers,
@@ -477,6 +478,80 @@ Standalone CLI commands save tracked jobs and reviews separately from service jo
 the service API to control service jobs. The attempted Start is saved before sending it,
 so restarting cannot silently retry it. The service persists tracked jobs and reconciles
 live identity before control after a restart.
+
+## OctoPrint
+
+Configure the host explicitly; Dutchman performs no discovery. HTTP and HTTPS are accepted,
+including a reverse proxy base path. HTTPS verifies the hostname and certificate against system
+trust; there are no certificate exceptions. Redirects are refused. Keep HTTP on a trusted local
+network. Only text G-code is sent, using your separately installed PrusaSlicer or OrcaSlicer.
+
+```toml
+[backend]
+kind = "printers"
+
+[slicers.local]
+kind = "prusaslicer" # or "orcaslicer"
+# path = "/path/to/prusa-slicer"
+
+[[printers]]
+kind = "octoprint"
+id = "workbench"
+name = "Workbench printer"
+model = "Your commissioned printer model"
+url = "https://octoprint.example/printing"
+api_key = "REPLACE_WITH_YOUR_OCTOPRINT_USER_OR_APPLICATION_KEY"
+slicer = "local"
+printer_profile = "Your installed printer preset"
+print_profile = "Your installed print preset"
+filament_profile = "Your installed filament preset"
+```
+
+Create a key in your local OctoPrint installation. Prefer a user-approved application key
+from [Application Keys](https://docs.octoprint.org/en/main/bundledplugins/appkeys.html), or
+generate a personal key in your user settings using the API key controls in the change-password
+dialog, described in [API authentication](https://docs.octoprint.org/en/main/api/general.html#authorization).
+The key needs status, version, printer-profile read, file-list, upload, select, print, pause,
+and cancel permissions. Permission failures are reported as authentication failures; inspect
+the key's permissions in OctoPrint. Dutchman sends it only as `X-Api-Key`, never in a URL.
+No cloud account or application registration is required. Keep the config private.
+
+Commission all three slicer profiles for the actual model, build volume, nozzle, toolhead,
+material, and plate. Per-job profile differences are refused. Only single-extruder profiles
+are accepted; material-slot assignment is unsupported. Review the active OctoPrint printer
+profile and serial connection too. OctoPrint's REST status cannot verify physical printer
+identity, firmware, loaded material, or plate changes. Check these physically before every
+confirmation; a changed physical setup requires new preparation and review.
+
+Status reads the documented [connection](https://docs.octoprint.org/en/main/api/connection.html),
+[printer](https://docs.octoprint.org/en/main/api/printer.html), and
+[job](https://docs.octoprint.org/en/main/api/job.html) endpoints within four seconds. A reachable
+host with disconnected serial reports offline. Opening, missing, contradictory, or unknown
+states block control. Operational maps to idle, Printing/Pausing/Cancelling to printing,
+Paused to paused, and Error to error; documented flags must agree. Progress, remaining time,
+temperatures, and selected file name are reported when available. Missing values stay absent.
+
+Before starting, acknowledge the checked bed with `clear workbench --yes` or the confirmed
+API clear route. Dutchman checks input and G-code bytes, configured profiles, the active
+OctoPrint connection and printer profile, and server version against preparation. It checks
+fresh readiness before upload and again before start. It stages a uniquely named local file
+using [file operations](https://docs.octoprint.org/en/main/api/files.html), with select and print
+disabled, refusing an existing name. Uploads are capped at 200 MiB with a deadline of 30 seconds
+plus one second per 32 KiB. It requires a completed upload and validates the stored name,
+origin, machine-code type, and size. It selects without printing, reads the selected file
+back, and only then sends the explicit job start command once. A conflict or lost reply
+requires status reconciliation; an attempted start is never repeated automatically.
+
+Pause, explicit resume, and cancel require a fresh local file-name/origin match to the job
+Dutchman started. Pause never toggles. OctoPrint supplies no execution ID, so external reuse
+of the exact staged file cannot be distinguished; avoid controlling these files elsewhere.
+An idle machine alone does not prove completion. Dutchman requires a newer print-history
+record for that file after observing it active. A successful record means done; an unsuccessful
+record means failed, or cancelled when this companion requested cancellation. Without that
+evidence the outcome stays unresolved. After every start attempt, finish, cancellation, or
+failure, check and acknowledge the bed again. CLI state preserves attempted starts across
+restarts; the service uses the same confirmation and safety policy described in
+[the job API](print-api.md).
 
 ## Bambu Lab LAN control (experimental)
 

@@ -22,11 +22,16 @@ struct Prepared {
     attempted: bool,
     filename: String,
     profiles: Value,
+    #[serde(default)]
+    history: Value,
+    #[serde(default)]
+    cancelling: bool,
 }
 pub struct Printers {
     configs: Vec<crate::config::Printer>,
     clients: Vec<Option<Arc<Client>>>,
     bambu: BTreeMap<String, Arc<crate::bambu::Client>>,
+    octoprint: BTreeMap<String, Arc<crate::octoprint::Client>>,
     slicers: BTreeMap<String, crate::slicer::Config>,
     jobs: Mutex<BTreeMap<String, Prepared>>,
     store: Option<PathBuf>,
@@ -60,7 +65,7 @@ impl Printers {
             .iter()
             .cloned()
             .map(|p| {
-                if p.kind.as_deref() == Some("bambu") {
+                if matches!(p.kind.as_deref(), Some("bambu" | "octoprint")) {
                     Ok(None)
                 } else {
                     Client::new(p).map(|c| Some(Arc::new(c)))
@@ -80,10 +85,17 @@ impl Printers {
             .iter()
             .map(|p| config.slicer_for(p).map(|s| (p.id.clone(), s.clone())))
             .collect::<Result<_, _>>()?;
+        let octoprint = config
+            .printers
+            .iter()
+            .filter(|p| p.kind.as_deref() == Some("octoprint"))
+            .map(|p| crate::octoprint::Client::new(p.clone()).map(|c| (p.id.clone(), Arc::new(c))))
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             configs: config.printers,
             clients,
             bambu,
+            octoprint,
             slicers,
             jobs: Mutex::new(BTreeMap::new()),
             store: None,
@@ -281,6 +293,16 @@ impl Printers {
         Ok(snapshot)
     }
     async fn control(&self, printer: &str, action: &str, expected: JobState) -> Result<Job, Error> {
+        if self.octoprint.contains_key(printer) {
+            let mut jobs = self.jobs.lock().await;
+            let target = jobs
+                .values_mut()
+                .find(|p| p.job.printer == printer && p.attempted && p.job.state == expected)
+                .ok_or_else(|| {
+                    refuse("No matching tracked job. Read status to reconcile the printer.")
+                })?;
+            return self.octoprint_control(target, action).await;
+        }
         if let Some(client) = self.bambu.get(printer) {
             client.check_control()?;
             let mut jobs = self.jobs.lock().await;
@@ -375,6 +397,247 @@ impl Printers {
         if target.job.state != expected_state {
             return Err(refuse(
                 "Command outcome is not confirmed. Read fresh status.",
+            ));
+        }
+        Ok(target.job.clone())
+    }
+}
+impl Printers {
+    async fn reconcile_octoprint(
+        &self,
+        target: &mut Prepared,
+    ) -> Result<crate::octoprint::Snapshot, Error> {
+        use crate::backend::PrinterState;
+        let client = self
+            .octoprint
+            .get(&target.job.printer)
+            .ok_or(Error::NotFound)?;
+        let live = client.snapshot().await?;
+        let identity = format!("local/{}", target.filename);
+        if target.attempted
+            && live.printer.job_id.as_deref() == Some(identity.as_str())
+            && live
+                .job
+                .pointer("/job/file/path")
+                .and_then(Value::as_str)
+                .is_none_or(|p| p == target.filename)
+            && matches!(
+                target.job.state,
+                JobState::Ready | JobState::Printing | JobState::Paused
+            )
+        {
+            match live.printer.state {
+                PrinterState::Printing
+                    if matches!(
+                        live.printer.detail.as_deref(),
+                        Some("Printing" | "Pausing" | "Cancelling")
+                    ) =>
+                {
+                    target.job.state = JobState::Printing;
+                    target.remote = Some(identity);
+                }
+                PrinterState::Paused => {
+                    target.job.state = JobState::Paused;
+                    target.remote = Some(identity);
+                }
+                PrinterState::Idle if target.remote.is_some() => {
+                    let file = client
+                        .json(&format!("/api/files/local/{}", target.filename))
+                        .await?;
+                    if file.get("name").and_then(Value::as_str) != Some(target.filename.as_str())
+                        || file.get("origin").and_then(Value::as_str) != Some("local")
+                    {
+                        return Err(refuse(
+                            "Stored file identity differs from the tracked job. Read fresh status.",
+                        ));
+                    }
+                    let history = crate::octoprint::history(&file);
+                    if history
+                        .get("date")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|date| {
+                            target
+                                .history
+                                .get("date")
+                                .and_then(Value::as_u64)
+                                .is_none_or(|old| date > old)
+                        })
+                    {
+                        target.job.state = match history.get("success").and_then(Value::as_bool) {
+                            Some(true) => JobState::Done,
+                            Some(false) if target.cancelling => JobState::Cancelled,
+                            Some(false) => JobState::Failed,
+                            None => target.job.state,
+                        };
+                    }
+                }
+                // Error flags alone cannot attribute a terminal outcome to this execution.
+                _ => {}
+            }
+            target.job.progress = live.printer.progress;
+            target.job.seconds_left = live.printer.seconds_left;
+        }
+        Ok(live)
+    }
+    async fn octoprint_control(&self, target: &mut Prepared, action: &str) -> Result<Job, Error> {
+        let client = self
+            .octoprint
+            .get(&target.job.printer)
+            .ok_or(Error::NotFound)?;
+        let live = self.reconcile_octoprint(target).await?;
+        if !target.attempted
+            || target.remote.is_none()
+            || target.remote != live.printer.job_id
+            || live
+                .job
+                .pointer("/job/file/path")
+                .and_then(Value::as_str)
+                .is_some_and(|p| p != target.filename)
+            || !matches!(target.job.state, JobState::Printing | JobState::Paused)
+            || !matches!(
+                (action, live.printer.detail.as_deref(), live.printer.state),
+                (
+                    "pause",
+                    Some("Printing"),
+                    crate::backend::PrinterState::Printing
+                ) | (
+                    "resume",
+                    Some("Paused"),
+                    crate::backend::PrinterState::Paused
+                ) | (
+                    "cancel",
+                    Some("Printing" | "Pausing" | "Paused" | "Cancelling"),
+                    crate::backend::PrinterState::Printing | crate::backend::PrinterState::Paused
+                )
+            )
+        {
+            return Err(refuse("No matching live job for this command or readiness is unknown. Read fresh status to reconcile the printer."));
+        }
+        let payload = if action == "cancel" {
+            serde_json::json!({"command":"cancel"})
+        } else {
+            serde_json::json!({"command":"pause", "action": if action == "pause" {"pause"} else {"resume"}})
+        };
+        let result = client.command("/api/job", payload).await;
+        if action == "cancel" && !matches!(result, Err(Error::Refused(_) | Error::Authentication)) {
+            target.cancelling = true;
+        }
+        let fresh = self.reconcile_octoprint(target).await;
+        result?;
+        fresh?;
+        let expected = match action {
+            "pause" => JobState::Paused,
+            "resume" => JobState::Printing,
+            _ => JobState::Cancelled,
+        };
+        if target.job.state != expected {
+            return Err(refuse(
+                "Command outcome is not confirmed. Read fresh status to reconcile the job.",
+            ));
+        }
+        Ok(target.job.clone())
+    }
+    async fn start_octoprint(
+        &self,
+        id: &str,
+        jobs: &mut BTreeMap<String, Prepared>,
+    ) -> Result<Job, Error> {
+        let target = jobs.get_mut(id).ok_or(Error::NotFound)?;
+        if target.attempted || target.job.state != JobState::Ready {
+            return Err(refuse("Start was already attempted. Read status to reconcile the intended file and job. Start will not be repeated."));
+        }
+        if self.profiles(&target.job.printer)? != target.profiles {
+            return Err(refuse("Printer model, tooling, material, or plate profiles changed. Prepare and review again."));
+        }
+        let client = self
+            .octoprint
+            .get(&target.job.printer)
+            .ok_or(Error::NotFound)?;
+        let live = client.snapshot().await?;
+        crate::octoprint::ready(&live)?;
+        if client.review(&live).await? != target.info {
+            return Err(refuse("OctoPrint connection, version, build volume, or tooling changed. Prepare and review again."));
+        }
+        let bytes = file_bytes(&target.path).await?;
+        if hash(&bytes) != target.digest {
+            return Err(refuse("Prepared G-code changed. Prepare and review again."));
+        }
+        // Use a new remote name per preparation; refuse collisions rather than overwrite.
+        let filename = target.filename.clone();
+        let path = format!("/api/files/local/{filename}");
+        let (code, _) = client
+            .request(Method::GET, &path, Bytes::new(), "application/json", false)
+            .await?;
+        if code != StatusCode::NOT_FOUND {
+            return Err(refuse("OctoPrint staging file already exists or storage cannot be checked. Prepare a new job after inspecting storage."));
+        }
+        crate::octoprint::ready(&client.snapshot().await?)?;
+        client.upload(&filename, &bytes).await?;
+        let uploaded = client.json(&path).await?;
+        if uploaded.get("name").and_then(Value::as_str) != Some(filename.as_str())
+            || uploaded.get("origin").and_then(Value::as_str) != Some("local")
+            || uploaded.get("type").and_then(Value::as_str) != Some("machinecode")
+            || uploaded.get("size").and_then(Value::as_u64) != Some(bytes.len() as u64)
+            || uploaded
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|p| p != filename)
+        {
+            return Err(refuse("Uploaded file validation failed. Inspect the stored name, origin, type, and size before starting."));
+        }
+        target.history = crate::octoprint::history(&uploaded);
+        let live = client.snapshot().await?;
+        crate::octoprint::ready(&live)?;
+        if client.review(&live).await? != target.info {
+            return Err(refuse("OctoPrint machine profile or connection changed during upload. Prepare and review again."));
+        }
+        // Selection does not move the machine. Reconcile it before crossing the start boundary.
+        client
+            .command(
+                &path,
+                serde_json::json!({"command":"select", "print":false}),
+            )
+            .await?;
+        let selected = client.snapshot().await?;
+        crate::octoprint::ready(&selected)?;
+        if selected.printer.job_id.as_deref() != Some(format!("local/{filename}").as_str())
+            || selected
+                .job
+                .pointer("/job/file/path")
+                .and_then(Value::as_str)
+                .is_some_and(|p| p != filename)
+            || selected
+                .job
+                .pointer("/job/file/size")
+                .and_then(Value::as_u64)
+                != Some(bytes.len() as u64)
+        {
+            return Err(refuse("Selected file differs from the reviewed upload. Read status and review selection before starting."));
+        }
+        target.attempted = true;
+        if let Some(path) = &self.store {
+            let bytes = serde_json::to_vec(&*jobs).map_err(|_| Error::Unavailable)?;
+            let temporary = path.with_extension("new");
+            tokio::fs::write(&temporary, bytes)
+                .await
+                .map_err(|_| Error::Unavailable)?;
+            tokio::fs::rename(temporary, path)
+                .await
+                .map_err(|_| Error::Unavailable)?;
+        }
+        let target = jobs.get_mut(id).ok_or(Error::NotFound)?;
+        let reply = client
+            .command("/api/job", serde_json::json!({"command":"start"}))
+            .await;
+        let fresh = self.reconcile_octoprint(target).await;
+        match reply {
+            Err(Error::Unavailable) => return Err(refuse("Start reply was lost. Read status to reconcile the intended file and job. Start will not be repeated.")),
+            other => other?,
+        }
+        fresh?;
+        if target.job.state != JobState::Printing {
+            return Err(refuse(
+                "Start is not confirmed. Read status to reconcile the intended file and job.",
             ));
         }
         Ok(target.job.clone())
@@ -533,6 +796,16 @@ impl Backend for Printers {
             for (index, config) in self.configs.iter().enumerate() {
                 if let Some(client) = self.bambu.get(&config.id).cloned() {
                     tasks.spawn(async move { (index, client.snapshot().await) });
+                } else if let Some(client) = self.octoprint.get(&config.id).cloned() {
+                    tasks.spawn(async move {
+                        (
+                            index,
+                            match client.snapshot().await {
+                                Ok(s) => s.printer,
+                                Err(e) => client.offline(&e),
+                            },
+                        )
+                    });
                 } else if let Some(client) = self.clients.get(index).and_then(Clone::clone) {
                     tasks.spawn(async move {
                         (
@@ -645,28 +918,37 @@ impl Backend for Printers {
                         attempted: false,
                         filename,
                         profiles: self.profiles(printer)?,
+                        history: Value::Null,
+                        cancelling: false,
                     },
                 );
                 return Ok(output.estimate);
             }
-            let client = self.client(printer)?;
-            client.snapshot().await?;
-            let info = self.review_info(client).await?;
-            if info.pointer("/info/mmu").and_then(Value::as_bool) != Some(false) {
-                return Err(refuse("Material slot assignments are not supported yet. Use a commissioned single-material printer."));
-            }
+            let info = if let Some(client) = self.octoprint.get(printer) {
+                let snapshot = client.snapshot().await?;
+                crate::octoprint::ready(&snapshot)?;
+                client.review(&snapshot).await?
+            } else {
+                let client = self.client(printer)?;
+                client.snapshot().await?;
+                let info = self.review_info(client).await?;
+                if info.pointer("/info/mmu").and_then(Value::as_bool) != Some(false) {
+                    return Err(refuse("Material slot assignments are not supported yet. Use a commissioned single-material printer."));
+                }
+                info
+            };
             let slicer = crate::slicer::Slicer::new(
                 self.slicers.get(printer).ok_or(Error::NotFound)?.clone(),
             )
             .map_err(|_| {
-                Error::Failed("Cannot find PrusaSlicer. Set slicer.path to its executable.".into())
+                Error::Failed("Cannot find the slicer. Set slicer.path to its executable.".into())
             })?;
             let output = slicer
                 .prepare(path, profile, &options, crate::slicer::OutputKind::Gcode)
                 .await
                 .map_err(|_| {
                     Error::Failed(
-                        "Cannot slice this job. Check the configured PrusaSlicer profiles.".into(),
+                        "Cannot slice this job. Check the configured slicer profiles.".into(),
                     )
                 })?;
             let bytes = file_bytes(&output.path).await?;
@@ -701,6 +983,8 @@ impl Backend for Printers {
                     attempted: false,
                     filename,
                     profiles: self.profiles(printer)?,
+                    history: Value::Null,
+                    cancelling: false,
                 },
             );
             self.checkpoint(&jobs).await?;
@@ -711,6 +995,9 @@ impl Backend for Printers {
         Box::pin(async move {
             let mut jobs = self.jobs.lock().await;
             let target = jobs.get_mut(id).ok_or(Error::NotFound)?;
+            if self.octoprint.contains_key(&target.job.printer) {
+                return self.start_octoprint(id, &mut jobs).await;
+            }
             if let Some(client) = self.bambu.get(&target.job.printer) {
                 client.check_control()?;
                 if target.attempted || target.job.state != JobState::Ready {
@@ -878,6 +1165,9 @@ impl Backend for Printers {
                 target.job.state = JobState::Cancelled;
                 return Ok(target.job.clone());
             }
+            if self.octoprint.contains_key(&target.job.printer) {
+                return self.octoprint_control(target, "cancel").await;
+            }
             self.control_job(target, "cancel").await
         })
     }
@@ -894,6 +1184,8 @@ impl Backend for Printers {
             if target.attempted {
                 if self.bambu.contains_key(&target.job.printer) {
                     self.reconcile_bambu(target).await?;
+                } else if self.octoprint.contains_key(&target.job.printer) {
+                    self.reconcile_octoprint(target).await?;
                 } else {
                     self.reconcile(target).await?;
                 }

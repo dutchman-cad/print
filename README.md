@@ -3,7 +3,7 @@
 Dutchman Print is a local companion that prepares and sends print jobs from
 [SolidCraft](https://github.com/tangency-labs/solidcraft) through an open job API.
 It slices with your own PrusaSlicer or OrcaSlicer, installed separately. Backends include
-simulated printers, PrusaLink, and Bambu Lab LAN monitoring.
+simulated printers, PrusaLink, OctoPrint, and Bambu Lab LAN control.
 
 Not released yet. Tested against simulated printers.
 

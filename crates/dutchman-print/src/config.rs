@@ -141,13 +141,18 @@ impl Config {
                     Some("prusalink") => {
                         crate::prusalink::validate(printer)?;
                     }
+                    Some("octoprint") => crate::octoprint::validate(printer)?,
                     Some("bambu") => {
                         crate::bambu::validate_enrollment(
                             printer,
                             enrollment == Some(printer.id.as_str()),
                         )?;
                     }
-                    _ => return Err("Set each printer kind to prusalink or bambu.".into()),
+                    _ => {
+                        return Err(
+                            "Set each printer kind to prusalink, octoprint, or bambu.".into()
+                        )
+                    }
                 }
                 if [
                     &printer.printer_profile,
