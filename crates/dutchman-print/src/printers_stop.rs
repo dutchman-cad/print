@@ -78,6 +78,9 @@ impl Printers {
             self.stop_duet(client, identity, name).await?;
             return self.printer(printer).await;
         }
+        if self.repetier.contains_key(printer) {
+            return Err(refuse(crate::repetier::STOP));
+        }
         if let Some(client) = self.sdcp.get(printer) {
             client.stop(identity, name).await?;
             return self.printer(printer).await;
@@ -262,6 +265,11 @@ impl Printers {
                 }
                 client.delete(&staged).await
             } else if let Some(client) = self.duet.get(&target.job.printer) {
+                if staged != target.filename {
+                    return Err(Error::Unavailable);
+                }
+                client.delete(&staged).await
+            } else if let Some(client) = self.repetier.get(&target.job.printer) {
                 if staged != target.filename {
                     return Err(Error::Unavailable);
                 }

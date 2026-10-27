@@ -15,8 +15,9 @@ Sections:
 7. [Duet (RepRapFirmware standalone)](#duet-reprapfirmware-standalone)
 8. [Elegoo SDCP: resin and Centauri Carbon](#elegoo-sdcp-resin-and-centauri-carbon)
 9. [Snapmaker 2.0 and J1/Artisan](#snapmaker-20-and-j1artisan)
+10. [Repetier-Server](#repetier-server)
 
-Sections 8 and 9 are only for you if you have that hardware.
+Sections 8 to 10 are only for you if you have that hardware.
 
 ## Before you start
 
@@ -529,3 +530,49 @@ correctly.
 ### Recording
 
 - [ ] Save every read and record the firmware version.
+
+## Repetier-Server
+
+Only for a printer driven by Repetier-Server 2.0. Turn off "Autostart next job" in the
+server's printer settings before any machine action: Stop cannot name a job, so a job the
+server starts by itself at that moment would be stopped.
+
+### Setup
+
+- [ ] Add a `kind = "repetier"` printer as in the [Repetier-Server config](print.md#repetier-server),
+  with `url`, the printer's `slug` from the server, an `api_key` with print, add and delete
+  rights, and `nozzle_diameter` set to the installed nozzle.
+- [ ] Record the Repetier-Server version.
+
+### Read-only checks
+
+- [ ] `dutchman-print printers --json > repetier-01-idle.json` reads `idle`, with nozzle and
+  bed temperatures matching the server's web page.
+- [ ] Use a wrong API key. Pass: an authentication failure. Put it back.
+- [ ] Record whether the key is enough for the server version, printer config and free-space
+  reads. If any read is refused, record which.
+- [ ] Disconnect the printer from the server, read again, and record the `detail`. Pass:
+  `offline`. Record any `online` value other than 0 or 1 you see while it reconnects.
+- [ ] Prepare without starting. Pass: `ready`.
+
+### Machine actions
+
+- [ ] Start a job. Pass: one model named `dutchman-...` appears in the server's model list,
+  one job is queued and then prints, and the printer prints it once.
+- [ ] If Start refuses with a size mismatch, record the model's size as the server shows it
+  and the G-code file's size in bytes. Start refuses whenever these differ.
+- [ ] Record whether queueing the model ever starts a print by itself.
+- [ ] While printing, record the `job_name` and `job_id`, and whether the job stays in the
+  server's job list while printing and after it ends.
+- [ ] Pause from the server's own page, then read. Record what Dutchman shows: there is no
+  paused state in the API, so it is expected to read `printing`. Resume from the server.
+- [ ] Cancel the Dutchman job. Pass: it stops within 25 seconds and reads `cancelled`.
+- [ ] Pause a job from the server page, then cancel it from Dutchman, and record whether it
+  stops.
+- [ ] Staged-model cleanup: the model and queued copy are gone after each Dutchman job ends.
+  If cleanup fails, record the job's `detail`.
+- [ ] Stop on a job started from the server page. Pass: refused, and nothing is sent.
+
+### Recording
+
+- [ ] Save every read and record the server version beside each result.

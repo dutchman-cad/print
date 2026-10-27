@@ -52,8 +52,10 @@ pub struct Printer {
     pub api_key: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
-    /// Commissioned nozzle size for printers that do not report one (Duet).
+    /// Commissioned nozzle size for printers that do not report one (Duet, Repetier-Server).
     pub nozzle_diameter: Option<f64>,
+    /// Repetier-Server printer slug; one server can host several printers.
+    pub slug: Option<String>,
     /// Elegoo SDCP protocol profile: `centauri` or `resin`.
     pub profile: Option<String>,
     /// Elegoo SDCP MainboardID; reports from another mainboard are refused.
@@ -152,6 +154,7 @@ impl Config {
                     Some("octoprint") => crate::octoprint::validate(printer)?,
                     Some("moonraker" | "snapmaker-u1") => crate::moonraker::validate(printer)?,
                     Some("duet") => crate::duet::validate(printer)?,
+                    Some("repetier") => crate::repetier::validate(printer)?,
                     Some("elegoo-sdcp") => crate::elegoo_sdcp::validate(printer)?,
                     Some("snapmaker-2" | "snapmaker-j1") => crate::snapmaker::validate(printer)?,
                     Some("bambu") => {
@@ -161,12 +164,21 @@ impl Config {
                         )?;
                     }
                     _ => return Err(
-                        "Set each printer kind to prusalink, octoprint, moonraker, snapmaker-u1, snapmaker-2, snapmaker-j1, duet, bambu, or elegoo-sdcp."
+                        "Set each printer kind to prusalink, octoprint, moonraker, snapmaker-u1, snapmaker-2, snapmaker-j1, duet, repetier, bambu, or elegoo-sdcp."
                             .into(),
                     ),
                 }
-                if printer.nozzle_diameter.is_some() && printer.kind.as_deref() != Some("duet") {
-                    return Err("Set nozzle_diameter only for Duet printers.".into());
+                let repetier = printer.kind.as_deref() == Some("repetier");
+                if printer.nozzle_diameter.is_some()
+                    && !repetier
+                    && printer.kind.as_deref() != Some("duet")
+                {
+                    return Err(
+                        "Set nozzle_diameter only for Duet and Repetier-Server printers.".into(),
+                    );
+                }
+                if printer.slug.is_some() && !repetier {
+                    return Err("Set slug only for Repetier-Server printers.".into());
                 }
                 let sdcp = printer.kind.as_deref() == Some("elegoo-sdcp");
                 if !sdcp && (printer.profile.is_some() || printer.mainboard_id.is_some()) {

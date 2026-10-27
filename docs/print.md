@@ -4,7 +4,7 @@ Dutchman Print is a local print companion for SolidCraft and a standalone comman
 A backend prepares 3MF files, estimates jobs, and controls printers. The included
 `simulated` backend is a demo: it contacts no printers and can optionally run a local slicer.
 The `printers` backend supports individually configured local PrusaLink, OctoPrint, Moonraker (Klipper),
-Snapmaker U1, Duet (RepRapFirmware standalone), and Bambu printers, and monitors Elegoo printers
+Snapmaker U1, Duet (RepRapFirmware standalone), Repetier-Server, and Bambu printers, and monitors Elegoo printers
 that speak SDCP and Snapmaker 2.0, J1, and Artisan printers.
 
 Build `dutchman-print` from this checkout with Rust 1.88 or newer:
@@ -87,7 +87,7 @@ Configure slicers with `[slicers.<name>]` tables, each containing `kind`, option
 optional `datadir`, and `timeout_seconds`. Set each printer's `slicer = "<name>"` to choose
 one. Without a name, Dutchman selects the only slicer of the required kind: PrusaLink needs
 `prusaslicer`, Bambu needs `orcaslicer`. Missing or ambiguous choices are refused.
-OctoPrint, Moonraker, Snapmaker U1, and Duet accept either kind; select a named slicer when more than one is configured.
+OctoPrint, Moonraker, Snapmaker U1, Duet, and Repetier-Server accept either kind; select a named slicer when more than one is configured.
 The simulator with `slice = true` uses the same per-printer selection; a simulated printer
 without a kind can use the only configured slicer, or select one explicitly.
 `[slicer]` remains a single-slicer shorthand; it cannot be combined with named slicers,
@@ -959,8 +959,8 @@ reports that in `detail` as an offline state. Close other clients or wait for th
 sessions to expire. See [HTTP requests](https://github.com/Duet3D/RepRapFirmware/wiki/HTTP-requests).
 
 The object model does not report a nozzle diameter. Set `nozzle_diameter` to the installed
-nozzle after checking it, in millimetres, greater than 0 and at most 10. Only Duet
-printers accept it. Preparation, challenge review, and upload refuse a missing value, and the sliced
+nozzle after checking it, in millimetres, greater than 0 and at most 10. Only Duet and
+Repetier-Server printers accept it. Preparation, challenge review, and upload refuse a missing value, and the sliced
 `nozzle_diameter` must match it; mismatches name both values, with no override. This checks
 configuration, not the physical nozzle. Commission the profiles for the actual model, build
 volume, tooling, material, and plate. Only one tool with one extruder and one heater is
@@ -1026,6 +1026,146 @@ never removed.
 Testing uses synthetic responses on test-owned loopback servers. Session handling, path
 spelling in `job.file.fileName`, delete replies for missing files, and macro behaviour still
 need checking on a real board before relying on control.
+
+## Repetier-Server
+
+`kind = "repetier"` talks to a [Repetier-Server](https://www.repetier-server.com/) installation,
+a host program that runs one or more printers. Repetier-Server 2.0 is the final release: the
+vendor has [ended development](https://www.repetier-server.com/the-end-of-repetier-server-development/),
+made 2.0 free, and publishes no further fixes or compatibility updates. Configure the server
+address explicitly; there is no discovery. HTTP and HTTPS are accepted, including a reverse
+proxy base path. HTTPS uses system certificate trust and checks the configured hostname;
+redirects and certificate exceptions are refused. Keep HTTP on a trusted local network.
+
+```toml
+[backend]
+kind = "printers"
+
+[slicer]
+kind = "prusaslicer" # or "orcaslicer"; use named slicers for multiple choices
+
+[[printers]]
+kind = "repetier"
+id = "bench"
+name = "Workbench printer"
+model = "Commissioned printer"
+url = "http://repetier.local:3344"
+api_key = "REPLACE_WITH_THE_REPETIER_SERVER_API_KEY"
+slug = "Workbench" # the printer's slug in Repetier-Server
+nozzle_diameter = 0.4 # millimetres; the installed nozzle
+printer_profile = "Commissioned machine"
+print_profile = "Reviewed print settings"
+filament_profile = "Loaded material"
+```
+
+The server listens on port 3344 unless its configuration changes that. One server can host
+several printers, so `slug` names the one this entry controls: 1–64 letters, digits, hyphens,
+or underscores, as shown in Repetier-Server's printer settings. Only Repetier-Server printers
+accept `slug`. Use a user's API key from **User Profiles** to give Print only that user's
+rights, or the global key in **Global Settings → Connectivity**. The key is sent only as the
+`x-api-key` header, never in a URL, because the manual warns that proxies may store keys
+given as the `apikey` parameter. It never appears in reports, logs, or errors. Print needs
+the printing, adding files, and deleting files permissions.
+
+Every request uses the manual's [API](https://www.repetier-server.com/manuals/programming/API/index.html):
+websocket commands are sent through its REST form, `/printer/api/<slug>?a=<command>&data=<json>`,
+and uploads go to `/printer/model/<slug>`. No websocket is opened, so no session or ping is
+needed and server events are not received.
+
+### Status
+
+Status reads `listPrinter`, `stateList`, and `listJobs` within four seconds. The entry whose
+`slug` matches maps as follows; `detail` keeps the value shown:
+
+| `listPrinter` entry | State | `detail` |
+|---|---|---|
+| `online` 0, `active` false | offline | `deactivated` |
+| `online` 0 | offline | `offline` |
+| `online` 1, `active` true, `job` `none` | idle | `online, no job` |
+| `online` 1, `active` true, `job` naming a job | printing | `online, job active` |
+| anything else | error | the raw `online`, `active`, and `job` values |
+| no entry with the slug | error | asks you to check `slug` |
+
+The manual shows only `none` for `job` and lists no state values, so nothing else is
+inferred. Repetier-Server reports no paused state over this interface: a paused job still
+shows as printing. Only idle permits Start. `job_name` is the live `job` value, and `job_id`
+is the id of the queued job with that name in `listJobs`, when exactly one has it. The manual
+does not give units for `printTime` or say what `printedTimeComp` measures, so `progress` and
+`seconds_left` are omitted. The nozzle temperature is `tempRead` of the extruder numbered
+`activeExtruder` in `stateList`, and the bed temperature `heatedBed.tempRead`. Target
+temperatures (`tempSet`) are not reported, since the job API has no field for them. An
+authentication error reply reports offline with an authentication `detail`.
+
+### Preparation and Start
+
+Repetier-Server does not report a nozzle diameter. Set `nozzle_diameter` to the installed
+nozzle after checking it, in millimetres, greater than 0 and at most 10. Preparation,
+challenge review, and upload refuse a missing value, and the sliced `nozzle_diameter` must
+match it; mismatches name both values, with no override. Preparation slices locally to text
+G-code and reads the server `version` and the printer's `getPrinterConfig`: firmware name,
+printer name and variant, heated bed, axis limits, and extruders. Only a printer configured
+with one extruder is supported. Changes to these, or to the input, G-code, or profiles,
+require new preparation and review. Acknowledge the bed through a clear challenge and the API
+clear route in the running server, then request a separate Start challenge. Clearance follows
+the shared policy; polling also withdraws it when the state, the live job name, or its id
+changes. Activity between polls that leaves all three unchanged cannot be detected.
+
+Start checks fresh idle status and the review, refuses a staging name already present in
+`listModels` or `listJobs`, and asks `canUploadGCodeWithSize` for free space. It uploads the
+reviewed G-code as multipart field `filename` to `/printer/model/<slug>?a=upload&name=<name>`,
+where the name is unique to the job, under the shared 30-second transport idle timeout. The
+manual does not describe the upload reply, so success is HTTP 200 without an `error`, and
+`listModels` must then list exactly one model with that name and the reviewed size as
+`length`. A failed or uncertain upload or a failed check removes the staged model with
+`removeModel` and confirms through `listModels` that it is gone before returning an error;
+nothing is queued or started. If cleanup cannot be confirmed, inspect the model list and
+remove the model before preparing again.
+
+`copyModel` takes a flag to start the print, so the attempt is saved durably before it is
+sent, once, with `autostart` false. The queued job is found in `listJobs` by its unique
+name; if it cannot be found, the outcome is reported as unconfirmed and nothing more is
+sent. If the printer is still idle, `startJob` is sent once with the queued job's id. A lost
+reply is reconciled from status and never causes a second Start. Start waits up to 25
+seconds for the printer to report the job; pending is announced on stderr, and expiry leaves
+an unconfirmed outcome to reconcile from fresh status. A server that starts the queued job
+by itself is waited for and never sent `startJob`.
+
+### Cancel, Stop, pause, and resume
+
+Cancel and printer Stop send `stopJob` once, only while the live `job` is the unique name of
+the job this companion started, and wait up to 25 seconds for the printer to stop reporting
+it. `stopJob` takes no job id and stops whatever runs on the printer, so Stop is refused for
+work started elsewhere; stop it in Repetier-Server. The live name is checked just before the
+command, but a job the server starts in the moment between that check and `stopJob` would be
+stopped instead; keep the server's automatic start of the next queued job off for printers
+used with Print. A job that was queued but never ran, for example after a refused `startJob`,
+is cancelled with `removeJob`, which the manual allows only for a job that is not printing,
+and confirmed through `listJobs`.
+
+The manual documents no pause command, and Repetier-Server reports no paused state, so
+pause is refused and resume is never offered: a paused job could not be told apart from a
+running one. Pause and resume jobs in Repetier-Server; `continueJob` is not sent.
+
+Repetier-Server reports how a job ended only through websocket events, which Print does not
+receive. A tracked job becomes `cancelled` when this companion stopped it and `ended`
+(outcome unknown) when it no longer runs after being seen running. Its staged model, and any
+queued copy, are then removed with `removeModel` and `removeJob` once the printer is idle and
+confirmed gone through the lists; external files are never removed.
+
+### What needs a real server
+
+Testing uses a simulated server on a test-owned loopback socket. Before relying on control,
+check on a real Repetier-Server 2.0:
+
+- the REST form's reply for each command, especially whether it is the websocket `data`
+  payload unwrapped, and the reply to an upload;
+- what `listPrinter` `job` holds while a job runs or is paused, and whether it is the name
+  given at upload, with or without the `.gcode` extension (both are matched);
+- whether `listModels` `length` is the stored size in bytes;
+- whether `copyModel` with `autostart` false ever starts a job, on 2.0 and on servers older
+  than 0.93, which do not document the flag;
+- whether a queued job stays in `listJobs` while printing and after it ends;
+- whether `stopJob` also stops a paused job, and how `removeJob` replies for a printing job.
 
 ## Elegoo (SDCP)
 
@@ -1331,6 +1471,10 @@ Snapmaker 2.0, J1, and Artisan printers refuse Stop. See
 Duet Stop addresses the live file path: a running job is paused with `M25`, the pause is
 confirmed, and then `M0` is sent. Stop is confirmed when the printer is idle with that file
 reported as the last one processed.
+
+Repetier-Server Stop is available only for the live job this companion started, because
+`stopJob` names no job; it is refused for work started elsewhere. See
+[Repetier-Server](#repetier-server).
 
 Bambu commands use the existing monitoring MQTT connection and match replies by sequence
 number. Reconnect never replays a command. Upload is refused when telemetry reports no SD
