@@ -12,7 +12,7 @@ publish = false
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "multipart", "query"] }
 clap = { workspace = true, features = ["env"] }
-dutchman-serve = { path = "../dutchman-serve" }
+dutchman-serve = { git = "https://github.com/dutchman-cad/dutchman", rev = "670a97876eaf3d7b137db7b38dc67567cf85b0f3" }
 zip.workspace = true
 http-body-util = "0.1"
 base64 = "0.22"

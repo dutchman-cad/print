@@ -1,0 +1,6 @@
+Dutchman Print
+Copyright 2026 Dutchman contributors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Printer backends are written from public protocol documentation. No printer server or client implementation code is included.

@@ -8,10 +8,10 @@ The `printers` backend supports individually configured local PrusaLink and Bamb
 Build `dutchman-print` from this checkout with Rust 1.88 or newer:
 
 ```sh
-cargo build -p dutchman-print
+cargo build --locked -p dutchman-print
 ```
 
-It is not included in release archives or the Docker image yet. Put the executable beside
+It is not released yet; testing uses simulated printers. Put the executable beside
 `dutchman` or on `PATH` to use `dutchman printers` and `dutchman print`.
 
 ## Config
@@ -276,7 +276,7 @@ writes a timestamp, printer ID, job ID, and action to stderr; header values are 
   CLI snapshots are separate from service jobs.
 
 Backend authors implement the asynchronous `backend::Backend` trait in
-`crates/dutchman-print/src/backend.rs`. Slicing belongs inside `prepare`, which receives the
+[`crates/dutchman-print/src/backend.rs`](../crates/dutchman-print/src/backend.rs). Slicing belongs inside `prepare`, which receives the
 job ID, private 3MF path, printer ID, and profile names. Typed errors distinguish not found,
 busy, refused with a message, unavailable/offline, and failed. The simulated implementation
 accepts a clock so lifecycle tests can advance time without sleeping.
@@ -309,7 +309,7 @@ and the CLI launchers above. It requires Linux system Flatpaks at
 
 ```sh
 mkdir -p "$HOME/Documents/diag-print-lead/slicer/tmp"
-DUTCHMAN_PRINT_REAL_SLICER=prusaslicer buildq run dutchman /path/to/dutchman -- \
+DUTCHMAN_PRINT_REAL_SLICER=prusaslicer buildq run dutchman /path/to/print -- \
   cargo --config 'env.TMPDIR="/absolute/home/path/Documents/diag-print-lead/slicer/tmp"' \
   test -p dutchman-print --locked -- --ignored real_slicer --nocapture
 ```
