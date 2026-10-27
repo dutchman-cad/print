@@ -8,7 +8,7 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use serde_json::{Map, Value};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 use tokio::time::Instant;
 
 const FRESH: Duration = Duration::from_secs(30);
@@ -392,6 +392,34 @@ impl Telemetry {
                     .insert("external_tray".into(), material(tray.get("tray_type")));
             }
         }
+        if let Some(extruder) = print.get("device").and_then(|d| d.get("extruder")) {
+            if !print.contains_key("nozzle_temper") {
+                self.fields.remove("nozzle_temper");
+            }
+            if let Some(info) = extruder
+                .get("info")
+                .and_then(Value::as_array)
+                .filter(|a| a.len() <= 2)
+            {
+                for item in info {
+                    if let Some(id) = item.get("id").and_then(Value::as_u64).filter(|id| *id < 2) {
+                        let key = format!("nozzle_temperature_{id}");
+                        if let Some(temp) = item
+                            .get("temp")
+                            .and_then(Value::as_u64)
+                            .filter(|t| *t <= u64::from(u32::MAX))
+                        {
+                            self.fields.insert(key, serde_json::json!(temp & 0xffff));
+                        } else {
+                            self.fields.remove(&key);
+                        }
+                    }
+                }
+            } else {
+                self.fields.remove("nozzle_temperature_0");
+                self.fields.remove("nozzle_temperature_1");
+            }
+        }
         // Only retain known scalar telemetry. Unknown nested data cannot grow the cache.
 
         for key in [
@@ -399,6 +427,8 @@ impl Telemetry {
             "mc_percent",
             "mc_remaining_time",
             "nozzle_temper",
+            "stg_cur",
+            "sdcard",
             "bed_temper",
             "subtask_name",
             "gcode_start_time",
@@ -408,7 +438,8 @@ impl Telemetry {
             "nozzle_type",
         ] {
             if let Some(v) = print.get(key) {
-                if v.is_number()
+                if v.is_boolean()
+                    || v.is_number()
                     || v.is_null()
                     || v.as_str()
                         .is_some_and(|s| s.len() <= 256 && !s.chars().any(char::is_control))
@@ -483,10 +514,64 @@ impl Telemetry {
             }
         };
         let mut detail = detail.to_owned();
+        if live
+            && matches!(
+                self.fields.get("gcode_state").and_then(Value::as_str),
+                Some("PREPARE" | "RUNNING")
+            )
+        {
+            if let Some(stage) = self.fields.get("stg_cur").and_then(Value::as_i64) {
+                let label = match stage {
+                    1 => "Bed leveling",
+                    2 => "Heating bed",
+                    3 => "XY vibration calibration",
+                    4 => "Changing filament",
+                    5 => "G-code pause",
+                    6 => "Filament runout",
+                    7 => "Heating nozzle",
+                    8 => "Extrusion calibration",
+                    9 => "Scanning bed",
+                    10 => "First layer inspection",
+                    11 => "Identifying plate",
+                    12 | 18 => "Lidar calibration",
+                    13 => "Homing",
+                    14 => "Cleaning nozzle",
+                    15 => "Checking temperatures",
+                    16 => "User pause",
+                    17 => "Front cover open",
+                    19 => "Flow calibration",
+                    20 => "Nozzle temperature fault",
+                    21 => "Bed temperature fault",
+                    _ => "",
+                };
+                if label.is_empty() {
+                    detail.push_str(&format!("; Stage {stage}"));
+                } else {
+                    detail.push_str(&format!("; {label}"));
+                }
+            }
+        }
+        if live
+            && self
+                .fields
+                .get("nozzle_temper")
+                .and_then(Value::as_f64)
+                .is_none()
+        {
+            for id in 0..2 {
+                if let Some(temp) = self
+                    .fields
+                    .get(&format!("nozzle_temperature_{id}"))
+                    .and_then(Value::as_u64)
+                {
+                    detail.push_str(&format!("; Nozzle {id}: {temp} °C"));
+                }
+            }
+        }
         if live {
             let alerts = self.hms_detail();
             if !alerts.is_empty() {
-                if detail == "PAUSE" {
+                if state == PrinterState::Attention {
                     detail.push_str("; Needs attention");
                 }
                 detail.push_str("; ");
@@ -510,6 +595,7 @@ impl Telemetry {
             state,
             detail: Some(detail),
             needs_clearing: Some(self.terminal),
+            job_path: None,
             job_id: if live {
                 let name = self
                     .fields
@@ -550,15 +636,26 @@ impl Telemetry {
             } else {
                 None
             },
-            nozzle_temperature: number("nozzle_temper"),
+            nozzle_temperature: number("nozzle_temper")
+                .or_else(|| number("nozzle_temperature_0"))
+                .or_else(|| number("nozzle_temperature_1")),
             bed_temperature: number("bed_temper"),
         }
     }
 }
 
+struct CommandRequest {
+    payload: Value,
+    identity: Option<String>,
+    name: String,
+    sent: oneshot::Sender<Result<(), Error>>,
+}
 pub struct Client {
     config: crate::config::Printer,
     options: MqttOptions,
+    commands: mpsc::Sender<CommandRequest>,
+    command_rx: Mutex<Option<mpsc::Receiver<CommandRequest>>>,
+    reports: broadcast::Sender<Value>,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     state: watch::Sender<Telemetry>,
     oneshot: bool,
@@ -574,10 +671,30 @@ impl Drop for Client {
     }
 }
 impl Client {
+    pub(crate) async fn delete(&self, filename: &str) -> Result<(), Error> {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            ftps::delete(&self.config, filename),
+        )
+        .await
+        .map_err(|_| Error::Unavailable)?
+    }
     /// Stages bytes without starting a print, after a read-only readiness check.
     pub async fn upload(&self, filename: &str, bytes: &[u8]) -> Result<(), Error> {
         self.check_control()?;
         self.check_materials(bytes).await?;
+        if self
+            .state
+            .borrow()
+            .fields
+            .get("sdcard")
+            .and_then(Value::as_bool)
+            == Some(false)
+        {
+            return Err(Error::Refused(
+                "No SD card is present. Insert a card before uploading.".into(),
+            ));
+        }
         ftps::upload(&self.config, filename, bytes).await
     }
 
@@ -626,7 +743,7 @@ impl Client {
         Ok(())
     }
 
-    /// A command connection is discarded after any transport error, with no reconnect or retry.
+    /// Publish once on the monitoring connection; reconnect never replays commands.
     pub async fn command(
         &self,
         mut payload: Value,
@@ -653,48 +770,76 @@ impl Client {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let serial = self.config.serial.as_deref().unwrap_or_default();
-        let mut options = self.options.clone();
-        options.set_client_id(format!(
-            "control-{}",
-            crate::new_job_id().map_err(Error::Failed)?
-        ));
-        let (client, mut events) = AsyncClient::new(options, 8);
+        let mut reports = self.reports.subscribe();
         let mut telemetry = self.state.borrow().clone();
         telemetry.state_received = None;
         if command == "project_file" {
             telemetry.job_received = None;
         }
+        let (sent, received) = oneshot::channel();
+        self.commands
+            .try_send(CommandRequest {
+                payload,
+                identity: identity.map(str::to_owned),
+                name: name.into(),
+                sent,
+            })
+            .map_err(|_| Error::Unavailable)?;
         let operation = async {
-            let mut sent = false;
+            received.await.map_err(|_| Error::Unavailable)??;
+            if expected != "FAILED" {
+                guard.take();
+            }
+            let mut accepted = false;
             loop {
-                match events.poll().await.map_err(|_| Error::Refused("Command reply was lost. Read status to reconcile the job; do not repeat Start.".into()))? {
-                    Event::Incoming(Incoming::ConnAck(_)) => client.subscribe(format!("device/{serial}/report"), QoS::AtMostOnce).await.map_err(|_| Error::Unavailable)?,
-                    Event::Incoming(Incoming::SubAck(_)) if !sent => {
-                        sent = true;
-                        client.publish(format!("device/{serial}/request"), QoS::AtLeastOnce, false, payload.to_string()).await.map_err(|_| Error::Unavailable)?;
-                    }
-                    // Keep Stop serialized through its outcome; other commands allow Stop to overtake their wait.
-                    Event::Outgoing(rumqttc::Outgoing::Publish(_)) if sent && expected != "FAILED" => { guard.take(); }
-                    Event::Incoming(Incoming::Publish(p)) if sent && !p.retain && p.topic == format!("device/{serial}/report") => {
-                        let value: Value = serde_json::from_slice(&p.payload).unwrap_or(Value::Null);
-                        if value.pointer("/print/sequence_id").and_then(Value::as_str) == Some(&sequence)
-                            && value.pointer("/print/command").and_then(Value::as_str) == Some(&command)
-                            && value.pointer("/print/result").and_then(Value::as_str).is_some_and(|s| !s.eq_ignore_ascii_case("success")) {
+                let value = reports.recv().await.map_err(|_| Error::Refused("Command reply was lost. Read status to reconcile the job; do not repeat Start.".into()))?;
+                if value.is_null() {
+                    return Err(Error::Refused(
+                        "Command connection was lost. Read fresh status; do not repeat Start."
+                            .into(),
+                    ));
+                }
+                if value.pointer("/print/sequence_id").and_then(Value::as_str) == Some(&sequence)
+                    && value
+                        .pointer("/print/command")
+                        .and_then(Value::as_str)
+                        .is_none_or(|c| c == command)
+                {
+                    if let Some(result) = value.pointer("/print/result").and_then(Value::as_str) {
+                        if !result.eq_ignore_ascii_case("success") {
                             return Err(Error::Refused("Bambu rejected the command. Check authorization and LAN/Developer Mode, then read status.".into()));
                         }
-                        telemetry.report(&p.payload);
-                        if telemetry.state_received.is_some() && telemetry.job_received.is_some()
-                            && telemetry.printer(&self.config, self.fresh).job_id.as_deref().is_some_and(|id| identity.is_none_or(|expected| id == expected))
-                            && (expected == "FAILED" || (!telemetry.active_error() && telemetry.fields.get("print_error").and_then(Value::as_u64).is_some()))
-                            && telemetry.fields.get("subtask_name").and_then(Value::as_str) == Some(name)
-                            && telemetry.fields.get("gcode_state").and_then(Value::as_str).is_some_and(|s| s == expected || s == "FAILED" || (expected == "RUNNING" && s == "PREPARE")) {
-                            telemetry.terminal |= self.state.borrow().terminal;
-                            self.state.send_replace(telemetry);
-                            return Ok(());
-                        }
+                        accepted = true;
                     }
-                    _ => (),
+                }
+                telemetry.report(value.to_string().as_bytes());
+                if accepted
+                    && telemetry.state_received.is_some()
+                    && telemetry.job_received.is_some()
+                    && telemetry
+                        .printer(&self.config, self.fresh)
+                        .job_id
+                        .as_deref()
+                        .is_some_and(|id| identity.is_none_or(|expected| id == expected))
+                    && (expected == "FAILED"
+                        || (!telemetry.active_error()
+                            && telemetry
+                                .fields
+                                .get("print_error")
+                                .and_then(Value::as_u64)
+                                .is_some()))
+                    && telemetry.fields.get("subtask_name").and_then(Value::as_str) == Some(name)
+                    && telemetry
+                        .fields
+                        .get("gcode_state")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| {
+                            s == expected
+                                || s == "FAILED"
+                                || (expected == "RUNNING" && s == "PREPARE")
+                        })
+                {
+                    return Ok(());
                 }
             }
         };
@@ -722,9 +867,14 @@ impl Client {
         options.set_keep_alive(Duration::from_secs(10));
         options.set_max_packet_size(1 << 20, 4096);
         let (state, _) = watch::channel(Telemetry::default());
+        let (commands, command_rx) = mpsc::channel(8);
+        let (reports, _) = broadcast::channel(64);
         Ok(Self {
             config,
             options,
+            commands,
+            command_rx: Mutex::new(Some(command_rx)),
+            reports,
             worker: Mutex::new(None),
             state,
             oneshot,
@@ -749,8 +899,12 @@ impl Client {
             let serial = self.config.serial.clone().unwrap_or_default();
             let oneshot = self.oneshot;
             let pacing = self.pacing;
+            let Some(commands) = self.command_rx.lock().await.take() else {
+                return rx.borrow().printer(&self.config, self.fresh);
+            };
+            let reports = self.reports.clone();
             *worker = Some(tokio::spawn(async move {
-                monitor(options, serial, tx, oneshot, pacing).await;
+                monitor(options, serial, tx, oneshot, pacing, commands, reports).await;
             }));
         }
         drop(worker);
@@ -800,6 +954,8 @@ async fn monitor(
     tx: watch::Sender<Telemetry>,
     oneshot: bool,
     pacing: Duration,
+    mut commands: mpsc::Receiver<CommandRequest>,
+    reports: broadcast::Sender<Value>,
 ) {
     let report = format!("device/{serial}/report");
     let request = format!("device/{serial}/request");
@@ -814,10 +970,29 @@ async fn monitor(
         state.connected = false;
         state.received = None;
         let mut due = None;
+        let mut subscribed = false;
+        let mut transmitting: Option<oneshot::Sender<Result<(), Error>>> = None;
         tx.send_replace(state.clone());
         loop {
             let event = tokio::select! {
                 event = events.poll() => event,
+                Some(command) = commands.recv(), if transmitting.is_none() => {
+                    if command.sent.is_closed() { continue; }
+                    let current = tx.borrow().clone();
+                    let valid = subscribed && current.connected && current.received.is_some_and(|t| t.elapsed() < FRESH)
+                        && command.identity.as_deref().is_none_or(|identity| {
+                            let start = current.fields.get("gcode_start_time").and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+                            current.fields.get("subtask_name").and_then(Value::as_str) == Some(command.name.as_str())
+                                && start.is_some_and(|start| start > 0 && format!("{}:{start}", command.name) == identity)
+                                && !matches!(current.fields.get("gcode_state").and_then(Value::as_str), Some("IDLE" | "FINISH" | "FAILED"))
+                        });
+                    if !valid { let _ = command.sent.send(Err(Error::Refused("Live Bambu execution changed or telemetry is unavailable. Read fresh status and confirm again.".into()))); continue; }
+                    if client.publish(&request, QoS::AtLeastOnce, false, command.payload.to_string()).await.is_err() {
+                        let _ = command.sent.send(Err(Error::Unavailable)); break;
+                    }
+                    transmitting = Some(command.sent);
+                    continue;
+                },
                 () = async { match due { Some(t) => tokio::time::sleep_until(t).await, None => std::future::pending().await } } => {
                     let payload = serde_json::json!({"pushing":{"command":"pushall","sequence_id":"0","version":1,"push_target":1}}).to_string();
                     if client.publish(&request, QoS::AtMostOnce, false, payload).await.is_err() { break; }
@@ -834,6 +1009,7 @@ async fn monitor(
                     }
                 }
                 Ok(Event::Incoming(Incoming::SubAck(_))) => {
+                    subscribed = true;
                     // Reconnect storms must not flood P1 printers with full-state requests.
                     due = Some(
                         last_request
@@ -865,11 +1041,18 @@ async fn monitor(
                     } else {
                         tx.send_replace(state.clone());
                     }
+                    let value = serde_json::from_slice(&p.payload).unwrap_or(Value::Null);
+                    let _ = reports.send(value);
                 }
                 Ok(Event::Incoming(_)) => {
                     state.terminal = tx.borrow().terminal;
                     state.received = Some(Instant::now());
                     tx.send_replace(state.clone());
+                }
+                Ok(Event::Outgoing(rumqttc::Outgoing::Publish(_))) => {
+                    if let Some(sent) = transmitting.take() {
+                        let _ = sent.send(Ok(()));
+                    }
                 }
                 Ok(_) => (),
                 Err(error) => {
@@ -892,6 +1075,10 @@ async fn monitor(
                     break;
                 }
             }
+        }
+        let _ = reports.send(Value::Null);
+        while let Ok(command) = commands.try_recv() {
+            let _ = command.sent.send(Err(Error::Unavailable));
         }
         // A reconnect must revoke bed clearance even if it happens between safety polls.
         tx.send_modify(|s| {

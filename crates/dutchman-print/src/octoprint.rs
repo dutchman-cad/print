@@ -417,6 +417,16 @@ impl Client {
             .filter(|s| s.len() <= 256 && !s.chars().any(char::is_control))
             .map(str::to_owned);
         printer.job_id = file_identity(&job);
+        printer.job_path = job
+            .pointer("/job/file/path")
+            .and_then(Value::as_str)
+            .filter(|path| {
+                !path.is_empty()
+                    && path.len() <= 1024
+                    && !path.chars().any(char::is_control)
+                    && !path.split('/').any(|part| matches!(part, "" | "." | ".."))
+            })
+            .map(str::to_owned);
         printer.progress = job
             .pointer("/progress/completion")
             .and_then(Value::as_f64)
@@ -467,6 +477,7 @@ impl Client {
                 .into(),
             ),
             needs_clearing: None,
+            job_path: None,
             job_id: None,
             job_name: None,
             progress: None,

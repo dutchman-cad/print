@@ -303,6 +303,27 @@ async fn job_outcomes_are_distinct_and_idle_is_not_success() {
         }
         assert_eq!(b.job("one").await.unwrap().state, expected);
         assert_eq!(b.printers().await.unwrap()[0].needs_clearing, Some(true));
+        if expected != JobState::Printing {
+            if state == "error" {
+                f.shared.machine.lock().await.state = "standby".into();
+                assert_eq!(b.job("one").await.unwrap().state, expected);
+            }
+            assert!(f.shared.machine.lock().await.bytes.is_empty());
+            assert_eq!(
+                f.shared
+                    .machine
+                    .lock()
+                    .await
+                    .records
+                    .iter()
+                    .filter(|(method, path, _)| method == "DELETE"
+                        && path.starts_with("/server/files/gcodes/dutchman-"))
+                    .count(),
+                1
+            );
+        } else {
+            assert!(!f.shared.machine.lock().await.bytes.is_empty());
+        }
     }
 }
 #[tokio::test]
@@ -972,10 +993,21 @@ async fn independent_printers_and_stop_during_start_poll() {
                 .review_action("cancel", "other", Some("two"))
                 .await
                 .unwrap();
+            let live = backend.printer("other").await.unwrap();
             assert_eq!(
-                backend.cancel("two").await.unwrap().state,
-                JobState::Cancelled
+                backend
+                    .stop(
+                        "other",
+                        live.job_id.as_deref().unwrap(),
+                        live.job_name.as_deref().unwrap(),
+                        live.job_path.as_deref()
+                    )
+                    .await
+                    .unwrap()
+                    .state,
+                PrinterState::Idle
             );
+            assert_eq!(backend.job("two").await.unwrap().state, JobState::Cancelled);
         })
         .await
         .unwrap();
@@ -1041,13 +1073,22 @@ async fn stop_overtakes_pause_and_resume_polls() {
             .await
             .unwrap();
         assert!(!command.is_finished());
+        let live = backend.printer("test").await.unwrap();
         assert_eq!(
-            timeout(Duration::from_secs(2), backend.cancel("one"))
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            JobState::Cancelled
+            timeout(
+                Duration::from_secs(2),
+                backend.stop(
+                    "test",
+                    live.job_id.as_deref().unwrap(),
+                    live.job_name.as_deref().unwrap(),
+                    live.job_path.as_deref(),
+                )
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+            PrinterState::Idle
         );
         assert_eq!(
             timeout(Duration::from_secs(2), command)
@@ -1058,5 +1099,92 @@ async fn stop_overtakes_pause_and_resume_polls() {
                 .state,
             JobState::Cancelled
         );
+    }
+}
+
+#[tokio::test]
+async fn printer_stop_external_history_execution_leaves_its_file() {
+    let f = Fake::new().await;
+    let b = Safety::new(Arc::new(Printers::new(f.config()).unwrap()));
+    {
+        let mut m = f.shared.machine.lock().await;
+        m.name = "external.gcode".into();
+        m.id = Some("E123".into());
+        m.state = "printing".into();
+        m.history_state = "in_progress".into();
+    }
+    let live = b.printer("test").await.unwrap();
+    assert!(b
+        .stop(
+            "test",
+            "old-execution",
+            live.job_name.as_deref().unwrap(),
+            None
+        )
+        .await
+        .is_err());
+    assert!(f.commands().await.is_empty());
+    let p = b
+        .stop(
+            "test",
+            live.job_id.as_deref().unwrap(),
+            live.job_name.as_deref().unwrap(),
+            live.job_path.as_deref(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(p.state, PrinterState::Idle);
+    assert_eq!(p.needs_clearing, Some(true));
+    assert_eq!(f.commands().await, vec!["/printer/print/cancel"]);
+    assert!(!f
+        .shared
+        .machine
+        .lock()
+        .await
+        .records
+        .iter()
+        .any(|(method, _, _)| method == "DELETE"));
+}
+
+#[tokio::test]
+async fn uploaded_ready_file_is_cleaned_on_cancel_or_forget() {
+    for forget in [false, true] {
+        let f = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend(&f, dir.path()).await;
+        b.clear("test").await.unwrap();
+        f.shared.machine.lock().await.block = Some("/server/files/upload".into());
+        let start = tokio::spawn({
+            let b = b.clone();
+            async move { b.start("one").await }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            f.shared.entered.notified(),
+        )
+        .await
+        .unwrap();
+        f.shared.machine.lock().await.settings["extruder"]["nozzle_diameter"] = json!(0.6);
+        f.shared.release.notify_one();
+        assert!(start.await.unwrap().is_err());
+        assert!(!f.shared.machine.lock().await.name.is_empty());
+        assert_eq!(b.job("one").await.unwrap().state, JobState::Ready);
+        if forget {
+            b.forget("one").await.unwrap();
+        } else {
+            assert_eq!(b.cancel("one").await.unwrap().state, JobState::Cancelled);
+        }
+        let m = f.shared.machine.lock().await;
+        assert!(m.name.is_empty());
+        assert_eq!(
+            m.records
+                .iter()
+                .filter(|(method, path, _)| method == "DELETE"
+                    && path.starts_with("/server/files/gcodes/dutchman-"))
+                .count(),
+            1
+        );
+        drop(m);
+        assert!(f.commands().await.is_empty());
     }
 }

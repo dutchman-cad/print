@@ -154,6 +154,7 @@ pub fn router(backend: Arc<dyn Backend>, config: ServerConfig) -> Router {
         .route("/api/v1/jobs/{id}/preview.png", get(preview))
         .route("/api/v1/jobs/{id}/start", post(start))
         .route("/api/v1/jobs/{id}/cancel", post(cancel))
+        .route("/api/v1/printers/{id}/stop", post(stop))
         .route("/api/v1/printers/{id}/pause", post(pause))
         .route("/api/v1/printers/{id}/resume", post(resume))
         .route("/api/v1/printers/{id}/clear", post(clear))
@@ -579,7 +580,7 @@ async fn confirm(
     request: Request,
     action: &str,
     id: &str,
-) -> Result<(), Problem> {
+) -> Result<crate::confirmation::Observation, Problem> {
     let error = || {
         (
             StatusCode::FORBIDDEN,
@@ -698,4 +699,27 @@ async fn clear(
     checkpoint(&app).await?;
     crate::log_clear(&id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn stop(
+    State(app): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    request: Request,
+) -> Result<Json<crate::backend::Printer>, Problem> {
+    let observed = confirm(&app, &headers, request, "stop", &id).await?;
+    let identity = observed
+        .job_id
+        .as_deref()
+        .ok_or_else(|| bad("Read a live job before stopping."))?;
+    let name = observed
+        .job_name
+        .as_deref()
+        .ok_or_else(|| bad("Read a live job before stopping."))?;
+    let result = app
+        .backend
+        .stop(&id, identity, name, observed.job_path.as_deref())
+        .await;
+    checkpoint(&app).await?;
+    Ok(Json(result.map_err(backend_error)?))
 }

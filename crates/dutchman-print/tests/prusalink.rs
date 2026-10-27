@@ -36,6 +36,7 @@ struct Recorded {
 }
 struct Machine {
     state: String,
+    progress: u64,
     id: u64,
     name: String,
     file: Vec<u8>,
@@ -182,7 +183,7 @@ async fn handle(
             if m.missing { return axum::Json(json!({})).into_response(); }
             let mut value = json!({"printer":{"state":m.state,"temp_nozzle":205.0,"temp_bed":60.0}});
             if matches!(m.state.as_str(), "PRINTING" | "PAUSED" | "FINISHED" | "STOPPED" | "ATTENTION" | "ERROR") && !m.name.is_empty() {
-                value["job"] = json!({"id":m.id,"progress":42,"time_remaining":120});
+                value["job"] = json!({"id":m.id,"progress":m.progress,"time_remaining":120});
             }
             axum::Json(value).into_response()
         }
@@ -227,6 +228,7 @@ impl Fake {
         let shared = Arc::new(Shared {
             machine: Mutex::new(Machine {
                 state: "IDLE".into(),
+                progress: 42,
                 id: 40,
                 name: String::new(),
                 file: Vec::new(),
@@ -741,6 +743,23 @@ async fn terminal_outcomes_are_distinct_and_idle_does_not_mean_done() {
         fake.shared.machine.lock().await.state = state.into();
         assert_eq!(b.job("one").await.unwrap().state, expected);
         assert_eq!(b.printers().await.unwrap()[0].needs_clearing, Some(true));
+        if state == "ERROR" {
+            assert!(!fake.shared.machine.lock().await.file.is_empty());
+            fake.shared.machine.lock().await.state = "IDLE".into();
+            assert_eq!(b.job("one").await.unwrap().state, expected);
+        }
+        assert!(fake.shared.machine.lock().await.file.is_empty());
+        assert_eq!(
+            fake.shared
+                .machine
+                .lock()
+                .await
+                .records
+                .iter()
+                .filter(|r| r.method == Method::DELETE && r.path.starts_with("/api/v1/files/"))
+                .count(),
+            1
+        );
     }
 }
 
@@ -1481,10 +1500,21 @@ async fn independent_printers_and_stop_during_start_poll() {
                 .review_action("cancel", "other", Some("two"))
                 .await
                 .unwrap();
+            let live = backend.printer("other").await.unwrap();
             assert_eq!(
-                backend.cancel("two").await.unwrap().state,
-                JobState::Cancelled
+                backend
+                    .stop(
+                        "other",
+                        live.job_id.as_deref().unwrap(),
+                        live.job_name.as_deref().unwrap(),
+                        live.job_path.as_deref()
+                    )
+                    .await
+                    .unwrap()
+                    .state,
+                PrinterState::Idle
             );
+            assert_eq!(backend.job("two").await.unwrap().state, JobState::Cancelled);
         })
         .await
         .unwrap();
@@ -1550,13 +1580,22 @@ async fn stop_overtakes_pause_and_resume_polls() {
             .await
             .unwrap();
         assert!(!command.is_finished());
+        let live = backend.printer("test").await.unwrap();
         assert_eq!(
-            timeout(Duration::from_secs(2), backend.cancel("one"))
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            JobState::Cancelled
+            timeout(
+                Duration::from_secs(2),
+                backend.stop(
+                    "test",
+                    live.job_id.as_deref().unwrap(),
+                    live.job_name.as_deref().unwrap(),
+                    live.job_path.as_deref(),
+                )
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+            PrinterState::Idle
         );
         assert_eq!(
             timeout(Duration::from_secs(2), command)
@@ -1567,5 +1606,150 @@ async fn stop_overtakes_pause_and_resume_polls() {
                 .state,
             JobState::Cancelled
         );
+    }
+}
+
+#[tokio::test]
+async fn printer_stop_confirms_external_execution_and_rejects_replacement() {
+    use tower::ServiceExt as _;
+    for state in ["PRINTING", "PAUSED", "ATTENTION"] {
+        let f = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut m = f.shared.machine.lock().await;
+            m.state = state.into();
+            m.id = 41;
+            m.name = "External cube.gcode".into();
+        }
+        let mut settings = dutchman_print::ServerConfig::default();
+        settings.storage.data_dir = dir.path().into();
+        let app = dutchman_print::router(Arc::new(Printers::new(f.config()).unwrap()), settings);
+        let request = axum::http::Request::post("/api/v1/printers/test/stop")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let issue = || {
+            axum::http::Request::post("/api/v1/confirmations")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"action":"stop","printer":"test"}).to_string(),
+                ))
+                .unwrap()
+        };
+        let response = app.clone().oneshot(issue()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let challenge: Value = serde_json::from_slice(&body).unwrap();
+        let summary = challenge["summary"].as_str().unwrap();
+        assert!(!summary.contains("clearance required"));
+        assert!(
+            summary.contains("External cube.gcode")
+                && summary.contains("41")
+                && summary.contains('%')
+        );
+        f.shared.machine.lock().await.id += 1;
+        let stop = |challenge: &Value, token: &str| {
+            axum::http::Request::post("/api/v1/printers/test/stop")
+                .header("Plugin-Confirmation", token.repeat(64))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"confirmation":challenge["id"]}).to_string(),
+                ))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(stop(&challenge, "a"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(f.count(Method::DELETE).await, 0);
+        let response = app.clone().oneshot(issue()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let challenge: Value = serde_json::from_slice(&body).unwrap();
+        f.shared.machine.lock().await.progress = 43;
+        let response = app.clone().oneshot(stop(&challenge, "b")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let printer: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(printer["needs_clearing"], true);
+        let m = f.shared.machine.lock().await;
+        assert_eq!(m.state, "STOPPED");
+        assert_eq!(
+            m.records
+                .iter()
+                .filter(|r| r.method == Method::DELETE && r.path == "/api/v1/job/42")
+                .count(),
+            1
+        );
+        assert!(!m
+            .records
+            .iter()
+            .any(|r| r.method == Method::DELETE && r.path.starts_with("/api/v1/files/")));
+    }
+}
+
+#[tokio::test]
+async fn cli_stop_requires_confirmation_and_can_stop_an_external_job() {
+    let f = Fake::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, format!("[backend]\nkind='printers'\n[slicer]\nkind='prusaslicer'\n[[printers]]\nkind='prusalink'\nid='test'\nname='Test printer'\nmodel='Synthetic'\nurl={:?}\napi_key='secret'\nprinter_profile='Machine'\nprint_profile='Draft'\nfilament_profile='PLA'\n", f.url)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    {
+        let mut m = f.shared.machine.lock().await;
+        m.state = "PRINTING".into();
+        m.name = "External cube.gcode".into();
+    }
+    for yes in [false, true] {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_dutchman-print"));
+        command
+            .arg("--config")
+            .arg(&config)
+            .arg("--data-dir")
+            .arg(dir.path().join("data"))
+            .args(["stop", "test"]);
+        if yes {
+            command.arg("--yes");
+        }
+        let result = command.output().await.unwrap();
+        assert_eq!(
+            result.status.success(),
+            yes,
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(if yes {
+                "External cube.gcode"
+            } else {
+                "needs confirmation"
+            }),
+            "{stderr}"
+        );
+        let machine = f.shared.machine.lock().await;
+        let stops = machine
+            .records
+            .iter()
+            .filter(|r| r.method == Method::DELETE && r.path.starts_with("/api/v1/job/"))
+            .count();
+        assert_eq!(stops, usize::from(yes));
+        assert_eq!(machine.state, if yes { "STOPPED" } else { "PRINTING" });
     }
 }

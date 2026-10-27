@@ -443,6 +443,24 @@ impl Backend for Safety {
             self.inner.cancel(id).await
         })
     }
+    fn stop<'a>(
+        &'a self,
+        printer: &'a str,
+        identity: &'a str,
+        name: &'a str,
+        path: Option<&'a str>,
+    ) -> Reply<'a, Printer> {
+        Box::pin(async move {
+            self.inner.check_control(printer)?;
+            self.state
+                .lock()
+                .await
+                .cleared
+                .insert(printer.into(), false);
+            self.inner.stop(printer, identity, name, path).await?;
+            self.printer(printer).await
+        })
+    }
     fn pause<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {
             self.inner.check_control(printer)?;
@@ -460,9 +478,12 @@ impl Backend for Safety {
             self.inner.check_control(printer)?;
             let p = self.fresh(printer).await?;
             if p.state != PrinterState::Paused
-                || p.detail
-                    .as_deref()
-                    .is_some_and(|s| !matches!(s, "PAUSED" | "PAUSE" | "Paused" | "paused"))
+                || p.detail.as_deref().is_some_and(|s| {
+                    !matches!(
+                        s.split("; ").next(),
+                        Some("PAUSED" | "PAUSE" | "Paused" | "paused")
+                    )
+                })
             {
                 return Err(Error::Refused("Printer readiness is unknown or attention is required. Read fresh status before resuming.".into()));
             }

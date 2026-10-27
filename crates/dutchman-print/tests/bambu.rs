@@ -590,7 +590,7 @@ async fn control_lifecycle_and_finish_consume_clearance() {
         .collect();
     assert_eq!(
         commands[0],
-        json!({"print":{"command":"project_file","sequence_id":commands[0]["print"]["sequence_id"],"param":"Metadata/plate_1.gcode","project_id":"0","profile_id":"0","task_id":"0","subtask_id":"0","subtask_name":name,"url":format!("file:///sdcard/{name}.gcode.3mf"),"md5":checksum,"timelapse":false,"bed_type":"auto","bed_leveling":false,"flow_cali":false,"vibration_cali":false,"layer_inspect":false,"use_ams":false,"ams_mapping":""}})
+        json!({"print":{"command":"project_file","sequence_id":commands[0]["print"]["sequence_id"],"param":"Metadata/plate_1.gcode","project_id":"0","profile_id":"0","task_id":"0","subtask_id":"0","subtask_name":name,"url":format!("file:///sdcard/{name}.gcode.3mf"),"md5":checksum,"timelapse":false,"bed_type":"auto","bed_leveling":true,"flow_cali":false,"vibration_cali":false,"layer_inspect":false,"use_ams":false,"ams_mapping":""}})
     );
     assert_eq!(commands[1]["print"].as_object().unwrap().len(), 3);
     assert_eq!(commands[1]["print"]["param"], "");
@@ -673,7 +673,15 @@ async fn lost_start_reply_reconciles_without_resending() {
     c.fake.lose_reply.store(true, Ordering::SeqCst);
     c.clear().await.unwrap();
     let _ = c.start().await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while c.fake.credentials.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let command = c.fake.commands.lock().await[0].clone();
+    c.report(json!({"print":{"gcode_state":"RUNNING","print_error":0,"subtask_name":command["print"]["subtask_name"],"gcode_start_time":command["print"]["sequence_id"]}})).await;
     assert_eq!(
         c.safety.job("control").await.unwrap().state,
         JobState::Printing
@@ -1135,13 +1143,22 @@ async fn stop_overtakes_pause_and_resume_polls() {
         .unwrap();
         assert!(!command.is_finished());
         c.fake.no_state.store(false, Ordering::SeqCst);
+        let live = c.backend.printer("bambu").await.unwrap();
         assert_eq!(
-            timeout(Duration::from_secs(2), c.backend.cancel("control"))
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            JobState::Cancelled
+            timeout(
+                Duration::from_secs(2),
+                c.backend.stop(
+                    "bambu",
+                    live.job_id.as_deref().unwrap(),
+                    live.job_name.as_deref().unwrap(),
+                    live.job_path.as_deref()
+                )
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+            PrinterState::Idle
         );
         assert_eq!(
             timeout(Duration::from_secs(2), command)
@@ -1153,5 +1170,92 @@ async fn stop_overtakes_pause_and_resume_polls() {
             JobState::Cancelled
         );
         assert_eq!(c.fake.commands.lock().await.len(), count + 2);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn printer_stop_external_attention_job_does_not_delete_external_file() {
+    let c = Control::new().await;
+    c.report(json!({"print":{"gcode_state":"PAUSE","subtask_name":"External cube","gcode_start_time":123,"hms":[{"attr":768,"code":1}]}})).await;
+    assert_eq!(c.status().await.state, PrinterState::Attention);
+    let result = c.machine("stop", None).await.unwrap();
+    assert_eq!(result["state"], "idle");
+    assert_eq!(result["needs_clearing"], true);
+    assert_eq!(c.fake.commands.lock().await.len(), 1);
+    assert_eq!(c.fake.commands.lock().await[0]["print"]["command"], "stop");
+    assert_eq!(c.fake.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(c.ftps.deleted.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_sd_card_blocks_upload_and_terminal_files_are_removed() {
+    use dutchman_print::backend::JobState;
+    let c = Control::new().await;
+    c.report(json!({"print":{"sdcard":false}})).await;
+    c.clear().await.unwrap();
+    assert!(c.start().await.unwrap_err().contains("SD card"));
+    assert_eq!(c.ftps.received.load(Ordering::SeqCst), 0);
+    assert!(c.fake.commands.lock().await.is_empty());
+    c.report(json!({"print":{"sdcard":true}})).await;
+    c.clear_start().await;
+    assert_eq!(c.ftps.deleted.load(Ordering::SeqCst), 0);
+    c.report(json!({"print":{"gcode_state":"FINISH"}})).await;
+    assert_eq!(c.safety.job("control").await.unwrap().state, JobState::Done);
+    assert_eq!(c.ftps.deleted.load(Ordering::SeqCst), 1);
+    assert_eq!(c.safety.job("control").await.unwrap().state, JobState::Done);
+    assert_eq!(c.ftps.deleted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cleanup_cancelled_failed_and_uploaded_ready_files() {
+    use dutchman_print::backend::JobState;
+    for cancelled in [false, true] {
+        let c = Control::new().await;
+        c.clear_start().await;
+        let job = if cancelled {
+            c.action("cancel").await.unwrap()
+        } else {
+            c.report(json!({"print":{"gcode_state":"FAILED","print_error":42}}))
+                .await;
+            c.safety.job("control").await.unwrap()
+        };
+        assert_eq!(
+            job.state,
+            if cancelled {
+                JobState::Cancelled
+            } else {
+                JobState::Failed
+            }
+        );
+        assert_eq!(c.ftps.deleted.load(Ordering::SeqCst), 1);
+    }
+    for forget in [false, true] {
+        let c = Control::new().await;
+        c.ftps.block_upload.store(true, Ordering::SeqCst);
+        let start = tokio::spawn({
+            let b = c.backend.clone();
+            async move { b.start("control").await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.ftps.entered.notified())
+            .await
+            .unwrap();
+        c.report(json!({"print":{"gcode_state":"PAUSE"}})).await;
+        c.ftps.release.notify_one();
+        assert!(start.await.unwrap().is_err());
+        assert_eq!(
+            c.backend.job("control").await.unwrap().state,
+            JobState::Ready
+        );
+        c.report(json!({"print":{"gcode_state":"IDLE"}})).await;
+        if forget {
+            c.backend.forget("control").await.unwrap();
+        } else {
+            assert_eq!(
+                c.backend.cancel("control").await.unwrap().state,
+                JobState::Cancelled
+            );
+        }
+        assert_eq!(c.ftps.deleted.load(Ordering::SeqCst), 1);
+        assert!(c.fake.commands.lock().await.is_empty());
     }
 }

@@ -1230,10 +1230,21 @@ async fn independent_printers_and_stop_during_start_poll() {
                 .review_action("cancel", "other", Some("two"))
                 .await
                 .unwrap();
+            let live = backend.printer("other").await.unwrap();
             assert_eq!(
-                backend.cancel("two").await.unwrap().state,
-                JobState::Cancelled
+                backend
+                    .stop(
+                        "other",
+                        live.job_id.as_deref().unwrap(),
+                        live.job_name.as_deref().unwrap(),
+                        live.job_path.as_deref()
+                    )
+                    .await
+                    .unwrap()
+                    .state,
+                PrinterState::Idle
             );
+            assert_eq!(backend.job("two").await.unwrap().state, JobState::Cancelled);
         })
         .await
         .unwrap();
@@ -1299,13 +1310,22 @@ async fn stop_overtakes_pause_and_resume_polls() {
             .await
             .unwrap();
         assert!(!command.is_finished());
+        let live = backend.printer("test").await.unwrap();
         assert_eq!(
-            timeout(Duration::from_secs(2), backend.cancel("one"))
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            JobState::Cancelled
+            timeout(
+                Duration::from_secs(2),
+                backend.stop(
+                    "test",
+                    live.job_id.as_deref().unwrap(),
+                    live.job_name.as_deref().unwrap(),
+                    live.job_path.as_deref(),
+                )
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+            PrinterState::Idle
         );
         assert_eq!(
             timeout(Duration::from_secs(2), command)
@@ -1316,5 +1336,119 @@ async fn stop_overtakes_pause_and_resume_polls() {
                 .state,
             JobState::Cancelled
         );
+    }
+}
+
+#[tokio::test]
+async fn printer_stop_external_file_and_cleanup_terminal_outcomes() {
+    let f = Fake::new().await;
+    let b = Safety::new(Arc::new(Printers::new(f.config()).unwrap()));
+    {
+        let mut m = f.shared.machine.lock().await;
+        m.name = Some("external.gcode".into());
+        m.state = "Printing".into();
+    }
+    assert!(b
+        .stop("test", "local/replaced.gcode", "external.gcode", None)
+        .await
+        .is_err());
+    assert!(f.commands().await.is_empty());
+    let live = b.printer("test").await.unwrap();
+    let p = b
+        .stop(
+            "test",
+            live.job_id.as_deref().unwrap(),
+            live.job_name.as_deref().unwrap(),
+            live.job_path.as_deref(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(p.state, PrinterState::Idle);
+    assert_eq!(p.needs_clearing, Some(true));
+    assert_eq!(f.commands().await, vec![json!({"command":"cancel"})]);
+    assert!(!f
+        .shared
+        .machine
+        .lock()
+        .await
+        .records
+        .iter()
+        .any(|(m, _, _)| *m == Method::DELETE));
+    for success in [true, false] {
+        for failure in [true, false] {
+            let f = Fake::new().await;
+            let dir = tempfile::tempdir().unwrap();
+            let b = f.backend(dir.path()).await;
+            b.clear("test").await.unwrap();
+            b.start("one").await.unwrap();
+            {
+                let mut m = f.shared.machine.lock().await;
+                m.state = "Operational".into();
+                m.history = json!({"date":1793059201.5,"success":success});
+                m.delete_fails = failure;
+            }
+            let j = b.job("one").await.unwrap();
+            assert_eq!(
+                j.state,
+                if success {
+                    JobState::Done
+                } else {
+                    JobState::Failed
+                }
+            );
+            assert_eq!(j.detail.is_some(), failure);
+            let m = f.shared.machine.lock().await;
+            assert_eq!(
+                m.records
+                    .iter()
+                    .filter(|(method, path, _)| *method == Method::DELETE
+                        && path.starts_with("/api/files/local/dutchman-"))
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn uploaded_ready_file_is_cleaned_on_cancel_or_forget() {
+    for forget in [false, true] {
+        let f = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let b = f.backend(dir.path()).await;
+        b.clear("test").await.unwrap();
+        f.shared.machine.lock().await.block_upload = true;
+        let start = tokio::spawn({
+            let b = b.clone();
+            async move { b.start("one").await }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            f.shared.entered.notified(),
+        )
+        .await
+        .unwrap();
+        f.shared.machine.lock().await.profile["extruder"]["nozzleDiameter"] = json!(0.6);
+        f.shared.release.notify_one();
+        assert!(start.await.unwrap().is_err());
+        assert!(f.shared.machine.lock().await.name.is_some());
+        assert_eq!(b.job("one").await.unwrap().state, JobState::Ready);
+        if forget {
+            b.forget("one").await.unwrap();
+        } else {
+            assert_eq!(b.cancel("one").await.unwrap().state, JobState::Cancelled);
+        }
+        let m = f.shared.machine.lock().await;
+        assert!(m.name.is_none());
+        assert_eq!(
+            m.records
+                .iter()
+                .filter(|(method, path, _)| *method == Method::DELETE
+                    && path.starts_with("/api/files/local/dutchman-"))
+                .count(),
+            1
+        );
+        drop(m);
+        assert!(f.commands().await.is_empty());
     }
 }

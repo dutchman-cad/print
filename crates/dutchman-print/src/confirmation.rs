@@ -14,6 +14,8 @@ pub struct Intent {
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Observation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_path: Option<String>,
     pub state: PrinterState,
     pub detail: Option<String>,
     pub job_id: Option<String>,
@@ -27,10 +29,11 @@ impl Observation {
     /// progress and temperatures move while a print runs and stopping it must stay possible.
     fn matches(&self, confirmed: &Observation, action: &str) -> bool {
         match action {
-            "pause" | "resume" | "cancel" => {
+            "pause" | "resume" | "cancel" | "stop" => {
                 self.state == confirmed.state
                     && self.job_id == confirmed.job_id
                     && self.job_name == confirmed.job_name
+                    && self.job_path == confirmed.job_path
             }
             _ => self == confirmed,
         }
@@ -39,6 +42,7 @@ impl Observation {
 impl From<Printer> for Observation {
     fn from(p: Printer) -> Self {
         Self {
+            job_path: p.job_path,
             state: p.state,
             detail: p.detail,
             job_id: p.job_id,
@@ -58,7 +62,7 @@ pub struct Challenge {
     /// Unix seconds.
     pub expires_at: u64,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Entry {
     challenge: Challenge,
     digest: Option<String>,
@@ -159,14 +163,25 @@ impl Confirmations {
                     )
                 }) && printer.state != PrinterState::Offline
             }
+            "stop" => {
+                job.is_none()
+                    && printer.job_id.is_some()
+                    && printer.job_name.is_some()
+                    && matches!(
+                        printer.state,
+                        PrinterState::Printing | PrinterState::Paused | PrinterState::Attention
+                    )
+            }
             "pause" => job.is_none() && printer.state == PrinterState::Printing,
             "resume" => {
                 job.is_none()
                     && printer.state == PrinterState::Paused
-                    && printer
-                        .detail
-                        .as_deref()
-                        .is_none_or(|s| matches!(s, "PAUSED" | "PAUSE" | "Paused" | "paused"))
+                    && printer.detail.as_deref().is_none_or(|s| {
+                        matches!(
+                            s.split("; ").next(),
+                            Some("PAUSED" | "PAUSE" | "Paused" | "paused")
+                        )
+                    })
             }
             _ => false,
         };
@@ -193,6 +208,7 @@ impl Confirmations {
         let action = match intent.action.as_str() {
             "start" => "Start printing",
             "cancel" => "Cancel printing",
+            "stop" => "Stop printing",
             "pause" => "Pause printing",
             "resume" => "Resume printing",
             _ => "Acknowledge the checked, clear bed",
@@ -206,7 +222,9 @@ impl Confirmations {
             .detail
             .clone()
             .unwrap_or_else(|| printer.state.to_string());
-        let bed = if printer.needs_clearing == Some(false) {
+        let bed = if intent.action == "stop" {
+            ""
+        } else if printer.needs_clearing == Some(false) {
             ", bed clear"
         } else {
             ", bed clearance required"
@@ -216,6 +234,11 @@ impl Confirmations {
             .as_ref()
             .map(|id| format!(", job {id}"))
             .unwrap_or_default();
+        let file_path = printer
+            .job_path
+            .as_ref()
+            .map(|path| format!(", file {path}"))
+            .unwrap_or_default();
         let progress = printer
             .progress
             .map(|p| format!(", {}%", (p * 100.0).floor()))
@@ -223,7 +246,7 @@ impl Confirmations {
         let challenge = Challenge {
             id: crate::new_job_id().map_err(Error::Failed)?,
             summary: format!(
-                "{action}{name} on {} ({detail}{bed}{live}{progress})?",
+                "{action}{name} on {} ({detail}{bed}{live}{file_path}{progress})?",
                 printer.name
             ),
             observed: printer.into(),
@@ -259,12 +282,12 @@ impl Confirmations {
         intent: &Intent,
         header: Option<&str>,
         now: Duration,
-    ) -> Result<(), Error> {
+    ) -> Result<Observation, Error> {
         let started = std::time::Instant::now();
         let mut guard = self.ledger.lock().await;
         self.load(&mut guard).await?;
         let ledger = guard.as_mut().ok_or(Error::Unavailable)?;
-        let entry = ledger.challenges.get(id).ok_or_else(refused)?;
+        let entry = ledger.challenges.get(id).ok_or_else(refused)?.clone();
         if entry.used
             || entry.challenge.expires_at <= now.as_secs()
             || entry.challenge.intent.action != intent.action
@@ -285,6 +308,7 @@ impl Confirmations {
         if ledger.headers.len() >= 10000 {
             return Err(Error::Unavailable);
         }
+        drop(guard);
         let job_state = if let Some(id) = &intent.job {
             Some(safety.job(id).await?.state)
         } else {
@@ -304,6 +328,25 @@ impl Confirmations {
         if now.saturating_add(started.elapsed()).as_secs() >= expiry {
             return Err(refused());
         }
+        // Network reads above never hold the shared ledger. Recheck single-use state
+        // atomically before consuming the challenge and header.
+        let mut guard = self.ledger.lock().await;
+        self.load(&mut guard).await?;
+        let ledger = guard.as_mut().ok_or(Error::Unavailable)?;
+        if now.saturating_add(started.elapsed()).as_secs() >= expiry
+            || ledger.challenges.get(id).is_none_or(|entry| entry.used)
+            || header_hash.as_ref().is_some_and(|h| {
+                ledger
+                    .headers
+                    .get(h)
+                    .is_some_and(|until| *until > now.as_secs())
+            })
+        {
+            return Err(refused());
+        }
+        if ledger.headers.len() >= 10000 {
+            return Err(Error::Unavailable);
+        }
         let entry = ledger.challenges.get_mut(id).ok_or_else(refused)?;
         entry.used = true;
         if let Some(hash) = header_hash {
@@ -311,6 +354,7 @@ impl Confirmations {
                 .headers
                 .insert(hash, now.as_secs().saturating_add(600).max(expiry));
         }
-        self.save(ledger).await
+        self.save(ledger).await?;
+        Ok(observed)
     }
 }
