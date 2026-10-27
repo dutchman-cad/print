@@ -233,11 +233,11 @@ filament_profile = "PLA"
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("not supported yet"));
+        assert!(String::from_utf8_lossy(&body).contains("confirmation"));
     }
     assert_eq!(fake.requests.load(Ordering::SeqCst), 2);
     // Read all fixture metadata so the same helper stays warning-free in both test targets.

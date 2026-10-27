@@ -145,6 +145,26 @@ pub struct Job {
 
 /// Errors must be safe to show to callers, without credentials or backend addresses.
 pub trait Backend: Send + Sync {
+    fn restore_jobs<'a>(&'a self, _path: &'a Path) -> Reply<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn persist_jobs<'a>(&'a self, _path: &'a Path) -> Reply<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Validate backend-specific preconditions without sending a machine command.
+    fn review_action<'a>(
+        &'a self,
+        _action: &'a str,
+        _printer: &'a str,
+        _job: Option<&'a str>,
+    ) -> Reply<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Only PrusaLink READY is an operator's printer-side bed acknowledgement.
+    fn bed_ready(&self, _printer: &str, _detail: Option<&str>) -> bool {
+        false
+    }
     /// Reject unavailable control before applying readiness checks.
     fn check_control(&self, _printer: &str) -> Result<(), Error> {
         Ok(())
@@ -160,6 +180,15 @@ pub trait Backend: Send + Sync {
     }
     /// Return fresh telemetry; unavailable or unknown readiness must never become idle.
     fn printers(&self) -> Reply<'_, Vec<Printer>>;
+    fn printer<'a>(&'a self, id: &'a str) -> Reply<'a, Printer> {
+        Box::pin(async move {
+            self.printers()
+                .await?
+                .into_iter()
+                .find(|p| p.id == id)
+                .ok_or(Error::NotFound)
+        })
+    }
     fn prepare<'a>(
         &'a self,
         job_id: &'a str,

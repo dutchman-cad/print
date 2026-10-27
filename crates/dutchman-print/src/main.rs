@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use clap::{Parser, Subcommand};
 use dutchman_print::backend::{Backend, Options};
-use dutchman_print::simulated::{Clock, Simulated, SystemClock};
+use dutchman_print::simulated::{Clock, Simulated};
 use dutchman_print::{config, ServerConfig};
 
 #[derive(Parser)]
@@ -52,12 +52,15 @@ enum Command {
         print_profile: Option<String>,
         #[arg(long)]
         filament_profile: Option<String>,
+        /// Acknowledge the checked, clear bed in this run.
+        #[arg(long)]
+        bed_clear: bool,
         #[arg(long)]
         yes: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Show a simulated CLI job.
+    /// Show a tracked CLI job.
     Status { job: String },
     /// Cancel a job after confirmation.
     Cancel {
@@ -65,7 +68,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Acknowledge that a printer bed has been checked and cleared.
+    /// Show bed acknowledgement status; clearance is kept only by a running server.
     Clear {
         printer: String,
         #[arg(long)]
@@ -89,6 +92,12 @@ enum Command {
         user: String,
         #[arg(long, env = "DUTCHMAN_PRINT_PUBLIC_ORIGIN", value_delimiter = ',')]
         public_origin: Vec<String>,
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(2..=30))]
+        clearance_interval_seconds: u64,
+        #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..=120))]
+        clearance_expiry_minutes: u64,
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=600))]
+        confirmation_seconds: u64,
     },
 }
 struct WallClock;
@@ -178,9 +187,13 @@ async fn run(args: Args) -> Result<(), String> {
         listen,
         user,
         public_origin,
+        clearance_interval_seconds,
+        clearance_expiry_minutes,
+        confirmation_seconds,
     } = args.command
     {
-        let backend = Arc::new(Simulated::new(config, Arc::new(SystemClock::default()))?);
+        let _server_lock = server_lock(&data_dir)?;
+        let backend = Arc::new(Simulated::new(config, Arc::new(WallClock))?);
         let login = std::env::var("DUTCHMAN_PRINT_PASSWORD")
             .ok()
             .filter(|s| !s.is_empty())
@@ -195,6 +208,9 @@ async fn run(args: Args) -> Result<(), String> {
         let mut settings = ServerConfig {
             login,
             public_origin,
+            clearance_interval: Duration::from_secs(clearance_interval_seconds),
+            clearance_expiry: Duration::from_secs(clearance_expiry_minutes * 60),
+            confirmation_ttl: Duration::from_secs(confirmation_seconds),
             ..Default::default()
         };
         settings.storage.data_dir = data_dir.clone();
@@ -229,6 +245,11 @@ async fn run(args: Args) -> Result<(), String> {
     safety.save(&safety_path).await?;
     backend.save(&state)?;
     result
+}
+fn server_lock(data: &Path) -> Result<Lock, String> {
+    let path = data.join("serve.lock");
+    std::fs::create_dir(&path).map_err(|_| "Another server is using this data folder. Stop it first; remove serve.lock only after it has stopped.")?;
+    Ok(Lock(path))
 }
 fn state_path(data_dir: &Path, config: &Path) -> Result<PathBuf, String> {
     use std::hash::{Hash as _, Hasher as _};
@@ -276,7 +297,45 @@ fn ask(
     ))
 }
 
-async fn command(command: Command, backend: &dyn Backend, data: &Path) -> Result<(), String> {
+async fn confirm_action(
+    backend: &dutchman_print::safety::Safety,
+    confirmations: &dutchman_print::confirmation::Confirmations,
+    action: &str,
+    printer: &str,
+    job: Option<&str>,
+    yes: bool,
+) -> Result<bool, dutchman_print::backend::Error> {
+    let intent = dutchman_print::confirmation::Intent {
+        action: action.into(),
+        printer: printer.into(),
+        job: job.map(str::to_owned),
+    };
+    let challenge = confirmations
+        .issue(
+            backend,
+            intent.clone(),
+            WallClock.now(),
+            Duration::from_secs(60),
+        )
+        .await?;
+    if yes {
+        eprintln!("{}", challenge.summary);
+    }
+    if !confirm(&challenge.summary, yes).map_err(dutchman_print::backend::Error::Refused)? {
+        return Ok(false);
+    }
+    confirmations
+        .consume(backend, &challenge.id, &intent, None, WallClock.now())
+        .await?;
+    Ok(true)
+}
+
+async fn command(
+    command: Command,
+    backend: &dutchman_print::safety::Safety,
+    data: &Path,
+) -> Result<(), String> {
+    let confirmations = dutchman_print::confirmation::Confirmations::new(None);
     let result: Result<(), dutchman_print::backend::Error> = async {
         match command {
             Command::Print {
@@ -285,6 +344,7 @@ async fn command(command: Command, backend: &dyn Backend, data: &Path) -> Result
                 printer_profile,
                 print_profile,
                 filament_profile,
+                bed_clear,
                 yes,
                 json,
             } => {
@@ -333,11 +393,13 @@ async fn command(command: Command, backend: &dyn Backend, data: &Path) -> Result
                             .unwrap_or_else(|| "unavailable".into())
                     );
                 }
-                let start = if json {
-                    yes
-                } else {
-                    confirm(&format!("Start printing {name} on {printer}?"), yes)
-                        .map_err(dutchman_print::backend::Error::Refused)?
+                let start = if json && !yes { false } else {
+                    if yes && !bed_clear {
+                        return Err(dutchman_print::backend::Error::Refused("Use --bed-clear --yes after checking the bed, or confirm interactively.".into()));
+                    }
+                    if !confirm_action(backend, &confirmations, "clear", &printer, None, yes && bed_clear).await? { return Ok(()) }
+                    backend.clear(&printer).await?;
+                    confirm_action(backend, &confirmations, "start", &printer, Some(&id), yes).await?
                 };
                 let job = if start {
                     let job = backend.start(&id).await?;
@@ -354,28 +416,19 @@ async fn command(command: Command, backend: &dyn Backend, data: &Path) -> Result
             }
             Command::Cancel { job, yes } => {
                 let target = backend.job(&job).await?;
-                if confirm(
-                    &format!("Cancel printing {} on {}?", target.name, target.printer),
-                    yes,
-                )
-                .map_err(dutchman_print::backend::Error::Refused)?
+                if confirm_action(backend, &confirmations, "cancel", &target.printer, Some(&job), yes).await?
                 {
                     let job = backend.cancel(&job).await?;
                     dutchman_print::log_action("cancel", &job);
                     output(&job).map_err(dutchman_print::backend::Error::Failed)?;
                 }
             }
-            Command::Clear { printer, yes } => {
-                if confirm(&format!("Is the bed of {printer} clear?"), yes)
-                    .map_err(dutchman_print::backend::Error::Refused)?
-                {
-                    backend.clear(&printer).await?;
-                    dutchman_print::log_clear(&printer);
-                }
+            Command::Clear { printer, yes: _ } => {
+                let challenge = confirmations.issue(backend, dutchman_print::confirmation::Intent { action: "clear".into(), printer, job: None }, WallClock.now(), Duration::from_secs(60)).await?;
+                println!("{}\nClearance is only kept by a running server. Use print with --bed-clear --yes or confirm both questions interactively.", challenge.summary);
             }
             Command::Pause { printer, yes } => {
-                if !confirm(&format!("Pause printing on {printer}?"), yes)
-                    .map_err(dutchman_print::backend::Error::Refused)?
+                if !confirm_action(backend, &confirmations, "pause", &printer, None, yes).await?
                 {
                     return Ok(());
                 }
@@ -384,8 +437,7 @@ async fn command(command: Command, backend: &dyn Backend, data: &Path) -> Result
                 output(&job).map_err(dutchman_print::backend::Error::Failed)?;
             }
             Command::Resume { printer, yes } => {
-                if !confirm(&format!("Resume printing on {printer}?"), yes)
-                    .map_err(dutchman_print::backend::Error::Refused)?
+                if !confirm_action(backend, &confirmations, "resume", &printer, None, yes).await?
                 {
                     return Ok(());
                 }
@@ -525,8 +577,12 @@ async fn real_commands(
         listen,
         user,
         public_origin,
+        clearance_interval_seconds,
+        clearance_expiry_minutes,
+        confirmation_seconds,
     } = cmd
     {
+        let _server_lock = server_lock(data)?;
         let login = std::env::var("DUTCHMAN_PRINT_PASSWORD")
             .ok()
             .filter(|v| !v.is_empty())
@@ -540,6 +596,9 @@ async fn real_commands(
         let mut settings = ServerConfig {
             login,
             public_origin,
+            clearance_interval: Duration::from_secs(clearance_interval_seconds),
+            clearance_expiry: Duration::from_secs(clearance_expiry_minutes * 60),
+            confirmation_ttl: Duration::from_secs(confirmation_seconds),
             ..Default::default()
         };
         settings.storage.data_dir = data.into();
@@ -549,7 +608,10 @@ async fn real_commands(
         ));
         let result = axum::serve(
             listener,
-            dutchman_print::router(Arc::new(backend), settings),
+            dutchman_print::router(
+                Arc::new(backend.with_store(data.join("jobs.json"))),
+                settings,
+            ),
         )
         .with_graceful_shutdown(stopped())
         .await;

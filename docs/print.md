@@ -155,7 +155,7 @@ dutchman-print --config config.toml clear workbench --yes
 dutchman printers --config config.toml --json
 dutchman print bracket.3mf --config config.toml --printer workbench
 dutchman-print print bracket.3mf --printer workbench --print-profile Fine --json
-dutchman-print print bracket.3mf --printer workbench --yes --json
+dutchman-print print bracket.3mf --printer workbench --bed-clear --yes --json
 dutchman-print status JOB_ID
 dutchman-print cancel JOB_ID --yes
 dutchman-print pause workbench
@@ -170,13 +170,16 @@ the same array as `GET /api/v1/printers`. The CLI calls the backend directly; no
 
 `print` accepts a single `.3mf`, `--printer ID`, and optional `--printer-profile`,
 `--print-profile`, and `--filament-profile` names. It checks the file and prepares a job,
-shows the estimate, then asks `Start printing <name> on <printer>? [y/N]` on a terminal.
+shows the estimate, then asks two separate questions on a terminal: acknowledge the checked,
+clear bed, then start the named job. Each challenge summary shows the current printer state.
 Without a terminal it refuses to start unless `--yes` is present. `--json` never prompts:
 without `--yes` it prepares only and returns the ready job and estimate; with `--yes` it
 starts and returns the printing job. Estimates go to stderr in plain mode; job JSON goes
 to stdout. `status`, `pause`, `resume`, and confirmed `cancel` return job JSON.
 `cancel`, `pause`, and `resume` ask for confirmation on a terminal unless given `--yes`.
-Check and acknowledge the printer bed with `clear <printer> [--yes]` before starting.
+Scripts must pass `print ... --bed-clear --yes` after checking the bed.
+`clear <printer> [--yes]` only prints what would be acknowledged and explains that clearance
+is kept only by a running server; it cannot authorize a later CLI run.
 
 Without `backend.slice = true`, the simulator estimates from the compressed 3MF size in bytes: seconds = 60 + size / 1024,
 filament mm = size / 10, filament g = size / 1000, and layers = 1 + size / 4096.
@@ -188,7 +191,9 @@ CLI simulation state is saved in the private data folder, separately for each co
 so later commands can read and control it. Jobs older than one hour are removed on the
 next command. One CLI command at a time may change that state.
 If a command is killed while holding a `.lock` folder, remove that folder once it has stopped.
-The service has its own in-memory simulation; restarting it resets its job state.
+The service persists its separate job state in its private data folder. Only one server may
+use a data folder at once; after a killed process, remove `serve.lock` only once it has stopped. Tracked jobs are
+reloaded and reconciled from live status before control after a restart.
 
 ## Plugin API
 
@@ -204,6 +209,7 @@ except `GET /healthz` when `DUTCHMAN_PRINT_PASSWORD` is set.
 |---|---|
 | `GET /healthz` | `{"service":"dutchman-print","api":1}`; service liveness only |
 | `GET /api/v1/printers` | Printer array, in config order |
+| `POST /api/v1/confirmations` | Issue an observation-bound challenge; 201 |
 | `POST /api/v1/jobs` | Raw 3MF or multipart prepare; 201 with `{id, printer, name, state: "ready", estimate, progress, seconds_left}` |
 | `GET /api/v1/jobs/{id}` | Current job |
 | `GET /api/v1/jobs/{id}/preview.png` | PNG when the backend supplied one; otherwise 404 |
@@ -236,13 +242,39 @@ and `seconds_left` may be null. Estimate fields `seconds`, `filament_mm`, `filam
 Not found maps to 404, busy or refused to 409, unavailable/offline to 503, and backend failure
 to 500. Backend error messages must never contain secrets.
 
-Every start, cancel, pause, resume, and clear requires a `Plugin-Confirmation` header containing
-exactly 64 lowercase hex characters. SolidCraft supplies a fresh value after its confirmation
-step. Missing, malformed, duplicate, or reused values return 403 with a message requiring
-confirmation in SolidCraft (or `--yes` on the command line). Accepted values are remembered
-for ten minutes, across all actions and callers; a failed backend action also consumes its
-value. This header is a confirmation signal, not authentication. Every successful action
-writes a timestamp, printer ID, job ID, and action to stderr; header values are never logged.
+Before each machine action, request a server-issued challenge with
+`POST /api/v1/confirmations` and JSON `{"action":"start","printer":"workbench","job":"JOB_ID"}`.
+Actions are `start`, `cancel`, `pause`, `resume`, and `clear`; `job` is required for start
+and cancel and omitted for printer actions. Issuance re-reads the printer and refuses
+incompatible actions with 409. Success is 201 with `id`, `action`, `printer`, nullable `job`,
+`summary`, `observed`, and `expires_at` (Unix seconds). `observed` contains normalized `state`,
+nullable vendor `detail`, `job_id`, `job_name`, `progress` (fraction rounded down to a whole
+percent), and `needs_clearing`.
+
+Show the returned summary verbatim, for example:
+`Start printing 'bracket' on Workbench MINI (idle, bed clear)?`.
+The challenge expires after 60 seconds (`--confirmation-seconds`, 1–600).
+For SolidCraft, the plugin's read step fetches this challenge and returns its summary for
+the host's own confirmation dialog. Only after the person approves that dialog does the
+host attach a fresh `Plugin-Confirmation` header to the physical action step. That step
+sends `{"confirmation":"CHALLENGE_ID"}` as JSON, or `?confirmation=CHALLENGE_ID` with an empty
+body. Send the id once. Clear and Start require separate challenges and separate approvals.
+
+Every machine route still requires exactly one `Plugin-Confirmation` header containing
+64 lowercase hexadecimal characters. Missing, malformed, or duplicate headers and missing
+challenge ids return 403. A challenge must be unused, unexpired, and match the action,
+printer, job, and reviewed input digest. Current state, vendor detail, job identity, whole
+percent progress, bed clearance, and tracked job state must still match the observation.
+A changed observation returns 409 with
+"The printer changed since you confirmed; confirm again." Invalid, expired, or consumed
+challenges and reused header values also return 409. Obtain a new challenge and confirmation;
+never automatically repeat Start after an uncertain result.
+
+The private data folder durably stores challenges and consumed ids until their expiry and
+hashes of seen header values for at least ten minutes, across callers and restarts. Both
+are consumed before attempting a backend action, including failed attempts. Header values
+are never logged. Confirmation is separate from authentication. Standalone CLI prompts
+and `--yes` create and consume the same observation-bound challenges internally.
 
 ## Server settings and hardening
 
@@ -253,6 +285,9 @@ writes a timestamp, printer ID, job ID, and action to stderr; header values are 
 | `--data-dir DIR` | `DUTCHMAN_PRINT_DATA` | `dutchman-print` in the system temporary folder |
 | `--user NAME` | `DUTCHMAN_PRINT_USER` | `dutchman` |
 | | `DUTCHMAN_PRINT_PASSWORD` | None; environment only |
+| `--clearance-interval-seconds N` | | 5; range 2–30 |
+| `--clearance-expiry-minutes N` | | 15; range 1–120 |
+| `--confirmation-seconds N` | | 60; range 1–600 |
 | `--public-origin ORIGIN,...` | `DUTCHMAN_PRINT_PUBLIC_ORIGIN` | None |
 
 - Set a password unless everyone who can reach the service may read job names and control
@@ -395,7 +430,11 @@ against the configured presets before confirmation; Dutchman cannot detect an un
 physical change. This backend is intended for commissioned single-material setups.
 
 Preparation reads status and machine information, then slices locally to text G-code.
-Missing serial, firmware, or nozzle information blocks preparation.
+Missing serial, firmware, or nozzle information blocks preparation. The resolved profile's
+`nozzle_diameter` is read from PrusaSlicer's output G-code comments in the first and last
+256 KiB. Missing, conflicting, or multiple-nozzle settings are refused. Before upload the
+profile diameter must match `/api/v1/info` `nozzle_diameter`; a mismatch names both diameters.
+Fit a matching nozzle or slice with the matching profile. No mismatch override is offered.
 Before upload and again before Start, Dutchman requires fresh `IDLE` or `READY` status,
 with no job or transfer reported. `BUSY`, `ATTENTION`, terminal, unknown, and unavailable
 states block Start. Status reads have a four-second deadline. Missing estimates stay absent;
@@ -412,23 +451,32 @@ Only explicit matching terminal reports establish done, cancelled, or failed; id
 proves completion. The endpoint contract comes from Prusa's
 [public API documentation](https://github.com/prusa3d/Prusa-Link-Web/blob/master/spec/openapi.yaml).
 
-Check and acknowledge the bed before the first start and after each job ends:
+Check the bed before starting, then acknowledge and start within the same CLI run:
 
 ```sh
-dutchman-print clear mini --yes
-dutchman-print print part.3mf --printer mini --yes
+dutchman-print print part.3mf --printer mini --bed-clear --yes
 ```
 
-`clear <printer> [--yes]` asks on a terminal unless `--yes` is given. Pause and resume also
-ask for confirmation or accept `--yes`. The API uses the single-use `Plugin-Confirmation`
-header for all five machine routes, including clear. Printer JSON includes optional
-`needs_clearing` and `detail`; see [the API](print-api.md). A start attempt consumes bed
-clearance even when the result is uncertain. The simulator follows this same policy.
+Without `--yes`, terminal use asks separately about bed clearance and Start, showing the
+current state each time. `clear mini` is an informational status command. Pause and resume
+also show a fresh challenge summary before confirmation or accept `--yes`.
+Printer JSON includes optional `needs_clearing` and `detail`; see [the API](print-api.md).
 
-Standalone CLI commands save jobs and safety checks in the private data folder, separately
-from the running service. Use the service API to control service jobs. The CLI records bed
-consumption and its attempted Start before sending it, so a restart cannot silently retry it.
-The service starts with no bed clearance after a restart.
+A remote bed-clear acknowledgement exists only in the running process. While it is held,
+the server polls that printer every 5 seconds (`--clearance-interval-seconds`, 2–30).
+It is withdrawn on any non-idle or unknown state, failed read, observation gap longer than
+twice that interval, reconnect following unavailable telemetry, job identity or finished-job
+signal change, or expiry after 15 minutes (`--clearance-expiry-minutes`, 1–120). A Start
+attempt consumes it even if the result is uncertain or fails. Polling stops when no remote
+acknowledgement is held. Activity entirely between polls with no identity or terminal signal
+change cannot be detected; clearance is not proof that no physical activity occurred.
+PrusaLink `READY` is the operator's printer-side bed-clear signal and substitutes for the
+remote acknowledgement; `IDLE` still requires one. Restarting never restores remote clearance.
+
+Standalone CLI commands save tracked jobs and reviews separately from service jobs. Use
+the service API to control service jobs. The attempted Start is saved before sending it,
+so restarting cannot silently retry it. The service persists tracked jobs and reconciles
+live identity before control after a restart.
 
 ## Bambu Lab LAN monitoring
 
