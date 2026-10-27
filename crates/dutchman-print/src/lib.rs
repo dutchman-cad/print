@@ -11,6 +11,7 @@ pub mod octoprint;
 pub mod printers;
 mod progress;
 pub mod prusalink;
+pub mod repetier;
 pub mod safety;
 mod server;
 pub mod simulated;

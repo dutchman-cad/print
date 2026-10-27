@@ -14,6 +14,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 #[path = "printers_duet.rs"]
 mod duet;
+#[path = "printers_repetier.rs"]
+mod repetier;
 #[path = "printers_stop.rs"]
 mod stop;
 
@@ -47,6 +49,7 @@ pub struct Printers {
     octoprint: BTreeMap<String, Arc<crate::octoprint::Client>>,
     moonraker: BTreeMap<String, Arc<crate::moonraker::Client>>,
     duet: BTreeMap<String, Arc<crate::duet::Client>>,
+    repetier: BTreeMap<String, Arc<crate::repetier::Client>>,
     sdcp: BTreeMap<String, Arc<crate::elegoo_sdcp::Client>>,
     snapmaker: BTreeMap<String, Arc<crate::snapmaker::Client>>,
     slicers: BTreeMap<String, crate::slicer::Config>,
@@ -94,6 +97,7 @@ impl Printers {
                             | "moonraker"
                             | "snapmaker-u1"
                             | "duet"
+                            | "repetier"
                             | "elegoo-sdcp"
                             | "snapmaker-2"
                             | "snapmaker-j1"
@@ -137,6 +141,12 @@ impl Printers {
             .filter(|p| p.kind.as_deref() == Some("duet"))
             .map(|p| crate::duet::Client::new(p.clone()).map(|c| (p.id.clone(), Arc::new(c))))
             .collect::<Result<_, _>>()?;
+        let repetier = config
+            .printers
+            .iter()
+            .filter(|p| p.kind.as_deref() == Some("repetier"))
+            .map(|p| crate::repetier::Client::new(p.clone()).map(|c| (p.id.clone(), Arc::new(c))))
+            .collect::<Result<_, _>>()?;
         let sdcp = config
             .printers
             .iter()
@@ -170,6 +180,7 @@ impl Printers {
             octoprint,
             moonraker,
             duet,
+            repetier,
             sdcp,
             snapmaker,
             slicers,
@@ -331,6 +342,8 @@ impl Printers {
             self.reconcile_moonraker(target).await?;
         } else if self.duet.contains_key(&target.job.printer) {
             self.reconcile_duet(target).await?;
+        } else if self.repetier.contains_key(&target.job.printer) {
+            self.reconcile_repetier(target).await?;
         } else {
             self.reconcile(target).await?;
         }
@@ -606,6 +619,8 @@ impl Printers {
             self.moonraker_control(target, action, guard).await
         } else if self.duet.contains_key(&target.job.printer) {
             self.duet_control(target, action, guard).await
+        } else if self.repetier.contains_key(&target.job.printer) {
+            self.repetier_control(target, action).await
         } else if self.octoprint.contains_key(&target.job.printer) {
             self.octoprint_control(target, action, guard).await
         } else if self.bambu.contains_key(&target.job.printer) {
@@ -1332,6 +1347,9 @@ impl Printers {
         if self.duet.contains_key(&target.job.printer) {
             return self.start_duet(target, guard).await;
         }
+        if self.repetier.contains_key(&target.job.printer) {
+            return self.start_repetier(target, guard).await;
+        }
         if self.octoprint.contains_key(&target.job.printer) {
             return self.start_octoprint(target, guard).await;
         }
@@ -1505,6 +1523,11 @@ impl Backend for Printers {
         job: Option<&'a str>,
     ) -> Reply<'a, ()> {
         Box::pin(async move {
+            if action == "stop" {
+                if let Some(client) = self.repetier.get(printer) {
+                    return self.review_repetier_stop(client, printer).await;
+                }
+            }
             if matches!(action, "clear" | "stop") {
                 return Ok(());
             }
@@ -1652,6 +1675,9 @@ impl Backend for Printers {
                 }
                 return Ok(());
             }
+            if let Some(client) = self.repetier.get(printer) {
+                return self.review_repetier(client, action, printer, job).await;
+            }
             if let Some(client) = self.octoprint.get(printer) {
                 let live = client.snapshot().await?;
                 let jobs = self.jobs.lock().await;
@@ -1779,6 +1805,12 @@ impl Backend for Printers {
                     Err(error) => client.offline(&error),
                 });
             }
+            if let Some(client) = self.repetier.get(id) {
+                return Ok(match client.snapshot().await {
+                    Ok(snapshot) => snapshot.printer,
+                    Err(error) => client.offline(&error),
+                });
+            }
             if let Some(client) = self.octoprint.get(id) {
                 return Ok(match client.snapshot().await {
                     Ok(snapshot) => snapshot.printer,
@@ -1840,6 +1872,7 @@ impl Backend for Printers {
             || self.octoprint.contains_key(printer)
             || self.moonraker.contains_key(printer)
             || self.duet.contains_key(printer)
+            || self.repetier.contains_key(printer)
             || self.sdcp.contains_key(printer)
     }
     fn clear<'a>(&'a self, id: &'a str) -> Reply<'a, ()> {
@@ -1854,6 +1887,9 @@ impl Backend for Printers {
                 client.acknowledge();
             }
             if let Some(client) = self.duet.get(id) {
+                client.acknowledge();
+            }
+            if let Some(client) = self.repetier.get(id) {
                 client.acknowledge();
             }
             if let Some(client) = self.sdcp.get(id) {
@@ -1878,6 +1914,16 @@ impl Backend for Printers {
                         )
                     });
                 } else if let Some(client) = self.duet.get(&config.id).cloned() {
+                    tasks.spawn(async move {
+                        (
+                            index,
+                            match client.snapshot().await {
+                                Ok(s) => s.printer,
+                                Err(e) => client.offline(&e),
+                            },
+                        )
+                    });
+                } else if let Some(client) = self.repetier.get(&config.id).cloned() {
                     tasks.spawn(async move {
                         (
                             index,
@@ -2054,6 +2100,9 @@ impl Backend for Printers {
             } else if let Some(client) = self.duet.get(printer) {
                 crate::duet::ready(&client.snapshot().await?)?;
                 client.review().await?
+            } else if let Some(client) = self.repetier.get(printer) {
+                crate::repetier::ready(&client.snapshot().await?)?;
+                client.review().await?
             } else {
                 let client = self.client(printer)?;
                 client.snapshot().await?;
@@ -2196,6 +2245,9 @@ impl Backend for Printers {
             if let Some(client) = self.snapmaker.get(printer) {
                 return Err(client.refusal());
             }
+            if self.repetier.contains_key(printer) {
+                return Err(refuse(crate::repetier::PAUSE));
+            }
             self.control(printer, "pause", JobState::Printing).await
         })
     }
@@ -2206,6 +2258,9 @@ impl Backend for Printers {
             }
             if let Some(client) = self.snapmaker.get(printer) {
                 return Err(client.refusal());
+            }
+            if self.repetier.contains_key(printer) {
+                return Err(refuse(crate::repetier::RESUME));
             }
             self.control(printer, "resume", JobState::Paused).await
         })

@@ -87,7 +87,7 @@ storage and removed on failure.
 | `name` | string | Required |
 | `model` | string | Required |
 | `state` | string | Required: `idle`, `printing`, `paused`, `attention`, `busy`, `error`, or `offline` |
-| `job_id` | string | Optional; active job ID, the live file path for Duet, or the `TaskId` for Elegoo SDCP |
+| `job_id` | string | Optional; active job ID, the live file path for Duet, the queued job id for Repetier-Server, or the `TaskId` for Elegoo SDCP |
 | `job_name` | string | Optional; active job name |
 | `job_path` | string | Optional; backend relative live file path, currently OctoPrint |
 | `progress` | number | Optional; fraction from 0 to 1 |
@@ -217,6 +217,33 @@ Standalone firmware does not report how a file ended: a companion cancellation y
 `cancelled`, a halt `failed`, and other endings `ended`. See
 [Duet configuration and checks](print.md#duet-reprapfirmware-standalone).
 
+Repetier-Server (`kind = "repetier"`) uses the same routes, server-issued challenges,
+reviewed-byte checks, and bed-clear policy. Each entry names one printer on the server by
+`slug`, and the API key is sent only as the `x-api-key` header. Status comes from the
+`listPrinter` entry with that slug: `online` 0 is `offline` (`detail` `deactivated` when
+`active` is false, otherwise `offline`); `online` 1 with `active` true is `idle` while `job`
+is `none` (`detail` `online, no job`) and `printing` while `job` names a job (`detail`
+`online, job active`); any other combination, or no entry with the slug, is `error` with
+the raw values in `detail` and blocks Start. No `paused` state is ever reported, because the
+server reports none. `job_name` is the live `job` value and `job_id` the id of the one queued
+`listJobs` entry with that name. `progress` and `seconds_left` are omitted: the manual gives
+no units for its job times. Temperatures are the active extruder's and the heated bed's
+`tempRead` from `stateList`. Polling withdraws clearance when the state, live job name, or
+its id changes. The server reports no nozzle diameter, so the sliced `nozzle_diameter` must
+match the printer's configured `nozzle_diameter` during preparation, challenge review, and
+before upload; a missing value is refused. Only a one-extruder printer configuration is
+accepted. Start checks free space with `canUploadGCodeWithSize`, uploads a uniquely named
+model, requires exactly one listed model of that name with the reviewed size, removes failed
+or uncertain uploads with `removeModel` before returning an error, saves the attempt, sends
+`copyModel` with `autostart` false once, and sends `startJob` once for the queued job; a lost
+reply is reconciled from status and never resent. Pause and resume challenges and routes are
+refused: the manual documents no pause and the server reports no paused state. Cancel and
+Stop send `stopJob` once and only while the live job is the one this companion started;
+`stopJob` names no job, so Stop is refused for external work. A queued job that never ran is
+cancelled with `removeJob`. Waits match Moonraker. Job endings are not reported over this
+interface: a companion cancellation yields `cancelled` and other endings `ended`. See
+[Repetier-Server configuration and checks](print.md#repetier-server).
+
 Elegoo SDCP (`kind = "elegoo-sdcp"`) printers report status only through the printer routes;
 preparation and Start are refused for both profiles, so they never have tracked jobs. Status
 needs a fresh report on the current WebSocket connection: until one arrives, and for 30
@@ -289,7 +316,8 @@ ready, printing, or paused jobs and yields `cancelled`. Backend failures may yie
 `ended` is terminal: the execution ended, but its outcome is unknown. PrusaLink uses it when a tracked execution disappears from idle
 telemetry without an observed terminal result; observed FINISHED and STOPPED remain
 `done` and `cancelled`. Duet uses it for every ending not caused by this companion's
-cancellation or a halt, since standalone firmware does not report the outcome. BUSY cannot revive a terminal job.
+cancellation or a halt, since standalone firmware does not report the outcome.
+Repetier-Server uses it for every ending not caused by this companion's cancellation. BUSY cannot revive a terminal job.
 Incompatible actions return 409. Printer pause and resume target that printer's active job.
 Jobs may expire; subsequent reads return 404. Dutchman Print retains jobs for one hour and
 persists service jobs in its private data folder. Startup reloads tracked jobs and reconciles
@@ -393,7 +421,7 @@ start/stop and 10 seconds for pause/resume. Pending is announced on stderr befor
 unconfirmed outcome is returned. Waiting never resends a command. Read status after
 an uncertain outcome before confirming another action.
 
-Uploads to PrusaLink, Bambu FTPS, OctoPrint, Moonraker, and Duet use a 30-second transport
+Uploads to PrusaLink, Bambu FTPS, OctoPrint, Moonraker, Duet, and Repetier-Server use a 30-second transport
 idle timeout, reset by byte progress, rather than a fixed total deadline. Once the whole body has
 been written, the printer's reply gets 60 seconds, since storing the file or draining socket
 buffers moves no bytes. Failed or
@@ -415,7 +443,9 @@ outcome. External jobs are not added to the prepared-job list.
 PrusaLink addresses the live job ID; OctoPrint cancels only the same live origin/file path;
 Moonraker requires the same history execution and filename; Bambu requires the same
 subtask name and positive start time; Duet requires the same live file path and pauses a
-running job before sending `M0`; Elegoo resin requires the same `TaskId` and `Filename`, sends
+running job before sending `M0`; Repetier-Server sends `stopJob` only while the live job is the
+one this companion started and refuses Stop for any other job, since `stopJob` names no job;
+Elegoo resin requires the same `TaskId` and `Filename`, sends
 command 130 once, waits up to 10 seconds for its `Ack`, and is confirmed by STOPPED for that
 task. OctoPrint cannot distinguish another execution of
 the same file. Stop waits up to 25 seconds, sends once, and returns 409 when unconfirmed.
