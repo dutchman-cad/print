@@ -48,6 +48,7 @@ struct Machine {
     wrong_path: bool,
     slow: bool,
     oversized: bool,
+    delay: bool,
 }
 struct Shared {
     machine: Mutex<Machine>,
@@ -115,7 +116,7 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
     match (parts.method.as_str(), path.as_str()) {
         ("GET", "/api/connection") => axum::Json(json!({"current":{"state":m.connection.as_ref().unwrap_or(&m.state),"port":"SYNTHETIC","baudrate":115200,"printerProfile":"test"}})).into_response(),
         ("GET", "/api/printer") => {
-            let flags = m.flags.clone().unwrap_or_else(|| json!({"operational":!matches!(m.state.as_str(),"Offline"|"Offline after error"|"Opening serial connection"),"printing":m.state=="Printing","paused":m.state=="Paused","pausing":m.state=="Pausing","cancelling":m.state=="Cancelling","error":m.state=="Error","ready":m.state=="Operational","closedOrError":matches!(m.state.as_str(),"Offline"|"Offline after error")}));
+            let flags = m.flags.clone().unwrap_or_else(|| json!({"operational":!matches!(m.state.as_str(),"Offline"|"Offline after error"|"Opening serial connection"),"printing":matches!(m.state.as_str(),"Printing"|"Printing from SD"),"paused":m.state=="Paused","pausing":m.state=="Pausing","cancelling":m.state=="Cancelling","error":m.state=="Error","ready":m.state=="Operational","closedOrError":matches!(m.state.as_str(),"Offline"|"Offline after error")}));
             axum::Json(json!({"state":{"text":m.state,"flags":flags},"temperature":{"tool0":{"actual":201.5},"bed":{"actual":59.0}}})).into_response()
         }
         ("GET", "/api/job") => axum::Json(json!({"state":m.state,"job":{"file":file(&m)},"progress":m.progress})).into_response(),
@@ -144,10 +145,30 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
         ("POST", "/api/job") => {
             if m.conflict || m.start_conflict {return StatusCode::CONFLICT.into_response();}
             let value: Value = serde_json::from_slice(&body).unwrap();
+            if m.delay {
+                let (transition, final_state) = match value["command"].as_str().unwrap() {
+                    "start" => ("Starting", "Printing"),
+                    "cancel" => ("Cancelling", "Operational"),
+                    "pause" if value["action"] == "pause" => ("Pausing", "Paused"),
+                    "pause" => ("Resuming", "Printing"),
+                    _ => unreachable!(),
+                };
+                m.state = transition.into();
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                    let mut m = shared.machine.lock().await;
+                    m.state = final_state.into();
+                    if final_state == "Operational" {
+                        m.history = json!({"date":1793059200.875,"success":false});
+                    }
+                });
+                return StatusCode::NO_CONTENT.into_response();
+            }
             match value["command"].as_str().unwrap() {
                 "start" => {m.state = "Printing".into(); if m.lost {return Response::new(Body::new(Broken));}},
                 "pause" => match value["action"].as_str().unwrap() {"pause" => m.state="Paused".into(), "resume" => m.state="Printing".into(), _ => unreachable!()},
-                "cancel" => {m.state="Operational".into(); m.history=json!({"date":200,"success":false});},
+                "cancel" => {m.state="Operational".into(); m.history=json!({"date":1793059200.875,"success":false});},
                 _ => unreachable!(),
             }
             StatusCode::NO_CONTENT.into_response()
@@ -182,6 +203,7 @@ impl Fake {
                 wrong_path: false,
                 slow: false,
                 oversized: false,
+                delay: false,
             }),
             entered: Notify::new(),
             release: Notify::new(),
@@ -246,19 +268,35 @@ async fn states_serial_connection_authentication_and_optional_values() {
         ("Printing", PrinterState::Printing),
         ("Pausing", PrinterState::Printing),
         ("Cancelling", PrinterState::Printing),
+        ("Starting", PrinterState::Printing),
+        ("Starting print from SD", PrinterState::Printing),
+        ("Resuming", PrinterState::Printing),
+        ("Finishing", PrinterState::Printing),
+        ("Printing from SD", PrinterState::Printing),
+        ("Sending file to SD", PrinterState::Offline),
+        ("Starting to send file to SD", PrinterState::Offline),
+        ("Transferring file to SD", PrinterState::Offline),
+        ("Transferring file to printer", PrinterState::Offline),
+        ("Connecting", PrinterState::Offline),
+        ("Detecting", PrinterState::Offline),
+        ("Detecting serial port", PrinterState::Offline),
+        ("Detecting baudrate", PrinterState::Offline),
         ("Paused", PrinterState::Paused),
         ("Error", PrinterState::Error),
         ("Offline", PrinterState::Offline),
-        ("Offline after error", PrinterState::Offline),
-        ("Opening serial connection", PrinterState::Error),
-        ("Future", PrinterState::Error),
+        ("Offline after error", PrinterState::Error),
+        ("Opening serial connection", PrinterState::Offline),
+        ("Future", PrinterState::Offline),
     ] {
         f.shared.machine.lock().await.state = state.into();
-        assert_eq!(
-            client.snapshot().await.unwrap().printer.state,
-            expected,
-            "{state}"
-        );
+        let snapshot = client.snapshot().await.unwrap();
+        assert_eq!(snapshot.printer.state, expected, "{state}");
+        if expected != PrinterState::Idle {
+            assert!(
+                dutchman_print::octoprint::ready(&snapshot).is_err(),
+                "{state}"
+            );
+        }
     }
     {
         let mut m = f.shared.machine.lock().await;
@@ -318,9 +356,15 @@ async fn start_stages_without_print_then_explicit_controls_and_completion_need_c
     assert!(body.contains("name=\"print\"\r\n\r\nfalse"));
     assert!(body.contains("name=\"select\"\r\n\r\nfalse"));
     drop(m);
+    f.shared.machine.lock().await.state = "Finishing".into();
+    assert_eq!(b.job("one").await.unwrap().state, JobState::Printing);
+    assert_eq!(
+        b.printers().await.unwrap()[0].detail.as_deref(),
+        Some("Finishing")
+    );
     f.shared.machine.lock().await.state = "Operational".into();
     assert_eq!(b.job("one").await.unwrap().state, JobState::Printing);
-    f.shared.machine.lock().await.history = json!({"date":200,"success":true});
+    f.shared.machine.lock().await.history = json!({"date":1793059200.875,"success":true});
     assert_eq!(b.job("one").await.unwrap().state, JobState::Done);
     assert_eq!(b.printers().await.unwrap()[0].needs_clearing, Some(true));
     b.clear("test").await.unwrap();
@@ -424,11 +468,11 @@ async fn stale_history_and_failed_outcomes_remain_distinct() {
     let dir = tempfile::tempdir().unwrap();
     let b = f.backend(dir.path()).await;
     b.clear("test").await.unwrap();
-    f.shared.machine.lock().await.history = json!({"date":100,"success":true});
+    f.shared.machine.lock().await.history = json!({"date":1793059200.125,"success":true});
     b.start("one").await.unwrap();
     f.shared.machine.lock().await.state = "Operational".into();
     assert_eq!(b.job("one").await.unwrap().state, JobState::Printing);
-    f.shared.machine.lock().await.history = json!({"date":200,"success":false});
+    f.shared.machine.lock().await.history = json!({"date":1793059200.875,"success":false});
     assert_eq!(b.job("one").await.unwrap().state, JobState::Failed);
     assert!(b.resume("test").await.is_err());
     assert_eq!(b.printers().await.unwrap()[0].needs_clearing, Some(true));
@@ -526,7 +570,14 @@ async fn lost_start_checkpoint_survives_restart_without_repeating_start() {
 
 #[tokio::test]
 async fn unknown_or_contradictory_resume_telemetry_never_moves_the_printer() {
-    for mode in ["unknown", "missing", "flags", "connection"] {
+    for mode in [
+        "unknown",
+        "missing",
+        "flags",
+        "connection",
+        "not_operational",
+        "contradictory_flags",
+    ] {
         let f = Fake::new().await;
         let dir = tempfile::tempdir().unwrap();
         let b = f.backend(dir.path()).await;
@@ -540,6 +591,13 @@ async fn unknown_or_contradictory_resume_telemetry_never_moves_the_printer() {
                 "missing" => m.missing = true,
                 "flags" => m.flags = Some(json!({"operational":true})),
                 "connection" => m.connection = Some("Printing".into()),
+                "not_operational" | "contradictory_flags" => {
+                    m.flags = Some(json!({
+                        "operational":mode != "not_operational", "paused":true,
+                        "printing":mode == "contradictory_flags", "pausing":false,
+                        "cancelling":false,"error":false,"closedOrError":false,"ready":true
+                    }))
+                }
                 _ => unreachable!(),
             }
         }
@@ -761,4 +819,72 @@ async fn stale_and_oversized_telemetry_blocks_readiness() {
     let began = std::time::Instant::now();
     assert!(client.snapshot().await.is_err());
     assert!(began.elapsed() < std::time::Duration::from_secs(6));
+}
+
+#[tokio::test]
+async fn delayed_transitions_are_polled_without_repeating_commands() {
+    let f = Fake::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let b = f.backend(dir.path()).await;
+    b.clear("test").await.unwrap();
+    f.shared.machine.lock().await.delay = true;
+    assert_eq!(b.start("one").await.unwrap().state, JobState::Printing);
+    assert_eq!(b.pause("test").await.unwrap().state, JobState::Paused);
+    assert_eq!(b.resume("test").await.unwrap().state, JobState::Printing);
+    assert_eq!(b.cancel("one").await.unwrap().state, JobState::Cancelled);
+    assert_eq!(f.commands().await.len(), 4);
+}
+
+#[tokio::test]
+async fn fractional_history_orders_results_within_the_same_second() {
+    for success in [true, false] {
+        let f = Fake::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let b = f.backend(dir.path()).await;
+        b.clear("test").await.unwrap();
+        f.shared.machine.lock().await.history = json!({"date":1793059200.5,"success":true});
+        b.start("one").await.unwrap();
+        f.shared.machine.lock().await.state = "Operational".into();
+        for date in [
+            json!(1793059200.25),
+            json!(1793059200.5),
+            Value::Null,
+            json!("1793059200.75"),
+        ] {
+            f.shared.machine.lock().await.history = json!({"date":date,"success":success});
+            assert_eq!(b.job("one").await.unwrap().state, JobState::Printing);
+        }
+        let history = json!({"date":1793059200.75,"success":success});
+        assert!(history["date"].as_u64().is_none());
+        f.shared.machine.lock().await.history = history;
+        assert_eq!(
+            b.job("one").await.unwrap().state,
+            if success {
+                JobState::Done
+            } else {
+                JobState::Failed
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn flags_precede_text_but_inconsistent_text_cannot_authorize_start() {
+    let f = Fake::new().await;
+    let client = Client::new(f.config().printers.remove(0)).unwrap();
+    for (key, expected) in [
+        ("printing", PrinterState::Printing),
+        ("pausing", PrinterState::Printing),
+        ("cancelling", PrinterState::Printing),
+        ("paused", PrinterState::Paused),
+        ("error", PrinterState::Error),
+        ("closedOrError", PrinterState::Offline),
+    ] {
+        let mut flags = json!({"operational":true,"printing":false,"pausing":false,"cancelling":false,"paused":false,"error":false,"closedOrError":false,"ready":true});
+        flags[key] = json!(true);
+        f.shared.machine.lock().await.flags = Some(flags);
+        let snapshot = client.snapshot().await.unwrap();
+        assert_eq!(snapshot.printer.state, expected, "{key}");
+        assert!(dutchman_print::octoprint::ready(&snapshot).is_err());
+    }
 }

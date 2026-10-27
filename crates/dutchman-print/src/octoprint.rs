@@ -21,6 +21,8 @@ pub struct Snapshot {
     pub printer: Printer,
     pub connection: Value,
     pub job: Value,
+    pub ready: bool,
+    pub control_ready: bool,
 }
 fn refuse(message: &str) -> Error {
     Error::Refused(message.into())
@@ -264,89 +266,45 @@ impl Client {
             .ok_or(Error::Unavailable)?;
         let mut printer = self.offline(&Error::Unavailable);
         printer.detail = Some(
-            match connection_state {
-                "Offline" => "Offline: printer serial connection is disconnected.",
-                "Offline after error" => {
-                    "Offline after error: check the printer serial connection."
-                }
-                "Operational" | "Printing" | "Pausing" | "Cancelling" | "Paused" | "Error" => {
-                    connection_state
-                }
-                _ => "Unknown or opening serial connection. Read fresh status.",
-            }
-            .into(),
+            state_text(connection_state)
+                .unwrap_or("Unknown printer state")
+                .into(),
         );
-        if matches!(connection_state, "Offline" | "Offline after error") {
+        if matches!(
+            connection_state,
+            "Offline" | "Offline after error" | "Error"
+        ) || connecting(connection_state)
+        {
+            printer.state = if matches!(connection_state, "Error" | "Offline after error") {
+                PrinterState::Error
+            } else {
+                PrinterState::Offline
+            };
             return Ok(Snapshot {
                 printer,
                 connection,
                 job,
+                ready: false,
+                control_ready: false,
             });
         }
         let data = self.json("/api/printer").await?;
-        let flags = data.pointer("/state/flags").ok_or(Error::Unavailable)?;
-        let flag = |key: &str| flags.get(key).and_then(Value::as_bool);
-        let complete = [
-            "operational",
-            "paused",
-            "printing",
-            "pausing",
-            "cancelling",
-            "error",
-            "ready",
-            "closedOrError",
-        ]
-        .iter()
-        .all(|key| flag(key).is_some());
-        let text = data.pointer("/state/text").and_then(Value::as_str);
-        printer.state = if !complete
-            || connection_state != job_state
-            || text != Some(job_state)
-            || flag("error") == Some(true)
+        let flags = data.pointer("/state/flags");
+        let text = data
+            .pointer("/state/text")
+            .and_then(Value::as_str)
+            .unwrap_or(job_state);
+        printer.state = summary(flags, text);
+        printer.detail = Some(state_text(text).unwrap_or("Unknown printer state").into());
+        // Display flags take precedence over asynchronously sampled text. Readiness
+        // remains stricter: all three resources must agree before starting.
+        if printer.state == PrinterState::Idle
+            && (connection_state != "Operational"
+                || job_state != "Operational"
+                || text != "Operational")
         {
-            PrinterState::Error
-        } else if flag("closedOrError") == Some(true) {
-            PrinterState::Offline
-        } else if flag("operational") != Some(true) {
-            PrinterState::Error
-        } else if matches!(job_state, "Pausing" | "Cancelling")
-            && flag(if job_state == "Pausing" {
-                "pausing"
-            } else {
-                "cancelling"
-            }) == Some(true)
-            && flag("paused") == Some(false)
-            && flag(if job_state == "Pausing" {
-                "cancelling"
-            } else {
-                "pausing"
-            }) == Some(false)
-        {
-            PrinterState::Printing
-        } else if job_state == "Paused"
-            && flag("paused") == Some(true)
-            && flag("printing") == Some(false)
-            && flag("pausing") == Some(false)
-            && flag("cancelling") == Some(false)
-        {
-            PrinterState::Paused
-        } else if job_state == "Printing"
-            && flag("printing") == Some(true)
-            && flag("paused") == Some(false)
-            && flag("pausing") == Some(false)
-            && flag("cancelling") == Some(false)
-        {
-            PrinterState::Printing
-        } else if job_state == "Operational"
-            && flag("ready") == Some(true)
-            && ["printing", "paused", "pausing", "cancelling"]
-                .iter()
-                .all(|k| flag(k) == Some(false))
-        {
-            PrinterState::Idle
-        } else {
-            PrinterState::Error
-        };
+            printer.detail = Some("Printer state is changing. Read fresh status.".into());
+        }
         printer.job_name = job
             .pointer("/job/file/display")
             .and_then(Value::as_str)
@@ -368,7 +326,22 @@ impl Client {
         printer.bed_temperature = data
             .pointer("/temperature/bed/actual")
             .and_then(Value::as_f64);
+        let flag = |key: &str| flags.and_then(|v| v.get(key)).and_then(Value::as_bool);
+        let control_ready = flags.is_some()
+            && flag("operational") == Some(true)
+            && !(flag("paused") == Some(true)
+                && ["printing", "pausing", "cancelling"]
+                    .iter()
+                    .any(|k| flag(k) == Some(true)))
+            && connection_state == job_state
+            && data.pointer("/state/text").and_then(Value::as_str) == Some(job_state)
+            && !matches!(printer.state, PrinterState::Error | PrinterState::Offline);
+        let ready = control_ready
+            && printer.state == PrinterState::Idle
+            && printer.detail.as_deref() == Some("Operational");
         Ok(Snapshot {
+            control_ready,
+            ready,
             printer,
             connection,
             job,
@@ -462,7 +435,8 @@ pub fn file_identity(job: &Value) -> Option<String> {
     Some(format!("{origin}/{name}"))
 }
 pub fn ready(snapshot: &Snapshot) -> Result<(), Error> {
-    if snapshot.printer.state != PrinterState::Idle
+    if !snapshot.ready
+        || snapshot.printer.state != PrinterState::Idle
         || snapshot.printer.detail.as_deref() != Some("Operational")
     {
         return Err(refuse("OctoPrint readiness is unknown, busy, or the serial connection is disconnected. Read fresh status and resolve the printer problem."));
@@ -474,4 +448,117 @@ pub fn history(file: &Value) -> Value {
         .or_else(|| file.pointer("/print/last"))
         .cloned()
         .unwrap_or(Value::Null)
+}
+
+// Only known state text is returned; arbitrary backend messages may contain secrets.
+fn state_text(text: &str) -> Option<&str> {
+    match text {
+        "Operational"
+        | "Printing"
+        | "Printing from SD"
+        | "Starting"
+        | "Starting print from SD"
+        | "Resuming"
+        | "Finishing"
+        | "Pausing"
+        | "Cancelling"
+        | "Paused"
+        | "Error"
+        | "Offline"
+        | "Offline after error"
+        | "Opening serial connection"
+        | "Connecting"
+        | "Detecting"
+        | "Detecting serial port"
+        | "Detecting baudrate"
+        | "Sending file to SD"
+        | "Starting to send file to SD"
+        | "Transferring file to SD"
+        | "Transferring file to printer" => Some(text),
+        _ => None,
+    }
+}
+fn connecting(text: &str) -> bool {
+    matches!(
+        text,
+        "Opening serial connection"
+            | "Connecting"
+            | "Detecting"
+            | "Detecting serial port"
+            | "Detecting baudrate"
+    )
+}
+fn summary(flags: Option<&Value>, text: &str) -> PrinterState {
+    let flag = |key: &str| flags.and_then(|v| v.get(key)).and_then(Value::as_bool);
+    if flag("error") == Some(true) || matches!(text, "Error" | "Offline after error") {
+        return PrinterState::Error;
+    }
+    if flag("closedOrError") == Some(true) {
+        return PrinterState::Offline;
+    }
+    // An incomplete flags object is not evidence of readiness or activity.
+    if flags.is_some()
+        && [
+            "operational",
+            "printing",
+            "paused",
+            "pausing",
+            "cancelling",
+            "error",
+            "ready",
+            "closedOrError",
+        ]
+        .iter()
+        .any(|key| flag(key).is_none())
+    {
+        return PrinterState::Error;
+    }
+    if flag("pausing") == Some(true) || flag("cancelling") == Some(true) {
+        return PrinterState::Printing;
+    }
+    if flag("paused") == Some(true) {
+        return PrinterState::Paused;
+    }
+    if flag("printing") == Some(true) {
+        return PrinterState::Printing;
+    }
+    // These phases can have printing=false while scripts or queued moves finish.
+    if matches!(
+        text,
+        "Starting" | "Starting print from SD" | "Resuming" | "Finishing"
+    ) {
+        return PrinterState::Printing;
+    }
+    if connecting(text)
+        || matches!(
+            text,
+            "Offline"
+                | "Sending file to SD"
+                | "Starting to send file to SD"
+                | "Transferring file to SD"
+                | "Transferring file to printer"
+        )
+    {
+        // API v1 has no busy state. Keep the reason in detail and block readiness.
+        return PrinterState::Offline;
+    }
+    if flags.is_some() {
+        return if flag("operational") == Some(true) && flag("ready") == Some(true) {
+            PrinterState::Idle
+        } else {
+            PrinterState::Offline
+        };
+    }
+    match text {
+        "Operational" => PrinterState::Idle,
+        "Printing" | "Printing from SD" | "Pausing" | "Cancelling" => PrinterState::Printing,
+        "Paused" => PrinterState::Paused,
+        _ => PrinterState::Offline,
+    }
+}
+pub fn history_date(history: &Value) -> Option<f64> {
+    history
+        .get("date")
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite())
 }

@@ -117,14 +117,24 @@ the same live job is cancelled and fresh telemetry confirms the outcome.
 OctoPrint uses the same routes, confirmation header, reviewed-byte checks, and bed-clear
 policy. Its `detail` retains a known connection state or a safe availability reason;
 authentication failure is separate from machine failure. A reachable host with a disconnected
-serial printer is `offline`. Unknown or contradictory telemetry is `error` and blocks control.
+serial printer is `offline`; `Offline after error` is `error`. Summary states prefer
+printer flags over display text. Starting, Resuming, SD printing, Pausing, Cancelling, and
+Finishing map to `printing`; Finishing alone cannot establish completion. Connection/detection
+and file-transfer phases map to `offline`, with the phase in `detail` (v1 has no busy state).
+Unknown or contradictory readiness blocks start/resume.
 For OctoPrint, optional `job_id` identifies the selected file as `origin/name`, not an
 execution identifier. Pause/resume/cancel require that file still be live and match the
 companion's attempted start. External reprints of the exact staged file are indistinguishable;
 avoid external control of those files. Idle status alone never completes a tracked job.
 A newer file print-history result after observed activity establishes `done` or `failed`;
 an unsuccessful result after companion cancellation establishes `cancelled`. Missing history
-leaves the outcome unresolved. Physical firmware, material, tooling, and plate changes not
+leaves the outcome unresolved. History timestamps are read as finite `f64` Unix seconds,
+including fractions, and must be strictly newer than the pre-start value.
+After an accepted command, the request waits for matching telemetry for up to 25 seconds
+for start/cancel or 10 seconds for pause/resume. Pending is announced on stderr during this
+wait. Expiry returns the existing 409 error with an unconfirmed pending outcome; clients
+must read status before another action. The command is sent once, with no automatic retry.
+Physical firmware, material, tooling, and plate changes not
 reported by OctoPrint require operator review before confirmation. See the
 [OctoPrint configuration and checks](print.md#octoprint).
 

@@ -527,8 +527,12 @@ Status reads the documented [connection](https://docs.octoprint.org/en/main/api/
 [printer](https://docs.octoprint.org/en/main/api/printer.html), and
 [job](https://docs.octoprint.org/en/main/api/job.html) endpoints within four seconds. A reachable
 host with disconnected serial reports offline. Opening, missing, contradictory, or unknown
-states block control. Operational maps to idle, Printing/Pausing/Cancelling to printing,
-Paused to paused, and Error to error; documented flags must agree. Progress, remaining time,
+states block control. Summary states prefer the documented flags over display text.
+Starting, Resuming, Printing from SD, Pausing, Cancelling, and Finishing report printing;
+Finishing remains unresolved until newer history establishes the terminal result. Paused
+reports paused. Error and Offline after error report error. Connection/detection phases and
+SD/file transfers report offline with their phase in detail, since API v1 has no busy state.
+Starting still requires complete flags and consistent Operational readiness. Progress, remaining time,
 temperatures, and selected file name are reported when available. Missing values stay absent.
 
 Before starting, acknowledge the checked bed with `clear workbench --yes` or the confirmed
@@ -545,8 +549,13 @@ requires status reconciliation; an attempted start is never repeated automatical
 Pause, explicit resume, and cancel require a fresh local file-name/origin match to the job
 Dutchman started. Pause never toggles. OctoPrint supplies no execution ID, so external reuse
 of the exact staged file cannot be distinguished; avoid controlling these files elsewhere.
+After an accepted start or cancel, Dutchman polls for up to 25 seconds; pause and resume
+poll for up to 10 seconds. It announces pending on stderr while waiting, then reports an
+unconfirmed pending outcome if the deadline expires. Polling only reads status and never
+repeats the command. Read status before another action after an uncertain result.
 An idle machine alone does not prove completion. Dutchman requires a newer print-history
-record for that file after observing it active. A successful record means done; an unsuccessful
+record for that file after observing it active. History dates are finite floating-point Unix
+timestamps; fractions are retained when comparing against the pre-start history. A successful record means done; an unsuccessful
 record means failed, or cancelled when this companion requested cancellation. Without that
 evidence the outcome stays unresolved. After every start attempt, finish, cancellation, or
 failure, check and acknowledge the bed again. CLI state preserves attempted starts across

@@ -427,12 +427,7 @@ impl Printers {
             )
         {
             match live.printer.state {
-                PrinterState::Printing
-                    if matches!(
-                        live.printer.detail.as_deref(),
-                        Some("Printing" | "Pausing" | "Cancelling")
-                    ) =>
-                {
+                PrinterState::Printing => {
                     target.job.state = JobState::Printing;
                     target.remote = Some(identity);
                 }
@@ -452,17 +447,9 @@ impl Printers {
                         ));
                     }
                     let history = crate::octoprint::history(&file);
-                    if history
-                        .get("date")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|date| {
-                            target
-                                .history
-                                .get("date")
-                                .and_then(Value::as_u64)
-                                .is_none_or(|old| date > old)
-                        })
-                    {
+                    if crate::octoprint::history_date(&history).is_some_and(|date| {
+                        crate::octoprint::history_date(&target.history).is_none_or(|old| date > old)
+                    }) {
                         target.job.state = match history.get("success").and_then(Value::as_bool) {
                             Some(true) => JobState::Done,
                             Some(false) if target.cancelling => JobState::Cancelled,
@@ -485,7 +472,8 @@ impl Printers {
             .get(&target.job.printer)
             .ok_or(Error::NotFound)?;
         let live = self.reconcile_octoprint(target).await?;
-        if !target.attempted
+        if !live.control_ready
+            || !target.attempted
             || target.remote.is_none()
             || target.remote != live.printer.job_id
             || live
@@ -498,7 +486,7 @@ impl Printers {
                 (action, live.printer.detail.as_deref(), live.printer.state),
                 (
                     "pause",
-                    Some("Printing"),
+                    Some("Printing" | "Printing from SD"),
                     crate::backend::PrinterState::Printing
                 ) | (
                     "resume",
@@ -506,7 +494,17 @@ impl Printers {
                     crate::backend::PrinterState::Paused
                 ) | (
                     "cancel",
-                    Some("Printing" | "Pausing" | "Paused" | "Cancelling"),
+                    Some(
+                        "Printing"
+                            | "Printing from SD"
+                            | "Starting"
+                            | "Starting print from SD"
+                            | "Resuming"
+                            | "Finishing"
+                            | "Pausing"
+                            | "Paused"
+                            | "Cancelling"
+                    ),
                     crate::backend::PrinterState::Printing | crate::backend::PrinterState::Paused
                 )
             )
@@ -522,20 +520,69 @@ impl Printers {
         if action == "cancel" && !matches!(result, Err(Error::Refused(_) | Error::Authentication)) {
             target.cancelling = true;
         }
-        let fresh = self.reconcile_octoprint(target).await;
-        result?;
-        fresh?;
-        let expected = match action {
-            "pause" => JobState::Paused,
-            "resume" => JobState::Printing,
-            _ => JobState::Cancelled,
-        };
-        if target.job.state != expected {
-            return Err(refuse(
-                "Command outcome is not confirmed. Read fresh status to reconcile the job.",
-            ));
+        if result.is_err() {
+            let _ = self.reconcile_octoprint(target).await;
+            result?;
         }
+        self.wait_octoprint(target, action).await?;
         Ok(target.job.clone())
+    }
+    async fn wait_octoprint(&self, target: &mut Prepared, action: &str) -> Result<(), Error> {
+        use std::time::Duration;
+        use tokio::time::{sleep, timeout_at, Instant};
+        let budget = if matches!(action, "start" | "cancel") {
+            25
+        } else {
+            10
+        };
+        let deadline = Instant::now() + Duration::from_secs(budget);
+        let mut pending = false;
+        loop {
+            let fresh = timeout_at(deadline, self.reconcile_octoprint(target)).await;
+            if let Ok(Ok(live)) = &fresh {
+                let matching = live.printer.job_id == target.remote
+                    && live
+                        .job
+                        .pointer("/job/file/path")
+                        .and_then(Value::as_str)
+                        .is_none_or(|p| p == target.filename);
+                let confirmed = matching
+                    && match action {
+                        "start" | "resume" => {
+                            target.job.state == JobState::Printing
+                                && matches!(
+                                    live.printer.detail.as_deref(),
+                                    Some("Printing" | "Printing from SD")
+                                )
+                                && live.printer.state == crate::backend::PrinterState::Printing
+                        }
+                        "pause" => {
+                            target.job.state == JobState::Paused
+                                && live.printer.state == crate::backend::PrinterState::Paused
+                        }
+                        _ => target.job.state == JobState::Cancelled,
+                    };
+                if confirmed {
+                    return Ok(());
+                }
+                if live.printer.job_id.as_deref()
+                    != Some(format!("local/{}", target.filename).as_str())
+                {
+                    return Err(refuse("Live file changed while the command was pending. Read fresh status to reconcile the job."));
+                }
+            }
+            if !pending {
+                eprintln!("OctoPrint {action} is pending. Waiting for fresh status; do not repeat the command.");
+                pending = true;
+            }
+            if Instant::now() >= deadline {
+                return Err(refuse("OctoPrint command is not confirmed after waiting. Read fresh status to reconcile the pending outcome; do not repeat the command."));
+            }
+            sleep(
+                Duration::from_millis(250).min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
+        }
     }
     async fn start_octoprint(
         &self,
@@ -629,17 +676,14 @@ impl Printers {
         let reply = client
             .command("/api/job", serde_json::json!({"command":"start"}))
             .await;
-        let fresh = self.reconcile_octoprint(target).await;
+        if reply.is_err() {
+            let _ = self.reconcile_octoprint(target).await;
+        }
         match reply {
             Err(Error::Unavailable) => return Err(refuse("Start reply was lost. Read status to reconcile the intended file and job. Start will not be repeated.")),
             other => other?,
         }
-        fresh?;
-        if target.job.state != JobState::Printing {
-            return Err(refuse(
-                "Start is not confirmed. Read status to reconcile the intended file and job.",
-            ));
-        }
+        self.wait_octoprint(target, "start").await?;
         Ok(target.job.clone())
     }
 }
