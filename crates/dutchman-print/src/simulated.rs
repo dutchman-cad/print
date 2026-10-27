@@ -13,6 +13,15 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> Duration;
 }
 
+pub struct WallClock;
+impl Clock for WallClock {
+    fn now(&self) -> Duration {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+    }
+}
+
 pub struct SystemClock(Instant);
 impl Default for SystemClock {
     fn default() -> Self {
@@ -162,6 +171,15 @@ impl Simulated {
 }
 
 impl Backend for Simulated {
+    fn restore_jobs<'a>(&'a self, path: &'a Path) -> Reply<'a, ()> {
+        Box::pin(async move {
+            self.restore(path).map_err(Error::Failed)?;
+            Ok(())
+        })
+    }
+    fn persist_jobs<'a>(&'a self, path: &'a Path) -> Reply<'a, ()> {
+        Box::pin(async move { self.save(path).map_err(Error::Failed) })
+    }
     fn printers(&self) -> Reply<'_, Vec<Printer>> {
         Box::pin(async {
             let jobs = self.jobs()?;

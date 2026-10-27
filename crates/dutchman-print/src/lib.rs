@@ -3,6 +3,7 @@
 pub mod backend;
 pub mod bambu;
 pub mod config;
+pub mod confirmation;
 pub mod printers;
 pub mod prusalink;
 pub mod safety;

@@ -16,7 +16,8 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::backend::{Backend, Error, Job, Options};
-use crate::simulated::{Clock, SystemClock};
+use crate::confirmation::{Confirmations, Intent};
+use crate::simulated::{Clock, WallClock};
 
 /// Upload, storage, expiry, and preparation limits.
 #[derive(Clone, Debug)]
@@ -54,6 +55,9 @@ pub struct ServerConfig {
     /// Upload, disk, expiry, and concurrency limits, with Dutchman Web's defaults.
     pub storage: StorageConfig,
     pub clock: Arc<dyn Clock>,
+    pub clearance_interval: Duration,
+    pub clearance_expiry: Duration,
+    pub confirmation_ttl: Duration,
 }
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -61,18 +65,25 @@ impl Default for ServerConfig {
             login: None,
             public_origin: Vec::new(),
             storage: StorageConfig::default(),
-            clock: Arc::new(SystemClock::default()),
+            clock: Arc::new(WallClock),
+            clearance_interval: Duration::from_secs(5),
+            clearance_expiry: Duration::from_secs(900),
+            confirmation_ttl: Duration::from_secs(60),
         }
     }
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Saved {
     created: Duration,
     preview: Option<PathBuf>,
 }
 struct App {
-    backend: Arc<dyn Backend>,
+    backend: Arc<crate::safety::Safety>,
+    raw: Arc<dyn Backend>,
+    initialized: Mutex<bool>,
+    actions: Mutex<()>,
     config: ServerConfig,
-    confirmations: Mutex<HashMap<String, Duration>>,
+    confirmations: Confirmations,
     saved: Mutex<HashMap<String, Saved>>,
     uploads: Semaphore,
     runs: Semaphore,
@@ -103,12 +114,29 @@ pub fn router(backend: Arc<dyn Backend>, config: ServerConfig) -> Router {
     let limit = usize::try_from(config.storage.max_upload)
         .unwrap_or(usize::MAX)
         .saturating_add(1 << 20);
+    let safety = Arc::new(
+        crate::safety::Safety::new(backend.clone()).timing(
+            config.clock.clone(),
+            config
+                .clearance_interval
+                .clamp(Duration::from_secs(2), Duration::from_secs(30)),
+            config
+                .clearance_expiry
+                .clamp(Duration::from_secs(60), Duration::from_secs(7200)),
+        ),
+    );
+    safety.monitor();
+    let confirmations =
+        Confirmations::new(Some(config.storage.data_dir.join("confirmations.json")));
     let app = Arc::new(App {
-        backend: Arc::new(crate::safety::Safety::new(backend)),
+        backend: safety,
+        raw: backend,
+        initialized: Mutex::new(false),
+        actions: Mutex::new(()),
         uploads: Semaphore::new(config.storage.uploads.clamp(1, Semaphore::MAX_PERMITS)),
         runs: Semaphore::new(config.storage.runs.clamp(1, Semaphore::MAX_PERMITS)),
         config,
-        confirmations: Mutex::new(HashMap::new()),
+        confirmations,
         saved: Mutex::new(HashMap::new()),
     });
     Router::new()
@@ -117,6 +145,10 @@ pub fn router(backend: Arc<dyn Backend>, config: ServerConfig) -> Router {
             get(|| async { Json(serde_json::json!({"service": "dutchman-print", "api": 1})) }),
         )
         .route("/api/v1/printers", get(printers))
+        .route(
+            "/api/v1/confirmations",
+            post(challenge).layer(DefaultBodyLimit::max(4096)),
+        )
         .route("/api/v1/jobs", post(create))
         .route("/api/v1/jobs/{id}", get(job))
         .route("/api/v1/jobs/{id}/preview.png", get(preview))
@@ -186,10 +218,72 @@ async fn guard_in(app: &App, request: Request, next: Next) -> Response {
                 .into_response();
         }
     }
+    if let Err(problem) = initialize(app).await {
+        return problem.into_response();
+    }
     if let Err(problem) = expire(app).await {
         return problem.into_response();
     }
     next.run(request).await
+}
+
+async fn initialize(app: &App) -> Result<(), Problem> {
+    let mut initialized = app.initialized.lock().await;
+    if !*initialized {
+        app.raw
+            .restore_jobs(&app.config.storage.data_dir.join("jobs.json"))
+            .await
+            .map_err(backend_error)?;
+        app.backend
+            .restore(&app.config.storage.data_dir.join("safety.json"))
+            .await
+            .map_err(internal)?;
+        match crate::safety::read_state(&app.config.storage.data_dir.join("saved.json")).await {
+            Ok(bytes) => {
+                *app.saved.lock().await = serde_json::from_slice(&bytes).map_err(internal)?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(internal(e)),
+        }
+        *initialized = true;
+    }
+    Ok(())
+}
+async fn checkpoint(app: &App) -> Result<(), Problem> {
+    let _write = app.actions.lock().await;
+    app.raw
+        .persist_jobs(&app.config.storage.data_dir.join("jobs.json"))
+        .await
+        .map_err(backend_error)?;
+    app.backend
+        .save(&app.config.storage.data_dir.join("safety.json"))
+        .await
+        .map_err(internal)?;
+    let saved = app.saved.lock().await;
+    let bytes = serde_json::to_vec(&*saved).map_err(internal)?;
+    let temporary = app.config.storage.data_dir.join("saved.new");
+    tokio::fs::write(&temporary, bytes)
+        .await
+        .map_err(internal)?;
+    tokio::fs::rename(temporary, app.config.storage.data_dir.join("saved.json"))
+        .await
+        .map_err(internal)
+}
+async fn challenge(
+    State(app): State<Shared>,
+    Json(intent): Json<Intent>,
+) -> Result<impl IntoResponse, Problem> {
+    let challenge = app
+        .confirmations
+        .issue(
+            &app.backend,
+            intent,
+            app.config.clock.now(),
+            app.config.confirmation_ttl,
+        )
+        .await
+        .map_err(backend_error)?;
+    Ok((StatusCode::CREATED, Json(challenge)))
 }
 
 async fn expire(app: &App) -> Result<(), Problem> {
@@ -456,6 +550,7 @@ async fn create_in(
         },
     );
     drop(saved);
+    checkpoint(app).await?;
     app.backend.job(id).await.map_err(backend_error)
 }
 
@@ -473,7 +568,18 @@ async fn preview(State(app): State<Shared>, Path(id): Path<String>) -> Result<Re
     Ok(([(header::CONTENT_TYPE, "image/png")], bytes).into_response())
 }
 
-async fn confirm(app: &App, headers: &HeaderMap) -> Result<(), Problem> {
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Confirmation {
+    confirmation: Option<String>,
+}
+async fn confirm(
+    app: &App,
+    headers: &HeaderMap,
+    request: Request,
+    action: &str,
+    id: &str,
+) -> Result<(), Problem> {
     let error = || {
         (
             StatusCode::FORBIDDEN,
@@ -486,7 +592,7 @@ async fn confirm(app: &App, headers: &HeaderMap) -> Result<(), Problem> {
     }
     let token = values
         .first()
-        .and_then(|value| value.to_str().ok())
+        .and_then(|v| v.to_str().ok())
         .ok_or_else(error)?;
     if token.len() != 64
         || !token
@@ -495,35 +601,57 @@ async fn confirm(app: &App, headers: &HeaderMap) -> Result<(), Problem> {
     {
         return Err(error());
     }
-    let now = app.config.clock.now();
-    let mut seen = app.confirmations.lock().await;
-    seen.retain(|_, when| now.saturating_sub(*when) < Duration::from_secs(600));
-    if seen.contains_key(token) {
-        return Err(error());
+    let Query(query) = Query::<Confirmation>::try_from_uri(request.uri())
+        .map_err(|_| bad("Use a confirmation id."))?;
+    let bytes = axum::body::to_bytes(request.into_body(), 4096)
+        .await
+        .map_err(|_| bad("Use a small confirmation body."))?;
+    let body: Confirmation = if bytes.is_empty() {
+        Confirmation::default()
+    } else {
+        serde_json::from_slice(&bytes).map_err(|_| bad("Use a confirmation id in JSON."))?
+    };
+    if query.confirmation.is_some() && body.confirmation.is_some() {
+        return Err(bad("Send confirmation once."));
     }
-    if seen.len() >= 10000 {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Too many confirmations. Try again later.".into(),
-        ));
-    }
-    seen.insert(token.into(), now);
-    Ok(())
+    let challenge = query.confirmation.or(body.confirmation).ok_or_else(error)?;
+    let (printer, job) = if matches!(action, "start" | "cancel") {
+        let job = app.backend.job(id).await.map_err(backend_error)?;
+        (job.printer, Some(id.into()))
+    } else {
+        (id.into(), None)
+    };
+    app.confirmations
+        .consume(
+            &app.backend,
+            &challenge,
+            &Intent {
+                action: action.into(),
+                printer,
+                job,
+            },
+            Some(token),
+            app.config.clock.now(),
+        )
+        .await
+        .map_err(backend_error)
 }
 async fn action(
     app: &App,
     id: &str,
     headers: HeaderMap,
+    request: Request,
     action: &str,
 ) -> Result<Json<Job>, Problem> {
-    confirm(app, &headers).await?;
-    let job = match action {
+    confirm(app, &headers, request, action, id).await?;
+    let result = match action {
         "start" => app.backend.start(id).await,
         "cancel" => app.backend.cancel(id).await,
         "pause" => app.backend.pause(id).await,
         _ => app.backend.resume(id).await,
-    }
-    .map_err(backend_error)?;
+    };
+    checkpoint(app).await?;
+    let job = result.map_err(backend_error)?;
     crate::log_action(action, &job);
     Ok(Json(job))
 }
@@ -531,38 +659,43 @@ async fn start(
     State(app): State<Shared>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    request: Request,
 ) -> Result<Json<Job>, Problem> {
-    action(&app, &id, headers, "start").await
+    action(&app, &id, headers, request, "start").await
 }
 async fn cancel(
     State(app): State<Shared>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    request: Request,
 ) -> Result<Json<Job>, Problem> {
-    action(&app, &id, headers, "cancel").await
+    action(&app, &id, headers, request, "cancel").await
 }
 async fn pause(
     State(app): State<Shared>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    request: Request,
 ) -> Result<Json<Job>, Problem> {
-    action(&app, &id, headers, "pause").await
+    action(&app, &id, headers, request, "pause").await
 }
 async fn resume(
     State(app): State<Shared>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    request: Request,
 ) -> Result<Json<Job>, Problem> {
-    action(&app, &id, headers, "resume").await
+    action(&app, &id, headers, request, "resume").await
 }
-
 async fn clear(
     State(app): State<Shared>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    request: Request,
 ) -> Result<StatusCode, Problem> {
-    confirm(&app, &headers).await?;
+    confirm(&app, &headers, request, "clear", &id).await?;
     app.backend.clear(&id).await.map_err(backend_error)?;
+    checkpoint(&app).await?;
     crate::log_clear(&id);
     Ok(StatusCode::NO_CONTENT)
 }

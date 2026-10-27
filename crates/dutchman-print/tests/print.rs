@@ -136,15 +136,41 @@ async fn accepted(app: &Router, request: Request<Body>, expected: u16) -> Value 
     );
     serde_json::from_slice(&body).unwrap()
 }
-async fn ready(app: &Router) -> Value {
-    let _ = send(
+async fn challenge(app: &Router, action: &str, job: Option<&str>) -> Value {
+    accepted(
         app,
-        action(
-            "/api/v1/printers/demo/clear",
-            Some(&dutchman_print::new_job_id().unwrap().repeat(2)),
-        ),
+        Request::post("/api/v1/confirmations")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"action":action,"printer":"demo","job":job}).to_string(),
+            ))
+            .unwrap(),
+        201,
+    )
+    .await
+}
+async fn confirmed(app: &Router, path: &str, token: &str) -> Request<Body> {
+    let parts: Vec<_> = path.split('/').collect();
+    let act = parts.last().copied().unwrap();
+    let job = if parts.get(3) == Some(&"jobs") {
+        parts.get(4).copied()
+    } else {
+        None
+    };
+    let c = challenge(app, act, job).await;
+    action(
+        &format!("{path}?confirmation={}", c["id"].as_str().unwrap()),
+        Some(token),
+    )
+}
+async fn ready(app: &Router) -> Value {
+    let request = confirmed(
+        app,
+        "/api/v1/printers/demo/clear",
+        &dutchman_print::new_job_id().unwrap().repeat(2),
     )
     .await;
+    assert_eq!(send(app, request).await.0, StatusCode::NO_CONTENT);
     accepted(
         app,
         upload(
@@ -262,7 +288,7 @@ async fn api_lifecycle_and_all_machine_routes_require_fresh_confirmation() {
         }
     }
     let token = "a".repeat(64);
-    let started = accepted(&app, action(&paths[0], Some(&token)), 200).await;
+    let started = accepted(&app, confirmed(&app, &paths[0], &token).await, 200).await;
     assert_eq!(started["state"], "printing");
     clock.advance(10);
     let progress = accepted(&app, get(&format!("/api/v1/jobs/{id}")), 200).await;
@@ -275,7 +301,7 @@ async fn api_lifecycle_and_all_machine_routes_require_fresh_confirmation() {
             StatusCode::FORBIDDEN
         );
     }
-    let paused = accepted(&app, action(&paths[2], Some(&"b".repeat(64))), 200).await;
+    let paused = accepted(&app, confirmed(&app, &paths[2], &"b".repeat(64)).await, 200).await;
     assert_eq!(paused["state"], "paused");
     clock.advance(20);
     assert_eq!(
@@ -283,11 +309,11 @@ async fn api_lifecycle_and_all_machine_routes_require_fresh_confirmation() {
         paused["progress"]
     );
     assert_eq!(
-        accepted(&app, action(&paths[3], Some(&"c".repeat(64))), 200).await["state"],
+        accepted(&app, confirmed(&app, &paths[3], &"c".repeat(64)).await, 200).await["state"],
         "printing"
     );
     assert_eq!(
-        accepted(&app, action(&paths[1], Some(&"d".repeat(64))), 200).await["state"],
+        accepted(&app, confirmed(&app, &paths[1], &"d".repeat(64)).await, 200).await["state"],
         "cancelled"
     );
     assert_eq!(
@@ -303,7 +329,7 @@ async fn api_lifecycle_and_all_machine_routes_require_fresh_confirmation() {
     assert_eq!(
         accepted(
             &app,
-            action(&format!("/api/v1/jobs/{next_id}/start"), Some(&token)),
+            confirmed(&app, &format!("/api/v1/jobs/{next_id}/start"), &token).await,
             200
         )
         .await["state"],
@@ -431,7 +457,23 @@ async fn authentication_origin_and_security_headers_cover_routes() {
         .insert(header::AUTHORIZATION, basic.parse().unwrap());
     let job = accepted(&app, request, 201).await;
     let path = format!("/api/v1/jobs/{}/start", job["id"].as_str().unwrap());
-    let mut clear = action("/api/v1/printers/demo/clear", Some(&"0".repeat(64)));
+    let auth_challenge = |act: &str, job: Option<&str>| {
+        Request::post("/api/v1/confirmations")
+            .header("content-type", "application/json")
+            .header(header::AUTHORIZATION, basic.as_str())
+            .body(Body::from(
+                json!({"action":act,"printer":"demo","job":job}).to_string(),
+            ))
+            .unwrap()
+    };
+    let c = accepted(&app, auth_challenge("clear", None), 201).await;
+    let mut clear = action(
+        &format!(
+            "/api/v1/printers/demo/clear?confirmation={}",
+            c["id"].as_str().unwrap()
+        ),
+        Some(&"0".repeat(64)),
+    );
     clear
         .headers_mut()
         .insert(header::AUTHORIZATION, basic.parse().unwrap());
@@ -441,7 +483,11 @@ async fn authentication_origin_and_security_headers_cover_routes() {
         send(&app, action(&path, Some(&token))).await.0,
         StatusCode::UNAUTHORIZED
     );
-    let mut request = action(&path, Some(&token));
+    let c = accepted(&app, auth_challenge("start", job["id"].as_str()), 201).await;
+    let mut request = action(
+        &format!("{path}?confirmation={}", c["id"].as_str().unwrap()),
+        Some(&token),
+    );
     request
         .headers_mut()
         .insert(header::AUTHORIZATION, basic.parse().unwrap());
@@ -596,9 +642,23 @@ fn cli_output_confirmation_and_json_prepare_only() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("Use --yes"));
     assert!(String::from_utf8_lossy(&refused.stderr).contains("Estimate:"));
     assert!(cli(&path, &["clear", "demo", "--yes"]).status.success());
-    let started = cli(
+    let stale = cli(
         &path,
         &["print", input, "--printer", "demo", "--json", "--yes"],
+    );
+    assert!(!stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("--bed-clear --yes"));
+    let started = cli(
+        &path,
+        &[
+            "print",
+            input,
+            "--printer",
+            "demo",
+            "--json",
+            "--bed-clear",
+            "--yes",
+        ],
     );
     assert!(
         started.status.success(),
@@ -635,7 +695,10 @@ fn cli_output_confirmation_and_json_prepare_only() {
         "cancelled"
     );
     assert!(cli(&path, &["clear", "demo", "--yes"]).status.success());
-    let plain = cli(&path, &["print", input, "--printer", "demo", "--yes"]);
+    let plain = cli(
+        &path,
+        &["print", input, "--printer", "demo", "--bed-clear", "--yes"],
+    );
     assert!(plain.status.success());
     assert!(String::from_utf8_lossy(&plain.stderr).contains("Estimate:"));
 }
@@ -801,6 +864,8 @@ async fn confirmation_is_atomic_and_duplicate_headers_are_refused() {
     let app = router(simulation(clock.clone()), settings(dir.path(), clock));
     let job = ready(&app).await;
     let path = format!("/api/v1/jobs/{}/start", job["id"].as_str().unwrap());
+    let c = challenge(&app, "start", job["id"].as_str()).await;
+    let path = format!("{path}?confirmation={}", c["id"].as_str().unwrap());
     let token = "e".repeat(64);
     let mut duplicate = action(&path, Some(&token));
     duplicate
@@ -812,8 +877,8 @@ async fn confirmation_is_atomic_and_duplicate_headers_are_refused() {
         send(&app, action(&path, Some(&token)))
     );
     assert!(
-        (first.0 == StatusCode::OK && second.0 == StatusCode::FORBIDDEN)
-            || (second.0 == StatusCode::OK && first.0 == StatusCode::FORBIDDEN)
+        (first.0 == StatusCode::OK && second.0 == StatusCode::CONFLICT)
+            || (second.0 == StatusCode::OK && first.0 == StatusCode::CONFLICT)
     );
 }
 
@@ -1089,88 +1154,106 @@ fn profile_validation_keeps_plain_text_and_length_limits() {
 }
 
 #[tokio::test]
-async fn bed_clearance_is_confirmed_single_use_and_shared_with_simulation() {
+async fn challenges_bind_actions_observations_expiry_and_survive_restart() {
     let dir = tempfile::tempdir().unwrap();
     let clock = Arc::new(TestClock::default());
     let app = router(
         simulation(clock.clone()),
         settings(dir.path(), clock.clone()),
     );
-    let job = accepted(
-        &app,
-        upload(&[("part.3mf", &model())], &[("printer", "demo")]),
-        201,
-    )
-    .await;
-    let start = format!("/api/v1/jobs/{}/start", job["id"].as_str().unwrap());
+    let job = ready(&app).await;
+    let id = job["id"].as_str().unwrap();
+    let c = challenge(&app, "start", Some(id)).await;
+    let query = format!("?confirmation={}", c["id"].as_str().unwrap());
+    let token = "1".repeat(64);
     assert_eq!(
-        send(&app, action(&start, Some(&"1".repeat(64)))).await.0,
+        send(
+            &app,
+            action(&format!("/api/v1/printers/demo/clear{query}"), Some(&token))
+        )
+        .await
+        .0,
         StatusCode::CONFLICT
     );
     assert_eq!(
-        send(&app, action("/api/v1/printers/demo/clear", None))
-            .await
-            .0,
+        send(
+            &app,
+            action(&format!("/api/v1/jobs/{id}/start{query}"), None)
+        )
+        .await
+        .0,
         StatusCode::FORBIDDEN
     );
-    let token = "2".repeat(64);
+    // Another clear changes neither the job nor state; the start can still be used.
     assert_eq!(
-        send(&app, action("/api/v1/printers/demo/clear", Some(&token)))
-            .await
-            .0,
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        send(&app, action(&start, Some(&token))).await.0,
-        StatusCode::FORBIDDEN
-    );
-    assert_eq!(
-        send(&app, action(&start, Some(&"3".repeat(64)))).await.0,
+        send(
+            &app,
+            action(&format!("/api/v1/jobs/{id}/start{query}"), Some(&token))
+        )
+        .await
+        .0,
         StatusCode::OK
     );
-    clock.advance(1000);
+    drop(app);
+    let app = router(
+        simulation(clock.clone()),
+        settings(dir.path(), clock.clone()),
+    );
     assert_eq!(
-        accepted(
+        accepted(&app, get(&format!("/api/v1/jobs/{id}")), 200).await["state"],
+        "printing"
+    );
+    assert_eq!(
+        send(
             &app,
-            get(&format!("/api/v1/jobs/{}", job["id"].as_str().unwrap())),
-            200
+            action(&format!("/api/v1/jobs/{id}/start{query}"), Some(&token))
         )
-        .await["state"],
-        "done"
+        .await
+        .0,
+        StatusCode::CONFLICT
     );
-    assert_eq!(
-        accepted(&app, get("/api/v1/printers"), 200).await[0]["needs_clearing"],
-        true
+    let request = confirmed(&app, "/api/v1/printers/demo/pause", &token).await;
+    assert_eq!(send(&app, request).await.0, StatusCode::CONFLICT); // durable header reuse
+                                                                   // Progress moves while a print runs; a pause confirmed a moment ago still applies.
+    let c = challenge(&app, "pause", None).await;
+    let stale = challenge(&app, "pause", None).await;
+    clock.advance(1);
+    let request = action(
+        &format!(
+            "/api/v1/printers/demo/pause?confirmation={}",
+            c["id"].as_str().unwrap()
+        ),
+        Some(&"2".repeat(64)),
     );
-    let next = accepted(
-        &app,
-        upload(&[("next.3mf", &model())], &[("printer", "demo")]),
-        201,
-    )
-    .await;
+    assert_eq!(send(&app, request).await.0, StatusCode::OK);
+    // A pause confirmed while the printer was printing no longer applies once it is paused.
+    let request = action(
+        &format!(
+            "/api/v1/printers/demo/pause?confirmation={}",
+            stale["id"].as_str().unwrap()
+        ),
+        Some(&"5".repeat(64)),
+    );
+    let result = send(&app, request).await;
+    assert_eq!(result.0, StatusCode::CONFLICT);
+    assert!(String::from_utf8_lossy(&result.2).contains("printer changed"));
+    let c = challenge(&app, "resume", None).await;
+    clock.advance(60);
     assert_eq!(
         send(
             &app,
             action(
-                &format!("/api/v1/jobs/{}/start", next["id"].as_str().unwrap()),
-                Some(&"4".repeat(64))
+                &format!(
+                    "/api/v1/printers/demo/resume?confirmation={}",
+                    c["id"].as_str().unwrap()
+                ),
+                Some(&"3".repeat(64))
             )
         )
         .await
         .0,
         StatusCode::CONFLICT
     );
-    assert_eq!(
-        send(
-            &app,
-            action("/api/v1/printers/demo/clear", Some(&"5".repeat(64)))
-        )
-        .await
-        .0,
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        accepted(&app, get("/api/v1/printers"), 200).await[0]["needs_clearing"],
-        false
-    );
+    let request = confirmed(&app, &format!("/api/v1/jobs/{id}/cancel"), &"4".repeat(64)).await;
+    assert_eq!(send(&app, request).await.0, StatusCode::OK);
 }

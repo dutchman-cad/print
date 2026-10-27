@@ -109,16 +109,30 @@ impl Printers {
         }
     }
     pub async fn save(&self, path: &Path) -> Result<(), String> {
-        let bytes = serde_json::to_vec(&*self.jobs.lock().await)
-            .map_err(|_| "Cannot save printer jobs.")?;
-        let temporary = path.with_extension("new");
-        tokio::fs::write(&temporary, bytes)
-            .await
-            .map_err(|_| "Cannot save printer jobs.")?;
-        tokio::fs::rename(temporary, path)
+        let jobs = self.jobs.lock().await;
+        let bytes = serde_json::to_vec(&*jobs).map_err(|_| "Cannot save printer jobs.")?;
+        crate::safety::write_state(path, &bytes)
             .await
             .map_err(|_| "Cannot save printer jobs.".into())
     }
+    async fn checkpoint(&self, jobs: &BTreeMap<String, Prepared>) -> Result<(), Error> {
+        if let Some(path) = &self.store {
+            let bytes = serde_json::to_vec(jobs).map_err(|_| Error::Unavailable)?;
+            crate::safety::write_state(path, &bytes)
+                .await
+                .map_err(|_| Error::Unavailable)?;
+        }
+        Ok(())
+    }
+    pub async fn reconcile_all(&self) -> Result<(), String> {
+        let mut jobs = self.jobs.lock().await;
+        for target in jobs.values_mut().filter(|p| p.attempted) {
+            // Offline printers remain tracked; controls still require live reconciliation.
+            let _ = self.reconcile(target).await;
+        }
+        self.checkpoint(&jobs).await.map_err(|e| e.to_string())
+    }
+
     fn profiles(&self, printer: &str) -> Result<Value, Error> {
         let p = self
             .configs
@@ -279,6 +293,95 @@ impl Printers {
     }
 }
 impl Backend for Printers {
+    fn review_action<'a>(
+        &'a self,
+        action: &'a str,
+        printer: &'a str,
+        job: Option<&'a str>,
+    ) -> Reply<'a, ()> {
+        Box::pin(async move {
+            if action == "clear" {
+                return Ok(());
+            }
+            self.check_control(printer)?;
+            let snapshot = self.client(printer)?.snapshot().await?;
+            let jobs = self.jobs.lock().await;
+            let target = if let Some(id) = job {
+                jobs.get(id)
+            } else {
+                jobs.values().find(|p| {
+                    p.job.printer == printer
+                        && p.remote.is_some()
+                        && p.remote == snapshot.printer.job_id
+                })
+            }
+            .ok_or_else(|| {
+                refuse("No matching tracked job. Read status to reconcile the printer.")
+            })?;
+            if action == "start" {
+                ready(&snapshot)?;
+                if target.attempted || target.job.state != JobState::Ready {
+                    return Err(refuse(
+                        "Start was already attempted. Read status; do not repeat Start.",
+                    ));
+                }
+                let bytes = file_bytes(&target.path).await?;
+                let info = self.review_info(self.client(printer)?).await?;
+                check_nozzle(&bytes, &info)?;
+                if hash(&bytes) != target.digest
+                    || info != target.info
+                    || self.profiles(printer)? != target.profiles
+                {
+                    return Err(refuse(
+                        "Prepared file or printer changed. Prepare and review again.",
+                    ));
+                }
+            } else if target.attempted {
+                let filename = snapshot
+                    .job
+                    .as_ref()
+                    .and_then(|j| {
+                        j.pointer("/file/display_name")
+                            .or_else(|| j.pointer("/file/name"))
+                    })
+                    .and_then(Value::as_str);
+                if target.remote.is_none()
+                    || target.remote != snapshot.printer.job_id
+                    || filename != Some(target.filename.as_str())
+                {
+                    return Err(refuse(
+                        "The live job differs from the reviewed job. No command was sent.",
+                    ));
+                }
+            }
+            Ok(())
+        })
+    }
+    fn printer<'a>(&'a self, id: &'a str) -> Reply<'a, Printer> {
+        Box::pin(async move {
+            if let Some(bambu) = self.bambu.get(id) {
+                return Ok(bambu.snapshot().await);
+            }
+            let client = self.client(id)?;
+            Ok(match client.snapshot().await {
+                Ok(snapshot) => snapshot.printer,
+                Err(e) => client.offline(&e),
+            })
+        })
+    }
+    fn restore_jobs<'a>(&'a self, path: &'a Path) -> Reply<'a, ()> {
+        Box::pin(async move {
+            self.restore(path).await.map_err(Error::Failed)?;
+            self.reconcile_all().await.map_err(Error::Failed)?;
+            Ok(())
+        })
+    }
+    fn persist_jobs<'a>(&'a self, path: &'a Path) -> Reply<'a, ()> {
+        Box::pin(async move { self.save(path).await.map_err(Error::Failed) })
+    }
+    fn bed_ready(&self, printer: &str, detail: Option<&str>) -> bool {
+        self.client(printer).is_ok() && detail == Some("READY")
+    }
     fn check_control(&self, printer: &str) -> Result<(), Error> {
         if self.bambu.contains_key(printer) {
             Err(crate::bambu::unsupported())
@@ -434,6 +537,7 @@ impl Backend for Printers {
                     "Use text G-code. Binary G-code support is not established for this printer.",
                 ));
             }
+            check_nozzle(&bytes, &info)?;
             let filename = format!("dutchman-{}.gcode", hash(id.as_bytes()));
             let job = Job {
                 id: id.into(),
@@ -461,6 +565,7 @@ impl Backend for Printers {
                     profiles: self.profiles(printer)?,
                 },
             );
+            self.checkpoint(&jobs).await?;
             Ok(output.estimate)
         })
     }
@@ -479,14 +584,16 @@ impl Backend for Printers {
                 return Err(refuse("Printer model, tooling, material, or plate profiles changed. Prepare and review again."));
             }
             ready(&client.snapshot().await?)?;
-            if self.review_info(client).await? != target.info {
-                return Err(refuse("Machine identity, firmware, or tooling changed. Prepare and review the job again."));
-            }
+            let current_info = self.review_info(client).await?;
             let bytes = file_bytes(&target.path).await?;
             if hash(&bytes) != target.digest {
                 return Err(refuse(
                     "Prepared G-code changed. Prepare and review the job again.",
                 ));
+            }
+            check_nozzle(&bytes, &current_info)?;
+            if current_info != target.info {
+                return Err(refuse("Machine identity, firmware, or tooling changed. Prepare and review the job again."));
             }
             let storage = client.json("/api/v1/storage").await?;
             let entry = storage.get("storage_list").and_then(Value::as_array).and_then(|list| list.iter().find(|s| {
@@ -544,16 +651,7 @@ impl Backend for Printers {
             }
             ready(&client.snapshot().await?)?;
             target.attempted = true;
-            if let Some(path) = &self.store {
-                let bytes = serde_json::to_vec(&*jobs).map_err(|_| Error::Unavailable)?;
-                let temporary = path.with_extension("new");
-                tokio::fs::write(&temporary, bytes)
-                    .await
-                    .map_err(|_| Error::Unavailable)?;
-                tokio::fs::rename(temporary, path)
-                    .await
-                    .map_err(|_| Error::Unavailable)?;
-            }
+            self.checkpoint(&jobs).await?;
             let target = jobs.get_mut(id).ok_or(Error::NotFound)?;
             let reply = client
                 .request(Method::POST, &path, Bytes::new(), false)
@@ -613,4 +711,34 @@ impl Backend for Printers {
             Ok(())
         })
     }
+}
+
+// PrusaSlicer's text output includes the resolved printer setting in its comments.
+fn check_nozzle(bytes: &[u8], info: &Value) -> Result<(), Error> {
+    let mut values = Vec::new();
+    for region in [
+        bytes.get(..bytes.len().min(256 << 10)),
+        bytes.get(bytes.len().saturating_sub(256 << 10)..),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let text = String::from_utf8_lossy(region);
+        for line in text.lines() {
+            if let Some(value) = line.trim().strip_prefix("; nozzle_diameter =") {
+                let value = value.trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0)
+                    .ok_or_else(|| refuse("Cannot verify the sliced nozzle diameter. Use a single-nozzle PrusaSlicer profile."))?;
+                values.push(value);
+            }
+        }
+    }
+    let sliced = values.first().copied().ok_or_else(|| refuse("Sliced nozzle diameter is missing. Export PrusaSlicer text G-code with its settings comments."))?;
+    let installed = info
+        .pointer("/info/nozzle_diameter")
+        .and_then(Value::as_f64)
+        .ok_or(Error::Unavailable)?;
+    if values.iter().any(|v| (*v - sliced).abs() > 0.0001) || (installed - sliced).abs() > 0.0001 {
+        return Err(Error::Refused(format!("Installed nozzle is {installed} mm; sliced profile requires {sliced} mm. Fit the matching nozzle or slice with the matching profile.")));
+    }
+    Ok(())
 }

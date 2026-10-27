@@ -13,8 +13,13 @@ use tokio::sync::Mutex;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct State {
+    #[serde(skip)]
     cleared: HashMap<String, bool>,
+    #[serde(skip)]
+    clearance: HashMap<String, (std::time::Duration, std::time::Duration)>,
     reviews: HashMap<String, Review>,
+    #[serde(default)]
+    job_names: HashMap<String, Option<String>>,
     #[serde(default)]
     terminal_seen: HashMap<String, bool>,
     #[serde(default)]
@@ -32,6 +37,9 @@ pub struct Safety {
     state: Mutex<State>,
     stops: Mutex<HashMap<String, bool>>,
     store: Option<std::path::PathBuf>,
+    clock: Arc<dyn crate::simulated::Clock>,
+    interval: std::time::Duration,
+    expiry: std::time::Duration,
 }
 pub async fn file_bytes(path: &Path) -> Result<Bytes, Error> {
     let mut bytes = Vec::new();
@@ -69,6 +77,25 @@ pub(crate) async fn read_state(path: &Path) -> std::io::Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+/// Replace private state only after its bytes have reached the filesystem.
+pub(crate) async fn write_state(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let temporary = path.with_extension("new");
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temporary).await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&temporary, path).await?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        tokio::fs::File::open(parent).await?.sync_all().await?;
+    }
+    Ok(())
+}
 impl Safety {
     pub fn new(inner: Arc<dyn Backend>) -> Self {
         Self {
@@ -76,7 +103,56 @@ impl Safety {
             state: Mutex::new(State::default()),
             stops: Mutex::new(HashMap::new()),
             store: None,
+            clock: Arc::new(crate::simulated::SystemClock::default()),
+            interval: std::time::Duration::from_secs(5),
+            expiry: std::time::Duration::from_secs(900),
         }
+    }
+    pub fn timing(
+        mut self,
+        clock: Arc<dyn crate::simulated::Clock>,
+        interval: std::time::Duration,
+        expiry: std::time::Duration,
+    ) -> Self {
+        self.clock = clock;
+        self.interval = interval;
+        self.expiry = expiry;
+        self
+    }
+    /// The task owns only a weak reference; dropping the server stops polling.
+    pub fn monitor(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let interval = self.interval;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(safety) = weak.upgrade() else { break };
+                let mut state = safety.state.lock().await;
+                let ids: Vec<_> = state
+                    .cleared
+                    .iter()
+                    .filter(|(_, held)| **held)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in ids {
+                    let _ = safety.fresh(&mut state, &id).await;
+                }
+            }
+        });
+    }
+    pub async fn review_digest(&self, id: Option<&str>) -> Result<Option<String>, Error> {
+        let state = self.state.lock().await;
+        let Some(id) = id else { return Ok(None) };
+        let Some(review) = state.reviews.get(id) else {
+            return Ok(None);
+        };
+        let digest = hash(&file_bytes(&review.path).await?);
+        if digest != review.hash {
+            return Err(Error::Refused(
+                "Prepared file changed. Prepare and review again.".into(),
+            ));
+        }
+        Ok(Some(digest))
     }
     pub fn with_store(mut self, path: std::path::PathBuf) -> Self {
         self.store = Some(path);
@@ -85,11 +161,7 @@ impl Safety {
     async fn checkpoint(&self, state: &State) -> Result<(), Error> {
         if let Some(path) = &self.store {
             let bytes = serde_json::to_vec(state).map_err(|_| Error::Unavailable)?;
-            let temporary = path.with_extension("new");
-            tokio::fs::write(&temporary, bytes)
-                .await
-                .map_err(|_| Error::Unavailable)?;
-            tokio::fs::rename(temporary, path)
+            write_state(path, &bytes)
                 .await
                 .map_err(|_| Error::Unavailable)?;
         }
@@ -98,8 +170,18 @@ impl Safety {
     pub async fn restore(&self, path: &Path) -> Result<(), String> {
         match read_state(path).await {
             Ok(bytes) if bytes.len() <= 16 << 20 => {
-                *self.state.lock().await = serde_json::from_slice(&bytes)
+                let state: State = serde_json::from_slice(&bytes)
                     .map_err(|_| "Cannot read safety state. Check the private data folder.")?;
+                if state.reviews.len() > 5000
+                    || state.observed.len() > 64
+                    || state.job_names.len() > 64
+                    || state.terminal_seen.len() > 64
+                {
+                    return Err(
+                        "Safety state exceeds its limits. Check the private data folder.".into(),
+                    );
+                }
+                *self.state.lock().await = state;
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -107,17 +189,15 @@ impl Safety {
         }
     }
     pub async fn save(&self, path: &Path) -> Result<(), String> {
-        let bytes = serde_json::to_vec(&*self.state.lock().await)
-            .map_err(|_| "Cannot save safety state.")?;
-        let temporary = path.with_extension("new");
-        tokio::fs::write(&temporary, bytes)
-            .await
-            .map_err(|_| "Cannot save safety state.")?;
-        tokio::fs::rename(temporary, path)
+        let state = self.state.lock().await;
+        let bytes = serde_json::to_vec(&*state).map_err(|_| "Cannot save safety state.")?;
+        write_state(path, &bytes)
             .await
             .map_err(|_| "Cannot save safety state.".into())
     }
-    fn observe(state: &mut State, printers: &mut [Printer]) {
+
+    fn observe(&self, state: &mut State, printers: &mut [Printer]) {
+        let now = self.clock.now();
         for printer in printers {
             let observation = (printer.job_id.clone(), printer.detail.clone());
             let terminal_changed = printer.needs_clearing == Some(true)
@@ -130,29 +210,81 @@ impl Safety {
             state
                 .terminal_seen
                 .insert(printer.id.clone(), printer.needs_clearing == Some(true));
+            let identity_changed = state
+                .observed
+                .get(&printer.id)
+                .is_some_and(|old| old != &observation)
+                || state
+                    .job_names
+                    .get(&printer.id)
+                    .is_some_and(|old| old != &printer.job_name);
+            state
+                .job_names
+                .insert(printer.id.clone(), printer.job_name.clone());
             state.observed.insert(printer.id.clone(), observation);
             let cleared = state.cleared.entry(printer.id.clone()).or_insert(false);
-            if printer.state != PrinterState::Idle || terminal_changed {
+            let late = state
+                .clearance
+                .get(&printer.id)
+                .is_none_or(|(created, last)| {
+                    now.saturating_sub(*created) >= self.expiry
+                        || now.saturating_sub(*last) > self.interval * 2
+                });
+            if printer.state != PrinterState::Idle || terminal_changed || identity_changed || late {
                 *cleared = false;
             }
-            printer.needs_clearing = Some(!*cleared);
+            if *cleared {
+                if let Some((_, last)) = state.clearance.get_mut(&printer.id) {
+                    *last = now;
+                }
+            }
+            printer.needs_clearing =
+                Some(!*cleared && !self.inner.bed_ready(&printer.id, printer.detail.as_deref()));
         }
     }
     async fn fresh(&self, state: &mut State, id: &str) -> Result<Printer, Error> {
-        let mut printers = self.inner.printers().await?;
-        Self::observe(state, &mut printers);
-        printers
-            .into_iter()
-            .find(|p| p.id == id)
-            .ok_or(Error::NotFound)
+        let mut printer =
+            match tokio::time::timeout(self.interval * 2, self.inner.printer(id)).await {
+                Ok(Ok(printer)) => printer,
+                _ => {
+                    state.cleared.insert(id.into(), false);
+                    state.clearance.remove(id);
+                    return Err(Error::Unavailable);
+                }
+            };
+        self.observe(state, std::slice::from_mut(&mut printer));
+        Ok(printer)
     }
 }
 impl Backend for Safety {
+    fn review_action<'a>(
+        &'a self,
+        action: &'a str,
+        printer: &'a str,
+        job: Option<&'a str>,
+    ) -> Reply<'a, ()> {
+        self.inner.review_action(action, printer, job)
+    }
+    fn printer<'a>(&'a self, id: &'a str) -> Reply<'a, Printer> {
+        Box::pin(async move { self.fresh(&mut *self.state.lock().await, id).await })
+    }
+    fn check_control(&self, printer: &str) -> Result<(), Error> {
+        self.inner.check_control(printer)
+    }
+
     fn printers(&self) -> Reply<'_, Vec<Printer>> {
         Box::pin(async {
             let mut state = self.state.lock().await;
-            let mut printers = self.inner.printers().await?;
-            Self::observe(&mut state, &mut printers);
+            let mut printers =
+                match tokio::time::timeout(self.interval * 2, self.inner.printers()).await {
+                    Ok(Ok(printers)) => printers,
+                    _ => {
+                        state.cleared.clear();
+                        state.clearance.clear();
+                        return Err(Error::Unavailable);
+                    }
+                };
+            self.observe(&mut state, &mut printers);
             Ok(printers)
         })
     }
@@ -171,6 +303,9 @@ impl Backend for Safety {
                 state.terminal_seen.insert(id.into(), false);
             }
             state.cleared.insert(id.into(), true);
+            state
+                .clearance
+                .insert(id.into(), (self.clock.now(), self.clock.now()));
             self.checkpoint(&state).await
         })
     }
@@ -209,9 +344,9 @@ impl Backend for Safety {
             if printer.state != PrinterState::Idle {
                 return Err(Error::Refused("Printer readiness is unknown or the printer is busy. Read fresh status before starting.".into()));
             }
-            if !state.cleared.get(&job.printer).copied().unwrap_or(false) {
+            if printer.needs_clearing != Some(false) {
                 return Err(Error::Refused(format!(
-                    "Check that {} has a clear bed, then acknowledge it with clear {}.",
+                    "Check that {} has a clear bed, then acknowledge it in this run or through the server for {}.",
                     printer.name, printer.id
                 )));
             }

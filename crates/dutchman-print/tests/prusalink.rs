@@ -554,7 +554,11 @@ async fn changed_bytes_identity_firmware_and_tooling_require_review() {
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("changed"),
+                .contains(if mode == "nozzle" {
+                    "nozzle"
+                } else {
+                    "changed"
+                }),
             "{mode}"
         );
         assert_eq!(fake.count(Method::PUT).await, 0);
@@ -1002,4 +1006,155 @@ async fn mixed_fleet_prepares_with_each_printers_slicer() {
     );
     assert!(mini_dir.join("sliced.gcode").is_file());
     assert!(a1_dir.join("sliced.3mf").is_file());
+}
+
+#[derive(Default)]
+struct ClearanceClock(std::sync::atomic::AtomicU64);
+impl dutchman_print::simulated::Clock for ClearanceClock {
+    fn now(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+#[tokio::test]
+async fn clearance_expires_and_failed_late_or_changed_reads_withdraw_it() {
+    for mode in ["failure", "gap", "expiry", "identity", "activity"] {
+        let fake = Fake::new().await;
+        let clock = Arc::new(ClearanceClock::default());
+        let b = Safety::new(Arc::new(Printers::new(fake.config()).unwrap())).timing(
+            clock.clone(),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(60),
+        );
+        b.clear("test").await.unwrap();
+        match mode {
+            "failure" => {
+                fake.shared.machine.lock().await.missing = true;
+                assert_eq!(b.printers().await.unwrap()[0].needs_clearing, Some(true));
+                fake.shared.machine.lock().await.missing = false;
+            }
+            "gap" => clock.0.store(11, std::sync::atomic::Ordering::SeqCst),
+            "expiry" => {
+                for second in (5..=60).step_by(5) {
+                    clock.0.store(second, std::sync::atomic::Ordering::SeqCst);
+                    let p = b.printers().await.unwrap();
+                    assert_eq!(p[0].needs_clearing, Some(second == 60));
+                }
+            }
+            "identity" => {
+                let mut m = fake.shared.machine.lock().await;
+                m.state = "FINISHED".into();
+                m.name = "external.gcode".into();
+                m.id = 99;
+            }
+            _ => {
+                fake.shared.machine.lock().await.state = "BUSY".into();
+                b.printers().await.unwrap();
+                fake.shared.machine.lock().await.state = "IDLE".into();
+            }
+        }
+        assert_eq!(
+            b.printers().await.unwrap()[0].needs_clearing,
+            Some(true),
+            "{mode}"
+        );
+    }
+}
+#[tokio::test]
+async fn monitor_sees_activity_between_client_reads_and_stops_without_clearance() {
+    let fake = Fake::new().await;
+    let b = Arc::new(
+        Safety::new(Arc::new(Printers::new(fake.config()).unwrap())).timing(
+            Arc::new(dutchman_print::simulated::SystemClock::default()),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(60),
+        ),
+    );
+    b.monitor();
+    b.clear("test").await.unwrap();
+    fake.shared.machine.lock().await.state = "BUSY".into();
+    tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
+    fake.shared.machine.lock().await.state = "IDLE".into();
+    assert_eq!(b.printers().await.unwrap()[0].needs_clearing, Some(true));
+    let reads = fake.shared.machine.lock().await.records.len();
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    assert_eq!(fake.shared.machine.lock().await.records.len(), reads);
+}
+#[tokio::test]
+async fn ready_substitutes_for_remote_clearance_but_idle_does_not() {
+    let fake = Fake::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let b = fake.backend(dir.path()).await;
+    assert!(b.start("one").await.is_err());
+    fake.shared.machine.lock().await.state = "READY".into();
+    assert_eq!(b.printers().await.unwrap()[0].needs_clearing, Some(false));
+    assert_eq!(b.start("one").await.unwrap().state, JobState::Printing);
+}
+#[tokio::test]
+async fn installed_nozzle_must_match_sliced_profile_before_upload() {
+    let fake = Fake::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let input = slicer_input(dir.path());
+    fake.shared.machine.lock().await.info["nozzle_diameter"] = json!(0.6);
+    let b = Printers::new(fake.config()).unwrap();
+    let error = b
+        .prepare("one", &input, "test", Options::default())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("0.6 mm"));
+    assert!(error.contains("0.4 mm"));
+    assert_eq!(fake.count(Method::PUT).await, 0);
+}
+#[tokio::test]
+async fn server_restart_reconciles_tracked_prusalink_job_before_cancel() {
+    use tower::ServiceExt as _;
+    let fake = Fake::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let input = slicer_input(dir.path());
+    let raw = Arc::new(
+        Printers::new(fake.config())
+            .unwrap()
+            .with_store(dir.path().join("jobs.json")),
+    );
+    let safety = Safety::new(raw);
+    safety
+        .prepare("one", &input, "test", Options::default())
+        .await
+        .unwrap();
+    safety.clear("test").await.unwrap();
+    safety.start("one").await.unwrap();
+    safety.save(&dir.path().join("safety.json")).await.unwrap();
+    // Only the pre-Start record is needed: startup recovers the live id and state.
+    let mut settings = dutchman_print::ServerConfig::default();
+    settings.storage.data_dir = dir.path().into();
+    let app = dutchman_print::router(
+        Arc::new(
+            Printers::new(fake.config())
+                .unwrap()
+                .with_store(dir.path().join("jobs.json")),
+        ),
+        settings,
+    );
+    let request = axum::http::Request::post("/api/v1/confirmations")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"action":"cancel","printer":"test","job":"one"}).to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let challenge: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(challenge["observed"]["job_id"], "41");
+    let request = axum::http::Request::post("/api/v1/jobs/one/cancel")
+        .header("Plugin-Confirmation", "a".repeat(64))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"confirmation":challenge["id"]}).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(fake.shared.machine.lock().await.state, "STOPPED");
 }

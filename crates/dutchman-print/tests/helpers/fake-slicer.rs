@@ -39,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(file, "G1 X0")?;
             return Ok(());
         }
-        writeln!(file, "; estimated printing time (normal mode) = 2m 3s\n; filament used [mm] = 450\n; filament used [g] = 1.5\n; total layers count = 12")?;
+        writeln!(file, "; estimated printing time (normal mode) = 2m 3s\n; filament used [mm] = 450\n; filament used [g] = 1.5\n; total layers count = 12\n; nozzle_diameter = 0.4")?;
         writeln!(
             file,
             "; thumbnail begin 1x1 0\n; {}\n; thumbnail end\nG1 X0",

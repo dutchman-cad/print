@@ -5,6 +5,7 @@ Any server can implement it; it does not require Dutchman or a particular printe
 SolidCraft's host and standalone clients can use the same protocol. All paths below are
 relative to the server's base URL. JSON uses UTF-8 and `Content-Type: application/json`.
 
+This unreleased v1 contract requires server-issued confirmations.
 Version 1 routes begin with `/api/v1`. Within v1, fields may only be added; new request fields must be optional.
 Existing fields, types, meanings, and routes remain compatible. Clients ignore unknown
 response fields. Breaking changes require a new path version such as `/api/v2`.
@@ -18,11 +19,12 @@ response fields. Breaking changes require a new path version such as `/api/v2`.
 | `POST /api/v1/jobs` | Raw 3MF or multipart, described below | 201, prepared job object |
 | `GET /api/v1/jobs/{id}` | No body | 200, current job object |
 | `GET /api/v1/jobs/{id}/preview.png` | No body | 200, `image/png`, or 404 when unavailable |
-| `POST /api/v1/jobs/{id}/start` | Empty body; confirmation header | 200, resulting job object |
-| `POST /api/v1/jobs/{id}/cancel` | Empty body; confirmation header | 200, resulting job object |
-| `POST /api/v1/printers/{id}/pause` | Empty body; confirmation header | 200, resulting active job object |
-| `POST /api/v1/printers/{id}/resume` | Empty body; confirmation header | 200, resulting active job object |
-| `POST /api/v1/printers/{id}/clear` | Empty body; confirmation header | 204, bed clearance acknowledged |
+| `POST /api/v1/confirmations` | Action, printer, optional job JSON | 201, confirmation challenge |
+| `POST /api/v1/jobs/{id}/start` | Confirmation id in JSON or query; confirmation header | 200, resulting job object |
+| `POST /api/v1/jobs/{id}/cancel` | Confirmation id in JSON or query; confirmation header | 200, resulting job object |
+| `POST /api/v1/printers/{id}/pause` | Confirmation id in JSON or query; confirmation header | 200, resulting active job object |
+| `POST /api/v1/printers/{id}/resume` | Confirmation id in JSON or query; confirmation header | 200, resulting active job object |
+| `POST /api/v1/printers/{id}/clear` | Confirmation id in JSON or query; confirmation header | 204, bed clearance acknowledged |
 
 IDs are opaque strings returned by the server; clients encode them as URL path segments.
 Health responses contain required `service` (string identifying the implementation) and
@@ -95,15 +97,16 @@ storage and removed on failure.
 
 Unavailable optional fields are omitted. An empty fleet is `[]`.
 
-Bed clearance is an additive v1 safety check. Dutchman Print starts each printer with
-`needs_clearing: true`, including the simulator. After checking the named printer, the
-person sends `POST /api/v1/printers/{id}/clear` with a fresh confirmation header. The
-printer must report fresh idle status. Acknowledgement does not move the printer or
-change its reported state. Start refuses with 409 and names the printer until acknowledged.
-A start attempt consumes that clearance, including an uncertain or failed attempt. Done,
-cancelled, and failed jobs require another check before using the bed again. Reading an old
-terminal job never clears a bed or changes the outcome of a replacement job. Observed active,
-error, or offline state also removes clearance. Restarting the service requires new clearance.
+A remote bed-clear acknowledgement exists only in the running process. While it is held,
+the server polls that printer every 5 seconds (`--clearance-interval-seconds`, 2–30).
+It is withdrawn on any non-idle or unknown state, failed read, observation gap longer than
+twice that interval, reconnect following unavailable telemetry, job identity or finished-job
+signal change, or expiry after 15 minutes (`--clearance-expiry-minutes`, 1–120). A Start
+attempt consumes it even if the result is uncertain or fails. Polling stops when no remote
+acknowledgement is held. Activity entirely between polls with no identity or terminal signal
+change cannot be detected; clearance is not proof that no physical activity occurred.
+PrusaLink `READY` is the operator's printer-side bed-clear signal and substitutes for the
+remote acknowledgement; `IDLE` still requires one. Restarting never restores remote clearance.
 
 Start and resume require fresh telemetry. Missing, stale, contradictory, or unknown
 readiness blocks movement. Prepared file changes require a new preparation and review.
@@ -136,22 +139,45 @@ A prepared job is `ready`; start moves it to `printing`. Pause moves a printing 
 ready, printing, or paused jobs and yields `cancelled`. Backend failures may yield `failed`.
 Incompatible actions return 409. Printer pause and resume target that printer's active job.
 Jobs may expire; subsequent reads return 404. Dutchman Print retains jobs for one hour and
-resets service job state on restart. Clients must handle jobs disappearing.
+persists service jobs in its private data folder. Startup reloads tracked jobs and reconciles
+attempted jobs with live status before control; unavailable printers stay tracked and controls
+require live reconciliation. Clients must still handle expired jobs disappearing.
 
 ## Confirmation for machine actions
 
-The five machine routes are start, cancel, pause, resume, and clear. Each requires exactly one
-`Plugin-Confirmation` header whose value is exactly 64 lowercase hexadecimal characters
-(`0`–`9`, `a`–`f`). SolidCraft's host attaches a fresh value after the person confirms the
-action. The plugin does not wrap the 3MF body or generate this confirmation itself.
-Standalone clients obtain confirmation from the person before sending a fresh value.
+Before each machine action, request a server-issued challenge with
+`POST /api/v1/confirmations` and JSON `{"action":"start","printer":"workbench","job":"JOB_ID"}`.
+Actions are `start`, `cancel`, `pause`, `resume`, and `clear`; `job` is required for start
+and cancel and omitted for printer actions. Issuance re-reads the printer and refuses
+incompatible actions with 409. Success is 201 with `id`, `action`, `printer`, nullable `job`,
+`summary`, `observed`, and `expires_at` (Unix seconds). `observed` contains normalized `state`,
+nullable vendor `detail`, `job_id`, `job_name`, `progress` (fraction rounded down to a whole
+percent), and `needs_clearing`.
 
-Values are single use across callers and all five routes. A server consumes a value before
-attempting the backend action, including when that action fails. Missing, malformed,
-duplicate, or reused values return 403. Clients must not retry a machine request with the
-same value. Dutchman Print remembers consumed values for ten minutes; clients never reuse
-values even after that interval. This header signals confirmation; authentication remains
-separate. Servers must not log confirmation values or credentials.
+Show the returned summary verbatim, for example:
+`Start printing 'bracket' on Workbench MINI (idle, bed clear)?`.
+The challenge expires after 60 seconds (`--confirmation-seconds`, 1–600).
+For SolidCraft, the plugin's read step fetches this challenge and returns its summary for
+the host's own confirmation dialog. Only after the person approves that dialog does the
+host attach a fresh `Plugin-Confirmation` header to the physical action step. That step
+sends `{"confirmation":"CHALLENGE_ID"}` as JSON, or `?confirmation=CHALLENGE_ID` with an empty
+body. Send the id once. Clear and Start require separate challenges and separate approvals.
+
+Every machine route still requires exactly one `Plugin-Confirmation` header containing
+64 lowercase hexadecimal characters. Missing, malformed, or duplicate headers and missing
+challenge ids return 403. A challenge must be unused, unexpired, and match the action,
+printer, job, and reviewed input digest. Current state, vendor detail, job identity, whole
+percent progress, bed clearance, and tracked job state must still match the observation.
+A changed observation returns 409 with
+"The printer changed since you confirmed; confirm again." Invalid, expired, or consumed
+challenges and reused header values also return 409. Obtain a new challenge and confirmation;
+never automatically repeat Start after an uncertain result.
+
+The private data folder durably stores challenges and consumed ids until their expiry and
+hashes of seen header values for at least ten minutes, across callers and restarts. Both
+are consumed before attempting a backend action, including failed attempts. Header values
+are never logged. Confirmation is separate from authentication. Standalone CLI prompts
+and `--yes` create and consume the same observation-bound challenges internally.
 
 ## Errors
 
@@ -168,7 +194,7 @@ backend addresses. Clients branch on status codes rather than matching message t
 |---|---|
 | 400 | Missing or malformed fields, unreadable multipart body, or failed 3MF validation |
 | 401 | Authentication required or credentials refused |
-| 403 | Browser origin refused or machine confirmation missing, malformed, duplicated, or reused |
+| 403 | Browser origin refused or machine confirmation header missing, malformed, or duplicated; missing challenge id |
 | 404 | Printer, job, preview, or route not found |
 | 405 | Method not allowed; `Allow` names permitted methods |
 | 409 | Printer busy, incompatible job state, or backend refusal |
@@ -185,3 +211,9 @@ Slicer selection belongs to the companion's private configuration: named
 The API does not accept a slicer override. Certificate enrollment uses the standalone
 `dutchman-print fingerprint <printer> [--json]` command described in
 [the companion guide](print.md#bambu-lab-lan-monitoring); it adds no HTTP route.
+
+For PrusaLink, preparation reads the resolved `nozzle_diameter` setting from PrusaSlicer's
+output text G-code comments (first and last 256 KiB). Missing, ambiguous, or multiple-nozzle
+settings are refused. Before upload it must match `/api/v1/info` `nozzle_diameter`; a
+mismatch names both diameters and requires a matching nozzle or a newly sliced profile.
+There is no per-printer mismatch override.
