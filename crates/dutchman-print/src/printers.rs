@@ -48,6 +48,7 @@ pub struct Printers {
     moonraker: BTreeMap<String, Arc<crate::moonraker::Client>>,
     duet: BTreeMap<String, Arc<crate::duet::Client>>,
     sdcp: BTreeMap<String, Arc<crate::elegoo_sdcp::Client>>,
+    snapmaker: BTreeMap<String, Arc<crate::snapmaker::Client>>,
     slicers: BTreeMap<String, crate::slicer::Config>,
     jobs: Mutex<BTreeMap<String, Prepared>>,
     store: Option<PathBuf>,
@@ -94,6 +95,8 @@ impl Printers {
                             | "snapmaker-u1"
                             | "duet"
                             | "elegoo-sdcp"
+                            | "snapmaker-2"
+                            | "snapmaker-j1"
                     )
                 ) {
                     Ok(None)
@@ -113,7 +116,7 @@ impl Printers {
         let slicers = config
             .printers
             .iter()
-            .filter(|p| p.kind.as_deref() != Some("elegoo-sdcp"))
+            .filter(|p| !crate::config::sliceless(p))
             .map(|p| config.slicer_for(p).map(|s| (p.id.clone(), s.clone())))
             .collect::<Result<_, _>>()?;
         let octoprint = config
@@ -142,6 +145,12 @@ impl Printers {
                 crate::elegoo_sdcp::Client::new(p.clone()).map(|c| (p.id.clone(), Arc::new(c)))
             })
             .collect::<Result<_, _>>()?;
+        let snapmaker = config
+            .printers
+            .iter()
+            .filter(|p| crate::snapmaker::is_kind(p.kind.as_deref()))
+            .map(|p| crate::snapmaker::Client::new(p.clone()).map(|c| (p.id.clone(), Arc::new(c))))
+            .collect::<Result<_, _>>()?;
         let machines = config
             .printers
             .iter()
@@ -162,6 +171,7 @@ impl Printers {
             moonraker,
             duet,
             sdcp,
+            snapmaker,
             slicers,
             jobs: Mutex::new(BTreeMap::new()),
             store: None,
@@ -309,9 +319,10 @@ impl Printers {
             target.job.state,
             JobState::Ready | JobState::Printing | JobState::Paused | JobState::Ended
         ) || self.sdcp.contains_key(&target.job.printer)
+            || self.snapmaker.contains_key(&target.job.printer)
         {
             // The saved terminal result remains valid after its staged file is removed;
-            // Elegoo SDCP printers never have tracked jobs.
+            // Elegoo SDCP and monitoring-only Snapmaker printers never have tracked jobs.
         } else if self.bambu.contains_key(&target.job.printer) {
             self.reconcile_bambu(target).await?;
         } else if self.octoprint.contains_key(&target.job.printer) {
@@ -589,6 +600,8 @@ impl Printers {
     ) -> Result<Job, Error> {
         if let Some(client) = self.sdcp.get(&target.job.printer) {
             Err(client.refusal(action))
+        } else if let Some(client) = self.snapmaker.get(&target.job.printer) {
+            Err(client.refusal())
         } else if self.moonraker.contains_key(&target.job.printer) {
             self.moonraker_control(target, action, guard).await
         } else if self.duet.contains_key(&target.job.printer) {
@@ -1310,6 +1323,9 @@ impl Printers {
         if let Some(client) = self.sdcp.get(&target.job.printer) {
             return Err(client.refusal("start"));
         }
+        if let Some(client) = self.snapmaker.get(&target.job.printer) {
+            return Err(client.refusal());
+        }
         if self.moonraker.contains_key(&target.job.printer) {
             return self.start_moonraker(target, guard).await;
         }
@@ -1495,6 +1511,9 @@ impl Backend for Printers {
             self.check_control(printer)?;
             if let Some(client) = self.sdcp.get(printer) {
                 return Err(client.refusal(action));
+            }
+            if let Some(client) = self.snapmaker.get(printer) {
+                return Err(client.refusal());
             }
             if let Some(client) = self.bambu.get(printer) {
                 let live = client.snapshot().await;
@@ -1745,6 +1764,9 @@ impl Backend for Printers {
             if let Some(client) = self.sdcp.get(id) {
                 return Ok(client.snapshot().await);
             }
+            if let Some(client) = self.snapmaker.get(id) {
+                return Ok(client.snapshot().await);
+            }
             if let Some(client) = self.moonraker.get(id) {
                 return Ok(match client.snapshot().await {
                     Ok(snapshot) => snapshot.printer,
@@ -1805,6 +1827,8 @@ impl Backend for Printers {
         if let Some(client) = self.bambu.get(printer) {
             client.check_control()
         } else if let Some(client) = self.sdcp.get(printer) {
+            client.check_control()
+        } else if let Some(client) = self.snapmaker.get(printer) {
             client.check_control()
         } else {
             Ok(())
@@ -1867,6 +1891,8 @@ impl Backend for Printers {
                     tasks.spawn(async move { (index, client.snapshot().await) });
                 } else if let Some(client) = self.sdcp.get(&config.id).cloned() {
                     tasks.spawn(async move { (index, client.snapshot().await) });
+                } else if let Some(client) = self.snapmaker.get(&config.id).cloned() {
+                    tasks.spawn(async move { (index, client.snapshot().await) });
                 } else if let Some(client) = self.octoprint.get(&config.id).cloned() {
                     tasks.spawn(async move {
                         (
@@ -1928,6 +1954,9 @@ impl Backend for Printers {
                 .ok_or(Error::NotFound)?;
             if let Some(client) = self.sdcp.get(printer) {
                 return Err(client.refusal("prepare"));
+            }
+            if let Some(client) = self.snapmaker.get(printer) {
+                return Err(client.refusal());
             }
             for (label, selected, configured) in [
                 (
@@ -2164,6 +2193,9 @@ impl Backend for Printers {
             if let Some(client) = self.sdcp.get(printer) {
                 return Err(client.refusal("pause"));
             }
+            if let Some(client) = self.snapmaker.get(printer) {
+                return Err(client.refusal());
+            }
             self.control(printer, "pause", JobState::Printing).await
         })
     }
@@ -2171,6 +2203,9 @@ impl Backend for Printers {
         Box::pin(async move {
             if let Some(client) = self.sdcp.get(printer) {
                 return Err(client.refusal("resume"));
+            }
+            if let Some(client) = self.snapmaker.get(printer) {
+                return Err(client.refusal());
             }
             self.control(printer, "resume", JobState::Paused).await
         })

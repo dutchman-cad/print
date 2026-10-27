@@ -5,7 +5,7 @@ A backend prepares 3MF files, estimates jobs, and controls printers. The include
 `simulated` backend is a demo: it contacts no printers and can optionally run a local slicer.
 The `printers` backend supports individually configured local PrusaLink, OctoPrint, Moonraker (Klipper),
 Snapmaker U1, Duet (RepRapFirmware standalone), and Bambu printers, and monitors Elegoo printers
-that speak SDCP.
+that speak SDCP and Snapmaker 2.0, J1, and Artisan printers.
 
 Build `dutchman-print` from this checkout with Rust 1.88 or newer:
 
@@ -1166,6 +1166,142 @@ learned `Id`, the default ports, how often it pushes status unasked, how `Curren
 `TaskId` look after a Stop, and, for Centauri, whether status 8 appears while idle, as one
 example in the notes suggests, and which further status codes the firmware uses.
 
+## Snapmaker 2.0 and J1/Artisan
+
+Print monitors two older Snapmaker families. Both are monitoring only: Print reads status
+and never uploads, starts, pauses, resumes, cancels, or stops a job. Each uses the transport
+Snapmaker documents for its networked models:
+
+- `kind = "snapmaker-2"` is the Snapmaker 2.0 series (A150, A250, A350), over the HTTP API
+  Snapmaker described on its
+  [forum](https://forum.snapmaker.com/t/do-snapmaker-2-0-devices-have-a-webpage/5455/4/).
+- `kind = "snapmaker-j1"` is the Snapmaker J1 and Artisan, over SACP on TCP, from Snapmaker's
+  [SACP documentation](https://github.com/Snapmaker/Snapmaker-SACP/tree/main/docs).
+
+The Snapmaker U1 uses neither; it has its own kind, `snapmaker-u1`.
+
+```toml
+[backend]
+kind = "printers"
+
+[[printers]]
+kind = "snapmaker-2"
+id = "a350"
+name = "Workshop A350"
+model = "Snapmaker 2.0 A350"
+host = "192.168.1.50"
+# port = 8080 # Optional; defaults to 8080.
+
+[[printers]]
+kind = "snapmaker-j1"
+id = "j1"
+name = "Snapmaker J1"
+model = "Snapmaker J1"
+host = "192.168.1.51"
+# port = 8888 # Optional; defaults to 8888.
+```
+
+`host` is the printer's hostname or IP address, without a scheme or path; `port` replaces
+the default. There is no discovery or network scan, although Snapmaker documents a broadcast
+one: configure the address yourself. Neither source describes TLS, so the connection is plain;
+keep these printers on a trusted local network. Print never slices for these printers, so
+they take no `slicer` and no slicer profiles, and every other printer field is refused.
+
+### Snapmaker 2.0
+
+The first status read sends `POST /api/v1/connect`, which the user must confirm on the
+touchscreen. While the request waits, the printer shows `offline` with `detail` asking you to
+tap Confirm. The wait is bounded at 60 seconds: if the printer has not confirmed by then, Print
+keeps no connection, releases any token it received with `POST /api/v1/disconnect`, and shows
+`offline` with `detail` saying to approve the request on the touchscreen and retry. The next
+status read at least 30 seconds later sends a new request; reading status again is the retry.
+
+The connect reply carries a token. Print keeps it in memory only, never logs it, and never
+puts it in a response, an error, or `detail`; a printer value that repeats it is shown as
+`(withheld)`. Status is `GET /api/v1/status` with the token as the `token` query parameter,
+every 10 seconds. A reply is fresh for 30 seconds; after that, or with no live reply, the
+printer is `offline`. If the printer refuses the token once it has been accepted, the
+connection ends and the next status read requests a new one, which needs confirming again.
+
+| `status` | State | `detail` starts with |
+|---|---|---|
+| `IDLE` | idle | `IDLE` |
+| anything else, or missing | error | the value, sanitised and at most 32 characters, or `UNKNOWN STATUS` |
+
+Snapmaker's description shows only `IDLE`, so no running, paused, or progress state is
+inferred from any other value; it stays an error until the value is documented. `detail`
+then lists the connect reply's `series`, `headType` (shown as reported), and an enclosure
+when `hasEnclosure` is true. The published example reports `headType` as a number, and
+Snapmaker has not published what the numbers mean, so a numeric head type is shown but not
+interpreted: check the installed head yourself. A `headType` given as text that names a
+laser or CNC head means the machine is not a printer right now, and an idle printer then
+shows `attention`. The head is never guessed from `series` or the product name. Positions
+and offsets in the status reply are not shown.
+
+Print does not send `POST /api/v1/disconnect` when it shuts down; the connection is simply
+dropped.
+
+### Snapmaker J1 and Artisan
+
+Print keeps one TCP connection per printer, opened at the first status read, and sends only
+two documented requests every 10 seconds: module info (command set `0x01`, command `0x20`)
+and machine info (`0x01`, `0x21`), addressed from the software peer (0) to the controller
+(1). Packets follow Packet.md and Types.md: `AA 55`, a little-endian length of the bytes from
+byte 7 to the end, version 1, a CRC-8 of the first six bytes, sender, attribute, a sequence
+number that increases with each request, command set and ID, the payload, and the TCP/IP
+checksum of bytes 7 onward. A packet is used only once it is complete and both checks pass;
+anything else is skipped. A reply is applied only if it is an acknowledgement addressed to
+the software peer with the sequence, command set, and command ID of a request from the
+latest round, so a late reply to an earlier request is ignored.
+
+The documentation describes no pairing or handshake for network clients. If the printer
+does not answer within 3 seconds of connecting, it shows `offline` with `detail` saying that
+Snapmaker has not published how these printers pair with network clients; check the
+touchscreen for a connection request. Print keeps the connection open and keeps asking, and
+a later reply is used normally. A module list is fresh for 30 seconds; after that, or after a
+reconnect until the new connection answers, the printer is `offline`. Reconnects back off from
+1 second, doubling up to 30 seconds.
+
+Snapmaker has not published the J1 or Artisan print state; its documentation leaves the
+3D-printing commands unfinished. So Print never reports `idle` or `printing` for these
+printers:
+
+| Installed modules | State | `detail` starts with |
+|---|---|---|
+| A printing module (ID 0 or 13), with any others | busy | `PRINTING MODULE` |
+| CNC, laser, other, or unknown modules only, or none | attention | `NO PRINTING MODULE` |
+| A nonzero result, or a list that cannot be read | error | `UNREADABLE MODULES` |
+
+`detail` names each module with its ID and firmware version, then the machine model and
+firmware version from machine info, and ends with why the state is what it is. The
+documentation does not say how the module list is counted, so Print reads it with a one-byte
+count, a two-byte count, and no count, and uses it only when every reading that fits the
+reply exactly gives the same list.
+
+### Why there is no control
+
+Snapmaker's 2.0 description documents only connect, status, and disconnect. The SACP
+documentation leaves the 3D-printing commands unfinished and describes no network pairing.
+Without a published contract for uploads, starts, pauses, resumes, and stops, Print sends
+none of them. Preparation, every confirmation challenge except bed clearance, and every
+action route are refused with a message saying so, and nothing but the requests above
+reaches the printer. Use the touchscreen or Snapmaker Luban to run jobs.
+
+### What needs a real printer
+
+Testing uses simulated printers on test-owned loopback servers. Before relying on these
+printers, check on real hardware:
+
+- Snapmaker 2.0: whether `POST /api/v1/connect` waits for the touchscreen or answers at once
+  and refuses status until confirmed (both are handled), what a refused or pending request
+  returns, whether the token expires without other traffic, whether `POST /api/v1/disconnect`
+  takes the token in its form body, the `status` values besides `IDLE`, and what `headType`
+  numbers each head reports.
+- J1 and Artisan: whether network clients need a pairing step, the CRC-8 variant (Print uses
+  polynomial 0x07 with initial value 0), whether the length field counts bytes 7 to the end
+  as Print does, whether requests should go to the controller (1) or the screen (2), how the
+  module list is counted, and which module IDs a J1's print heads report.
+
 ## Stop a printer and clean staged files
 
 Run `dutchman-print --config config.toml stop <printer>` to review the current live job's
@@ -1187,6 +1323,9 @@ job `detail` while preserving its outcome; inspect printer storage before removi
 
 Elegoo resin Stop addresses the live `TaskId` and `Filename` and sends command 130 once;
 Centauri printers refuse Stop. See [Elegoo (SDCP)](#elegoo-sdcp).
+
+Snapmaker 2.0, J1, and Artisan printers refuse Stop. See
+[Snapmaker 2.0 and J1/Artisan](#snapmaker-20-and-j1artisan).
 
 Duet Stop addresses the live file path: a running job is paused with `M25`, the pause is
 confirmed, and then `M0` is sent. Stop is confirmed when the printer is idle with that file
