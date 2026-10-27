@@ -54,6 +54,10 @@ pub struct Printer {
     pub password: Option<String>,
     /// Commissioned nozzle size for printers that do not report one (Duet).
     pub nozzle_diameter: Option<f64>,
+    /// Elegoo SDCP protocol profile: `centauri` or `resin`.
+    pub profile: Option<String>,
+    /// Elegoo SDCP MainboardID; reports from another mainboard are refused.
+    pub mainboard_id: Option<String>,
     pub id: String,
     pub name: String,
     pub model: String,
@@ -148,6 +152,7 @@ impl Config {
                     Some("octoprint") => crate::octoprint::validate(printer)?,
                     Some("moonraker" | "snapmaker-u1") => crate::moonraker::validate(printer)?,
                     Some("duet") => crate::duet::validate(printer)?,
+                    Some("elegoo-sdcp") => crate::elegoo_sdcp::validate(printer)?,
                     Some("bambu") => {
                         crate::bambu::validate_enrollment(
                             printer,
@@ -155,27 +160,37 @@ impl Config {
                         )?;
                     }
                     _ => return Err(
-                        "Set each printer kind to prusalink, octoprint, moonraker, snapmaker-u1, duet, or bambu."
+                        "Set each printer kind to prusalink, octoprint, moonraker, snapmaker-u1, duet, bambu, or elegoo-sdcp."
                             .into(),
                     ),
                 }
                 if printer.nozzle_diameter.is_some() && printer.kind.as_deref() != Some("duet") {
                     return Err("Set nozzle_diameter only for Duet printers.".into());
                 }
-                if [
-                    &printer.printer_profile,
-                    &printer.print_profile,
-                    &printer.filament_profile,
-                ]
-                .iter()
-                .any(|p| p.is_none())
+                let sdcp = printer.kind.as_deref() == Some("elegoo-sdcp");
+                if !sdcp && (printer.profile.is_some() || printer.mainboard_id.is_some()) {
+                    return Err(
+                        "Set profile and mainboard_id only for Elegoo SDCP printers.".into(),
+                    );
+                }
+                if !sdcp
+                    && [
+                        &printer.printer_profile,
+                        &printer.print_profile,
+                        &printer.filament_profile,
+                    ]
+                    .iter()
+                    .any(|p| p.is_none())
                 {
                     return Err(
                         "Set printer, print, and filament profiles for each printer.".into(),
                     );
                 }
             }
-            if self.backend.kind == "printers" || self.backend.slice {
+            // Print never slices for Elegoo SDCP printers, so they take no slicer.
+            if (self.backend.kind == "printers" || self.backend.slice)
+                && printer.kind.as_deref() != Some("elegoo-sdcp")
+            {
                 self.slicer_for(printer)?;
             }
             for name in [

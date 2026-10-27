@@ -5,6 +5,7 @@ pub mod bambu;
 pub mod config;
 pub mod confirmation;
 pub mod duet;
+pub mod elegoo_sdcp;
 pub mod moonraker;
 pub mod octoprint;
 pub mod printers;
