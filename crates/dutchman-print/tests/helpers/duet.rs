@@ -168,6 +168,10 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
         m = shared.machine.lock().await;
     }
     let value = match path.as_str() {
+        "/rr_disconnect" => {
+            m.keys.remove(key);
+            json!({"err":0})
+        }
         "/rr_model" => {
             let key = query.get("key").cloned().unwrap_or_default();
             let result = match key.as_str() {

@@ -184,7 +184,9 @@ async fn run(args: Args) -> Result<(), String> {
         backend.restore(&state)?;
         let safety = dutchman_print::safety::Safety::new(Arc::new(backend));
         safety.restore(&state.with_extension("safety.json")).await?;
-        let reports = safety.printers().await.map_err(|e| e.to_string())?;
+        let reports = safety.printers().await;
+        shutdown_backend(&safety).await;
+        let reports = reports.map_err(|e| e.to_string())?;
         if json {
             output(&reports)?;
         } else {
@@ -230,9 +232,13 @@ async fn run(args: Args) -> Result<(), String> {
             settings.storage.keep,
         ));
         eprintln!("dutchman-print: listening on http://{address}");
-        let result = axum::serve(listener, dutchman_print::router(backend, settings))
-            .with_graceful_shutdown(stopped())
-            .await;
+        let result = serve_until(
+            listener,
+            dutchman_print::router(backend.clone(), settings),
+            backend.as_ref(),
+            stopped(),
+        )
+        .await;
         cleanup.abort();
         return result.map_err(|err| err.to_string());
     }
@@ -253,8 +259,11 @@ async fn run(args: Args) -> Result<(), String> {
         dutchman_print::safety::Safety::new(backend.clone()).with_store(safety_path.clone());
     safety.restore(&safety_path).await?;
     let result = command(args.command, &safety, &data_dir).await;
-    safety.save(&safety_path).await?;
-    backend.save(&state)?;
+    let safety_saved = safety.save(&safety_path).await;
+    let jobs_saved = backend.save(&state);
+    shutdown_backend(&safety).await;
+    safety_saved?;
+    jobs_saved?;
     result
 }
 fn server_lock(data: &Path) -> Result<Lock, String> {
@@ -581,13 +590,85 @@ async fn real_commands(
     } else {
         dutchman_print::printers::Printers::one_shot(config)?
     };
+    let store = if matches!(cmd, Command::Serve { .. }) {
+        data.join("jobs.json")
+    } else {
+        state.clone()
+    };
+    let backend = Arc::new(if matches!(cmd, Command::Printers { .. }) {
+        backend
+    } else {
+        backend.with_store(store)
+    });
+    let serving = matches!(cmd, Command::Serve { .. });
+    // Keep the CLI lock through cleanup, including older Duet IP-based authentication.
+    let _lock = if !serving && !matches!(cmd, Command::Printers { .. }) {
+        dutchman_serve::prepare_data_dir(data)
+            .map_err(|_| "Cannot use the private data folder.")?;
+        let lock = state.with_extension("lock");
+        std::fs::create_dir(&lock)
+            .map_err(|_| "Another CLI command is using these printers. Wait for it to finish.")?;
+        Some(Lock(lock))
+    } else {
+        None
+    };
+    let result = real_command(cmd, backend.clone(), data, &state).await;
+    if !serving {
+        shutdown_backend(backend.as_ref()).await;
+    }
+    result
+}
+
+async fn shutdown_backend(backend: &dyn Backend) {
+    // Never display backend errors: they could include credentials or private addresses.
+    let _ = tokio::time::timeout(Duration::from_secs(3), backend.shutdown()).await;
+}
+
+async fn serve_until(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    backend: &dyn Backend,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<(), std::io::Error> {
+    use std::future::IntoFuture as _;
+    let (signal, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = stopped.await;
+        })
+        .into_future();
+    tokio::pin!(server);
+    let result = tokio::select! {
+        result = &mut server => Some(result),
+        () = stop => None,
+    };
+    let _ = signal.send(());
+    // Durable start attempts and existing job/safety checkpoints remain intact.
+    // Drain HTTP requests alongside disconnects, sharing one overall deadline.
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(shutdown_backend(backend), async {
+            if result.is_none() {
+                let _ = (&mut server).await;
+            }
+        });
+    })
+    .await;
+    result.unwrap_or(Ok(()))
+}
+
+async fn real_command(
+    cmd: Command,
+    backend: Arc<dutchman_print::printers::Printers>,
+    data: &Path,
+    state: &Path,
+) -> Result<(), String> {
     if let Command::Printers { json } = cmd {
         if data.exists() {
             dutchman_serve::prepare_data_dir(data)
                 .map_err(|_| "Cannot use the private data folder.")?;
         }
-        backend.restore(&state).await?;
-        let safety = dutchman_print::safety::Safety::new(Arc::new(backend));
+        backend.restore(state).await?;
+        let safety = dutchman_print::safety::Safety::new(backend.clone());
         safety.restore(&state.with_extension("safety.json")).await?;
         let reports = safety.printers().await.map_err(|e| e.to_string())?;
         if json {
@@ -631,37 +712,84 @@ async fn real_commands(
             data.into(),
             settings.storage.keep,
         ));
-        let result = axum::serve(
+        let result = serve_until(
             listener,
-            dutchman_print::router(
-                Arc::new(backend.with_store(data.join("jobs.json"))),
-                settings,
-            ),
+            dutchman_print::router(backend.clone(), settings),
+            backend.as_ref(),
+            stopped(),
         )
-        .with_graceful_shutdown(stopped())
         .await;
         cleanup.abort();
         return result.map_err(|_| "Print server stopped unexpectedly.".into());
     }
-    let lock = state.with_extension("lock");
-    std::fs::create_dir(&lock)
-        .map_err(|_| "Another CLI command is using these printers. Wait for it to finish.")?;
-    let _lock = Lock(lock);
-    let backend = Arc::new(backend.with_store(state.clone()));
-    backend.restore(&state).await?;
+    backend.restore(state).await?;
     let safety_path = state.with_extension("safety.json");
     let safety =
         dutchman_print::safety::Safety::new(backend.clone()).with_store(safety_path.clone());
     safety.restore(&safety_path).await?;
     let result = command(cmd, &safety, data).await;
-    backend.save(&state).await?;
-    safety.save(&safety_path).await?;
+    let jobs_saved = backend.save(state).await;
+    let safety_saved = safety.save(&safety_path).await;
+    jobs_saved?;
+    safety_saved?;
     result
 }
 
 #[cfg(test)]
+#[path = "../tests/helpers/snapmaker.rs"]
+mod shutdown_fake;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn server_stop_disconnects_once_even_with_a_pending_request() {
+        use tokio::io::AsyncWriteExt as _;
+        let fake = shutdown_fake::Fake2::new(shutdown_fake::Approval::Immediate).await;
+        let backend = Arc::new(dutchman_print::printers::Printers::new(fake.config()).unwrap());
+        backend.printers().await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let app = axum::Router::new().route(
+            "/pending",
+            axum::routing::get({
+                let entered = entered.clone();
+                move || {
+                    let entered = entered.clone();
+                    async move {
+                        entered.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                }
+            }),
+        );
+        let (stop, signal) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            serve_until(listener, app, backend.as_ref(), async {
+                let _ = signal.await;
+            })
+            .await
+        });
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(b"GET /pending HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(3500), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(3500));
+        assert_eq!(fake.count("/api/v1/disconnect").await, 1);
+    }
 
     #[test]
     fn confirmation_defaults_to_no_and_names_the_job_and_printer() {

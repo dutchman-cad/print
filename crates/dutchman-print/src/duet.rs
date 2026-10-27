@@ -40,6 +40,7 @@ pub struct Client {
     session: tokio::sync::Mutex<Session>,
     observation: tokio::sync::Mutex<Option<Value>>,
     changed: std::sync::atomic::AtomicBool,
+    closed: std::sync::atomic::AtomicBool,
 }
 pub struct Snapshot {
     pub printer: Printer,
@@ -155,6 +156,27 @@ fn text(value: Option<&Value>) -> Option<String> {
         .map(str::to_owned)
 }
 impl Client {
+    /// Release only the existing connection; never log in or retry during shutdown.
+    pub async fn shutdown(&self) -> Result<(), Error> {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut session = self.session.lock().await;
+        if !session.connected {
+            return Ok(());
+        }
+        session.connected = false;
+        let key = session.key.take();
+        drop(session);
+        let path = if self.transport == Transport::Sbc {
+            "/machine/disconnect"
+        } else {
+            "/rr_disconnect"
+        };
+        self.http
+            .raw(Method::GET, path, Bytes::new(), key.as_deref(), false)
+            .await
+            .map(|_| ())
+    }
+
     pub fn new(config: crate::config::Printer) -> Result<Self, String> {
         validate(&config)?;
         let uri: Uri = config
@@ -200,6 +222,7 @@ impl Client {
                 generation: 0,
             }),
             observation: tokio::sync::Mutex::new(None),
+            closed: std::sync::atomic::AtomicBool::new(false),
             changed: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -321,6 +344,9 @@ impl Client {
     /// beyond the printer's reported timeout.
     async fn login(&self) -> Result<(Option<String>, u64), Error> {
         let mut session = self.session.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Unavailable);
+        }
         if session.connected && session.last.elapsed() < session.timeout {
             return Ok((session.key.clone(), session.generation));
         }

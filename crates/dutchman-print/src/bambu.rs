@@ -666,6 +666,7 @@ pub struct Client {
     command_rx: Mutex<Option<mpsc::Receiver<CommandRequest>>>,
     reports: broadcast::Sender<Value>,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    closed: watch::Sender<bool>,
     state: watch::Sender<Telemetry>,
     oneshot: bool,
     fresh: Duration,
@@ -680,6 +681,25 @@ impl Drop for Client {
     }
 }
 impl Client {
+    pub async fn shutdown(&self) {
+        self.closed.send_replace(true);
+        let mut worker = self.worker.lock().await;
+        if let Some(task) = worker.as_mut() {
+            if tokio::time::timeout(Duration::from_secs(2), &mut *task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        worker.take();
+        self.state.send_modify(|s| {
+            s.connected = false;
+            s.received = None;
+        });
+    }
+
     pub(crate) async fn delete(&self, filename: &str) -> Result<(), Error> {
         tokio::time::timeout(
             Duration::from_secs(15),
@@ -885,6 +905,7 @@ impl Client {
             command_rx: Mutex::new(Some(command_rx)),
             reports,
             worker: Mutex::new(None),
+            closed: watch::channel(false).0,
             state,
             oneshot,
             fresh: FRESH,
@@ -902,6 +923,12 @@ impl Client {
     pub async fn snapshot(&self) -> Printer {
         let mut rx = self.state.subscribe();
         let mut worker = self.worker.lock().await;
+        if *self.closed.borrow() {
+            let mut state = rx.borrow().clone();
+            state.connected = false;
+            state.received = None;
+            return state.printer(&self.config, self.fresh);
+        }
         if worker.is_none() {
             let options = self.options.clone();
             let tx = self.state.clone();
@@ -912,8 +939,18 @@ impl Client {
                 return rx.borrow().printer(&self.config, self.fresh);
             };
             let reports = self.reports.clone();
+            let closed = self.closed.subscribe();
             *worker = Some(tokio::spawn(async move {
-                monitor(options, serial, tx, oneshot, pacing, commands, reports).await;
+                monitor(
+                    options,
+                    serial,
+                    tx,
+                    oneshot,
+                    pacing,
+                    commands,
+                    (reports, closed),
+                )
+                .await;
             }));
         }
         drop(worker);
@@ -964,13 +1001,17 @@ async fn monitor(
     oneshot: bool,
     pacing: Duration,
     mut commands: mpsc::Receiver<CommandRequest>,
-    reports: broadcast::Sender<Value>,
+    reporting: (broadcast::Sender<Value>, watch::Receiver<bool>),
 ) {
+    let (reports, mut closed) = reporting;
     let report = format!("device/{serial}/report");
     let request = format!("device/{serial}/request");
     let mut last_request: Option<Instant> = None;
     let mut backoff = 1;
     loop {
+        if *closed.borrow() {
+            return;
+        }
         let (client, mut events) = AsyncClient::new(options.clone(), 8);
         let mut network = rumqttc::NetworkOptions::new();
         network.set_connection_timeout(4);
@@ -984,6 +1025,20 @@ async fn monitor(
         tx.send_replace(state.clone());
         loop {
             let event = tokio::select! {
+                biased;
+                _ = closed.changed() => {
+                    // Do not flush a queued machine publish while closing the connection.
+                    if transmitting.is_some() { return; }
+                    if state.connected {
+                        let _ = client.disconnect().await;
+                        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                            loop {
+                                if matches!(events.poll().await, Ok(Event::Outgoing(rumqttc::Outgoing::Disconnect)) | Err(_)) { break; }
+                            }
+                        }).await;
+                    }
+                    return;
+                },
                 event = events.poll() => event,
                 Some(command) = commands.recv(), if transmitting.is_none() => {
                     if command.sent.is_closed() { continue; }
@@ -1098,7 +1153,10 @@ async fn monitor(
         if oneshot {
             return;
         }
-        tokio::time::sleep(Duration::from_secs(backoff)).await;
+        tokio::select! {
+            _ = closed.changed() => return,
+            () = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+        }
         backoff = (backoff * 2).min(60);
     }
 }

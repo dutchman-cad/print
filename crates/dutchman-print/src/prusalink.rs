@@ -14,6 +14,7 @@ pub struct Client {
     config: crate::config::Printer,
     uri: Uri,
     connection: tokio::sync::Mutex<Option<Connection>>,
+    closed: std::sync::atomic::AtomicBool,
     authentication: tokio::sync::Mutex<Option<(String, u32)>>,
     terminal: std::sync::Mutex<std::collections::VecDeque<(String, String, JobState)>>,
 }
@@ -85,6 +86,15 @@ pub fn validate(config: &crate::config::Printer) -> Result<(), String> {
     Ok(())
 }
 impl Client {
+    /// There is no protocol logout; release the cached HTTP socket without another request.
+    pub async fn shutdown(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(mut connection) = self.connection.lock().await.take() {
+            connection.driver.abort();
+            let _ = (&mut connection.driver).await;
+        }
+    }
+
     pub fn new(config: crate::config::Printer) -> Result<Self, String> {
         validate(&config)?;
         let uri = config
@@ -97,6 +107,7 @@ impl Client {
             config,
             uri,
             connection: tokio::sync::Mutex::new(None),
+            closed: std::sync::atomic::AtomicBool::new(false),
             authentication: tokio::sync::Mutex::new(None),
             terminal: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
@@ -143,6 +154,9 @@ impl Client {
     ) -> (Result<(StatusCode, HeaderMap, Bytes), Error>, bool) {
         let stale = std::sync::atomic::AtomicBool::new(false);
         let mut cached = self.connection.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return (Err(Error::Unavailable), false);
+        }
         let mut active = cached.take();
         if active.as_ref().is_some_and(|c| c.sender.is_closed()) {
             active = None;
@@ -231,7 +245,9 @@ impl Client {
         };
         let result = match result {
             Ok(Ok(value)) => {
-                *cached = active;
+                if !self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                    *cached = active;
+                }
                 Ok(value)
             }
             Ok(Err(error)) | Err(error) => Err(error),
@@ -571,6 +587,43 @@ mod tests {
                 return true;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_keep_alive_without_sending_a_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(crate::config::Printer {
+            url: Some(format!("http://{}", listener.local_addr().unwrap())),
+            api_key: Some("synthetic".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            assert!(head(&mut socket).await);
+            socket
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+            let mut byte = [0u8; 1];
+            assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+        });
+        client
+            .request(Method::GET, "/api/v1/status", Bytes::new(), false)
+            .await
+            .unwrap();
+        client.shutdown().await;
+        client.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(client
+            .request(Method::GET, "/api/v1/status", Bytes::new(), false)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

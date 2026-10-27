@@ -252,6 +252,9 @@ reloaded and reconciled from live status before control after a restart.
 dutchman-print --config config.toml serve --listen 127.0.0.1:8730 --data-dir private-jobs
 ```
 
+On Ctrl-C or SIGTERM, `serve` closes printer connections within three seconds without
+sending machine actions; CLI commands also close their connections after saving state.
+
 The standalone [job API version 1 specification](print-api.md) describes the protocol for
 clients and other servers. Errors are JSON objects with an `error` string and a 4xx or 5xx status. Basic authentication protects all routes
 except `GET /healthz` when `DUTCHMAN_PRINT_PASSWORD` is set.

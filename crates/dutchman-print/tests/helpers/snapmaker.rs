@@ -195,6 +195,7 @@ pub struct MachineJ1 {
     pub model: u8,
     pub requests: Vec<Packet>,
     pub connections: usize,
+    pub closed: usize,
 }
 pub struct FakeJ1 {
     pub machine: Arc<Mutex<MachineJ1>>,
@@ -246,6 +247,7 @@ impl FakeJ1 {
             model: 4,
             requests: Vec::new(),
             connections: 0,
+            closed: 0,
         }));
         let (close, _) = watch::channel(0);
         let task = tokio::spawn({
@@ -254,7 +256,12 @@ impl FakeJ1 {
             async move {
                 while let Ok((stream, _)) = listener.accept().await {
                     machine.lock().await.connections += 1;
-                    tokio::spawn(serve(stream, machine.clone(), close.subscribe()));
+                    let machine = machine.clone();
+                    let receiver = close.subscribe();
+                    tokio::spawn(async move {
+                        serve(stream, machine.clone(), receiver).await;
+                        machine.lock().await.closed += 1;
+                    });
                 }
             }
         });

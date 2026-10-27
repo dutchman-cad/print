@@ -161,6 +161,7 @@ struct Telemetry {
     reason: &'static str,
 }
 struct Link {
+    token: std::sync::Arc<Mutex<Option<String>>>,
     host: String,
     port: u16,
     timing: Timing,
@@ -169,6 +170,8 @@ struct Link {
 
 pub struct Client {
     config: crate::config::Printer,
+    token: std::sync::Arc<Mutex<Option<String>>>,
+    closed: std::sync::atomic::AtomicBool,
     timing: Timing,
     state: watch::Sender<Telemetry>,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -181,6 +184,31 @@ impl Drop for Client {
     }
 }
 impl Client {
+    pub async fn shutdown(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut worker = self.worker.lock().await;
+        if let Some(task) = worker.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.state.send_modify(|t| {
+            t.running = false;
+            t.received = None;
+            t.reason = ENDED;
+        });
+        let token = self.token.lock().await.take();
+        if let Some(token) = token {
+            let link = Link {
+                token: self.token.clone(),
+                host: self.config.host.clone().unwrap_or_default(),
+                port: self.config.port.unwrap_or(PORT),
+                timing: self.timing,
+                state: self.state.clone(),
+            };
+            link.disconnect(&token).await;
+        }
+    }
+
     pub fn new(config: crate::config::Printer) -> Result<Self, String> {
         super::validate(&config)?;
         let (state, _) = watch::channel(Telemetry {
@@ -193,6 +221,8 @@ impl Client {
         });
         Ok(Self {
             config,
+            token: Default::default(),
+            closed: std::sync::atomic::AtomicBool::new(false),
             timing: Timing::default(),
             state,
             worker: Mutex::new(None),
@@ -214,6 +244,9 @@ impl Client {
     /// Starts a connection unless one is open or pending, or the last ended too recently.
     async fn begin(&self) {
         let mut worker = self.worker.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         let due = {
             let t = self.state.borrow();
             !t.running && t.ended.is_none_or(|e| e.elapsed() >= self.timing.retry)
@@ -224,6 +257,7 @@ impl Client {
                 t.reason = WAITING;
             });
             let link = Link {
+                token: self.token.clone(),
                 host: self.config.host.clone().unwrap_or_default(),
                 port: self.config.port.unwrap_or(PORT),
                 timing: self.timing,
@@ -334,7 +368,7 @@ impl Link {
             .await
             .map_err(|_| Error::Unavailable)?
     }
-    /// Releases a token that was never approved; the reply does not matter.
+    /// Releases an approved or pending token; the reply does not matter.
     async fn disconnect(&self, token: &str) {
         let _ = self
             .request(
@@ -414,6 +448,7 @@ async fn connection(link: &Link) -> &'static str {
     else {
         return UNREADABLE;
     };
+    *link.token.lock().await = Some(token.clone());
     let machine = Machine::from_connect(&reply, &token);
     link.state.send_modify(|t| t.machine = machine);
     let path = format!("/api/v1/status?token={token}");
@@ -448,6 +483,7 @@ async fn connection(link: &Link) -> &'static str {
                 t.received = Some(Instant::now());
             });
         } else if !approved && Instant::now() >= deadline {
+            link.token.lock().await.take();
             link.disconnect(&token).await;
             return TIMED_OUT;
         } else if !approved {

@@ -23,6 +23,7 @@ pub struct Machine {
     pub requests: Vec<Value>,
     pub pings: usize,
     pub connections: usize,
+    pub closed: usize,
 }
 pub struct Fake {
     pub machine: Arc<Mutex<Machine>>,
@@ -95,6 +96,7 @@ impl Fake {
             requests: Vec::new(),
             pings: 0,
             connections: 0,
+            closed: 0,
         }));
         let (events, _) = broadcast::channel(16);
         let task = tokio::spawn({
@@ -108,7 +110,8 @@ impl Fake {
                         let receiver = events.subscribe();
                         if let Ok(socket) = tokio_tungstenite::accept_async(stream).await {
                             machine.lock().await.connections += 1;
-                            serve(socket, machine, events, receiver).await;
+                            serve(socket, machine.clone(), events, receiver).await;
+                            machine.lock().await.closed += 1;
                         }
                     });
                 }

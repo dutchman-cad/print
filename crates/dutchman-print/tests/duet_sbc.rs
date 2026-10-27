@@ -689,3 +689,24 @@ async fn api_reports_configured_controls() {
     let (_dir, app) = controls::app(f.config());
     controls::listed(&app, controls::ALL).await;
 }
+
+#[tokio::test]
+async fn shutdown_releases_the_session_once_without_machine_actions() {
+    use dutchman_print::backend::Backend as _;
+    let f = Fake::new().await;
+    let backend = Safety::new(Arc::new(Printers::new(f.config()).unwrap()));
+    backend.printers().await.unwrap();
+    backend.shutdown().await.unwrap();
+    backend.shutdown().await.unwrap();
+    drop(backend);
+    // A dropped client must not release the same session a second time.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let machine = f.shared.machine.lock().await;
+    let released = machine
+        .records
+        .iter()
+        .filter(|(path, _)| path == "/machine/disconnect")
+        .count();
+    assert_eq!(released, 1);
+    assert!(machine.commands.is_empty());
+}
