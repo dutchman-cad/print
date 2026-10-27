@@ -183,6 +183,16 @@ commissioned behaviour and unchanged machine configuration. Completed, cancelled
 failed executions remain distinct; idle alone cannot establish completion. See
 [Moonraker configuration and checks](print.md#moonraker-klipper).
 
+Snapmaker U1 (`kind = "snapmaker-u1"`) is a Moonraker printer and behaves exactly as above,
+except for its toolheads. The printer's tools are `configfile.settings` `extruder`,
+`extruder1`, and so on, each with a `nozzle_diameter`, and the active `toolhead.extruder`
+must be one of them. Loaded material per tool is not reported, so a job must select exactly
+one installed tool with `T<n>`; jobs selecting no tool, several tools (named in the error),
+an absent tool, or `ACTIVATE_EXTRUDER` are refused during preparation, challenge review, and
+before upload. The sliced `nozzle_diameter` for that tool must match the tool's configured
+value; a mismatch names the tool and both values, with no override. `nozzle_temperature`
+is the active tool's. See [Snapmaker U1 configuration and checks](print.md#snapmaker-u1).
+
 Duet (RepRapFirmware standalone) uses the same routes, server-issued challenges,
 reviewed-byte checks, and bed-clear policy. Status comes from the `rr_model` object model:
 `idle` is idle; `processing`, `pausing`, `resuming`, `cancelling`, and `changingTool` are

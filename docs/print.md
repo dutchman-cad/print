@@ -4,7 +4,7 @@ Dutchman Print is a local print companion for SolidCraft and a standalone comman
 A backend prepares 3MF files, estimates jobs, and controls printers. The included
 `simulated` backend is a demo: it contacts no printers and can optionally run a local slicer.
 The `printers` backend supports individually configured local PrusaLink, OctoPrint, Moonraker (Klipper),
-Duet (RepRapFirmware standalone), and Bambu printers.
+Snapmaker U1, Duet (RepRapFirmware standalone), and Bambu printers.
 
 Build `dutchman-print` from this checkout with Rust 1.88 or newer:
 
@@ -85,7 +85,7 @@ Configure slicers with `[slicers.<name>]` tables, each containing `kind`, option
 optional `datadir`, and `timeout_seconds`. Set each printer's `slicer = "<name>"` to choose
 one. Without a name, Dutchman selects the only slicer of the required kind: PrusaLink needs
 `prusaslicer`, Bambu needs `orcaslicer`. Missing or ambiguous choices are refused.
-OctoPrint, Moonraker, and Duet accept either kind; select a named slicer when more than one is configured.
+OctoPrint, Moonraker, Snapmaker U1, and Duet accept either kind; select a named slicer when more than one is configured.
 The simulator with `slice = true` uses the same per-printer selection; a simulated printer
 without a kind can use the only configured slicer, or select one explicitly.
 `[slicer]` remains a single-slicer shorthand; it cannot be combined with named slicers,
@@ -816,7 +816,7 @@ Other authentication forms are not implemented. No cloud account is required. Se
 
 Commission profiles for the actual model, build volume, nozzle, tooling, material, and
 plate. Only a single extruder is supported for control; unresolved material slots are
-refused. Loaded material and physical plate identity have no universal telemetry here:
+refused. [Snapmaker U1](#snapmaker-u1) printers have their own tool rule. Loaded material and physical plate identity have no universal telemetry here:
 check them before confirming each start. Set `resume_commissioned = true` only after
 checking that this printer's installed pause/resume macros behave safely. A changed
 machine configuration, including macros, requires fresh preparation and review.
@@ -874,6 +874,46 @@ and [job history](https://moonraker.readthedocs.io/en/latest/external_api/histor
 
 Testing uses synthetic responses on test-owned loopback servers. Physical printer and
 macro commissioning remains an installation step.
+
+## Snapmaker U1
+
+The Snapmaker U1 runs Snapmaker's fork of Moonraker. Its published
+[API documentation](https://github.com/Snapmaker/u1-moonraker/blob/main/docs/web_api.md) is
+upstream Moonraker's, so `kind = "snapmaker-u1"` uses the Moonraker backend above: the same
+address and `api_key` settings, status mapping, staging, start, pause, resume, cancel, Stop,
+history reconciliation, confirmations, bed clearance, and cleanup. Only the toolhead checks
+differ.
+
+```toml
+[[printers]]
+kind = "snapmaker-u1"
+id = "u1"
+name = "Workbench U1"
+model = "Snapmaker U1"
+url = "http://u1.local:7125"
+api_key = "REPLACE_WITH_YOUR_MOONRAKER_KEY"
+printer_profile = "Commissioned U1 profile"
+print_profile = "Reviewed print settings"
+filament_profile = "Material loaded in the print tool"
+resume_commissioned = false
+```
+
+The printer's tools are Klipper's `extruder`, `extruder1`, and so on in
+`configfile.settings`, numbered from 0 without gaps, each with a `nozzle_diameter`. Another
+section named `extruder...`, a missing nozzle size, or an active `toolhead.extruder` that
+is not one of these tools is refused. Status `nozzle_temperature` is the active tool's.
+
+The documented API reports no loaded material per tool, so a job may use only one tool.
+The sliced G-code must select it with a `T<n>` command, where `T0` is `extruder` and `T1` is
+`extruder1`. Preparation, challenge review, and the check before upload refuse G-code that
+selects no tool, selects more than one (naming them), selects a tool the printer does not
+have, or changes tools with `ACTIVATE_EXTRUDER`. The slicer's `nozzle_diameter` entry for
+that tool must match that tool's configured `nozzle_diameter`; a mismatch names the tool and
+both diameters, and missing or disagreeing values are refused. There is no override. A
+changed tool count or nozzle size after preparation requires preparing again.
+
+Check the material loaded in the print tool, the physical nozzle, and the plate before
+confirming each start. Testing uses a simulated U1 on a test-owned loopback server.
 
 ## Duet (RepRapFirmware standalone)
 

@@ -146,7 +146,7 @@ impl Config {
                         crate::prusalink::validate(printer)?;
                     }
                     Some("octoprint") => crate::octoprint::validate(printer)?,
-                    Some("moonraker") => crate::moonraker::validate(printer)?,
+                    Some("moonraker" | "snapmaker-u1") => crate::moonraker::validate(printer)?,
                     Some("duet") => crate::duet::validate(printer)?,
                     Some("bambu") => {
                         crate::bambu::validate_enrollment(
@@ -155,7 +155,7 @@ impl Config {
                         )?;
                     }
                     _ => return Err(
-                        "Set each printer kind to prusalink, octoprint, moonraker, duet, or bambu."
+                        "Set each printer kind to prusalink, octoprint, moonraker, snapmaker-u1, duet, or bambu."
                             .into(),
                     ),
                 }
