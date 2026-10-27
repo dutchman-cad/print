@@ -1,5 +1,7 @@
 //! Snapmaker U1 toolhead policy exercised only against test-owned loopback servers.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::unreachable)]
+#[path = "helpers/controls.rs"]
+mod controls;
 #[path = "helpers/moonraker.rs"]
 mod fake;
 #[path = "helpers/slicer.rs"]
@@ -382,4 +384,22 @@ fn config_uses_moonraker_validation() {
             "{extra}"
         );
     }
+}
+
+#[tokio::test]
+async fn api_reports_configured_controls() {
+    let f = u1().await;
+    let (_dir, app) = controls::app(config(&f));
+    controls::listed(&app, controls::ALL).await;
+}
+
+#[tokio::test]
+async fn uncommissioned_resume_is_omitted_and_refused_without_reads() {
+    let f = u1().await;
+    let mut config = config(&f);
+    config.printers[0].resume_commissioned = false;
+    let (_dir, app) = controls::app(config);
+    controls::unsupported(&app, "test", &["resume"]).await;
+    assert!(f.shared.machine.lock().await.records.is_empty());
+    controls::listed(&app, &["start", "pause", "cancel", "stop", "clear"]).await;
 }

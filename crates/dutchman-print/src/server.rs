@@ -581,6 +581,19 @@ async fn confirm(
     action: &str,
     id: &str,
 ) -> Result<crate::confirmation::Observation, Problem> {
+    let target = if matches!(action, "start" | "cancel") {
+        app.backend
+            .job_printer(id)
+            .await
+            .map(|printer| (printer, Some(id.into())))
+    } else {
+        Ok((id.into(), None))
+    };
+    if let Ok((printer, _)) = &target {
+        app.backend
+            .check_action(printer, action)
+            .map_err(backend_error)?;
+    }
     let error = || {
         (
             StatusCode::FORBIDDEN,
@@ -616,12 +629,7 @@ async fn confirm(
         return Err(bad("Send confirmation once."));
     }
     let challenge = query.confirmation.or(body.confirmation).ok_or_else(error)?;
-    let (printer, job) = if matches!(action, "start" | "cancel") {
-        let job = app.backend.job(id).await.map_err(backend_error)?;
-        (job.printer, Some(id.into()))
-    } else {
-        (id.into(), None)
-    };
+    let (printer, job) = target.map_err(backend_error)?;
     app.confirmations
         .consume(
             &app.backend,

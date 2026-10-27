@@ -12,6 +12,11 @@ pub mod sacp;
 pub const MONITORING_2: &str = "Snapmaker 2.0 printers are monitoring only. Snapmaker has not published an HTTP contract for uploading, starting, pausing, resuming, or stopping a job on them, only connect, status, and disconnect, so Print never sends one. Use the touchscreen or Snapmaker Luban.";
 pub const MONITORING_J1: &str = "Snapmaker J1 and Artisan printers are monitoring only. Snapmaker has not published the SACP commands for 3D printing, so Print never uploads, starts, pauses, resumes, or stops a job on them. Use the touchscreen or Snapmaker Luban.";
 
+/// These Snapmaker families support monitoring only.
+pub(crate) fn controls() -> Vec<&'static str> {
+    Vec::new()
+}
+
 /// Host and port only: there are no credentials, profiles, or slicer settings to give.
 pub fn validate(config: &crate::config::Printer) -> Result<(), String> {
     let host = config.host.as_deref().unwrap_or_default();
@@ -85,6 +90,7 @@ pub(crate) fn report(
     detail: String,
 ) -> Printer {
     Printer {
+        controls: controls().into_iter().map(String::from).collect(),
         id: config.id.clone(),
         name: config.name.clone(),
         model: config.model.clone(),
@@ -128,7 +134,11 @@ impl Client {
     }
     /// Every machine action, preparation included, is refused.
     pub fn check_control(&self) -> Result<(), Error> {
-        Err(self.refusal())
+        if controls().is_empty() {
+            Err(self.refusal())
+        } else {
+            Ok(())
+        }
     }
     pub fn refusal(&self) -> Error {
         Error::Refused(self.message().into())

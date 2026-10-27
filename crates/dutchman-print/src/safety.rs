@@ -264,6 +264,13 @@ impl Safety {
     }
 }
 impl Backend for Safety {
+    fn controls(&self, printer: &str) -> Vec<&'static str> {
+        self.inner.controls(printer)
+    }
+    fn check_action(&self, printer: &str, action: &str) -> Result<(), Error> {
+        self.inner.check_action(printer, action)
+    }
+
     fn review_action<'a>(
         &'a self,
         action: &'a str,
@@ -297,6 +304,7 @@ impl Backend for Safety {
     }
     fn clear<'a>(&'a self, id: &'a str) -> Reply<'a, ()> {
         Box::pin(async move {
+            self.inner.check_action(id, "clear")?;
             let printer = self.fresh(id).await?;
             let mut state = self.state.lock().await;
             if state.observed.get(id) != Some(&(printer.job_id.clone(), printer.detail.clone())) {
@@ -344,8 +352,9 @@ impl Backend for Safety {
     }
     fn start<'a>(&'a self, id: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {
+            let printer = self.inner.job_printer(id).await?;
+            self.inner.check_action(&printer, "start")?;
             let job = self.inner.job(id).await?;
-            self.inner.check_control(&job.printer)?;
             if job.state != JobState::Ready {
                 return Err(Error::Refused(
                     "Only a ready job can be started. Read status to reconcile it.".into(),
@@ -421,6 +430,8 @@ impl Backend for Safety {
     }
     fn cancel<'a>(&'a self, id: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {
+            let printer = self.inner.job_printer(id).await?;
+            self.inner.check_action(&printer, "cancel")?;
             {
                 let mut stops = self.stops.lock().await;
                 if stops.len() >= 5000 && !stops.contains_key(id) {
@@ -429,7 +440,6 @@ impl Backend for Safety {
                 stops.insert(id.into(), true);
             }
             let before = self.inner.job(id).await?;
-            self.inner.check_control(&before.printer)?;
             if before.state == JobState::Cancelled {
                 return Ok(before);
             }
@@ -451,7 +461,7 @@ impl Backend for Safety {
         path: Option<&'a str>,
     ) -> Reply<'a, Printer> {
         Box::pin(async move {
-            self.inner.check_control(printer)?;
+            self.inner.check_action(printer, "stop")?;
             self.state
                 .lock()
                 .await
@@ -463,7 +473,7 @@ impl Backend for Safety {
     }
     fn pause<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {
-            self.inner.check_control(printer)?;
+            self.inner.check_action(printer, "pause")?;
             let p = self.fresh(printer).await?;
             if p.state != PrinterState::Printing {
                 return Err(Error::Refused(
@@ -475,7 +485,7 @@ impl Backend for Safety {
     }
     fn resume<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {
-            self.inner.check_control(printer)?;
+            self.inner.check_action(printer, "resume")?;
             let p = self.fresh(printer).await?;
             if p.state != PrinterState::Paused
                 || p.detail.as_deref().is_some_and(|s| {
@@ -489,6 +499,9 @@ impl Backend for Safety {
             }
             self.inner.resume(printer).await
         })
+    }
+    fn job_printer<'a>(&'a self, id: &'a str) -> Reply<'a, String> {
+        self.inner.job_printer(id)
     }
     fn job<'a>(&'a self, id: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {

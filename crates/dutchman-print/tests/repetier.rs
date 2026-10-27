@@ -1,6 +1,8 @@
 //! Repetier-Server monitoring and control, exercised only against test-owned loopback servers
 //! and through the job API's confirmation challenges.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::unreachable)]
+#[path = "helpers/controls.rs"]
+mod controls;
 #[path = "helpers/repetier.rs"]
 mod fake;
 #[path = "helpers/slicer.rs"]
@@ -325,7 +327,7 @@ async fn key_goes_only_in_the_header_and_requests_name_the_slug() {
     let app = api(&f, dir.path()).await;
     ok(&app, "clear", None).await;
     ok(&app, "start", Some("one")).await;
-    ok(&app, "stop", None).await;
+    ok(&app, "cancel", Some("one")).await;
     let m = f.shared.machine.lock().await;
     assert!(m.records.len() > 10);
     for record in &m.records {
@@ -680,4 +682,13 @@ fn config_validates_url_key_slug_and_nozzle_without_echoing_secrets() {
         .err()
         .unwrap()
         .contains("slug only for Repetier-Server"));
+}
+
+#[tokio::test]
+async fn api_reports_controls_and_refuses_unsupported_actions_without_reads() {
+    let f = Fake::new().await;
+    let (_dir, app) = controls::app(f.config());
+    controls::unsupported(&app, "test", &["pause", "resume", "stop"]).await;
+    assert!(f.shared.machine.lock().await.records.is_empty());
+    controls::listed(&app, &["start", "cancel", "clear"]).await;
 }

@@ -72,6 +72,14 @@ impl Default for Timing {
     }
 }
 
+pub(crate) fn controls(printer: &crate::config::Printer) -> Vec<&'static str> {
+    if printer.profile.as_deref() == Some("resin") {
+        vec!["stop"]
+    } else {
+        Vec::new()
+    }
+}
+
 pub fn validate(config: &crate::config::Printer) -> Result<(), String> {
     if Profile::parse(config.profile.as_deref()).is_none() {
         return Err("Set profile to centauri or resin for each Elegoo SDCP printer.".into());
@@ -295,6 +303,7 @@ pub fn report(config: &crate::config::Printer, status: &Value) -> Printer {
     };
     let active = matches!(state, PrinterState::Printing | PrinterState::Paused);
     let mut printer = Printer {
+        controls: controls(config).into_iter().map(String::from).collect(),
         id: config.id.clone(),
         name: config.name.clone(),
         model: config.model.clone(),
@@ -506,6 +515,10 @@ impl Client {
     }
     fn offline(&self, reason: &str) -> Printer {
         Printer {
+            controls: controls(&self.config)
+                .into_iter()
+                .map(String::from)
+                .collect(),
             id: self.config.id.clone(),
             name: self.config.name.clone(),
             model: self.config.model.clone(),
@@ -550,9 +563,10 @@ impl Client {
     }
     /// Centauri accepts no machine action at all.
     pub fn check_control(&self) -> Result<(), Error> {
-        match self.profile {
-            Profile::Centauri => Err(refuse(MONITORING)),
-            Profile::Resin => Ok(()),
+        if controls(&self.config).contains(&"stop") {
+            Ok(())
+        } else {
+            Err(refuse(MONITORING))
         }
     }
     /// Why preparation, Start, pause, resume, and cancel are unavailable.

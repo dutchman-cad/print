@@ -335,6 +335,10 @@ async fn api_lifecycle_and_all_machine_routes_require_fresh_confirmation() {
     assert!(progress["progress"].as_f64().unwrap() > 0.0);
     let printers = accepted(&app, get("/api/v1/printers"), 200).await;
     assert_eq!(printers[0]["job_name"], "Bracket");
+    assert_eq!(
+        printers[0]["controls"],
+        json!(["start", "pause", "resume", "cancel", "stop", "clear"])
+    );
     for path in &paths {
         assert_eq!(
             send(&app, action(path, Some(&token))).await.0,
@@ -652,7 +656,7 @@ fn cli_output_confirmation_and_json_prepare_only() {
     assert!(listed.status.success());
     assert_eq!(
         serde_json::from_slice::<Value>(&listed.stdout).unwrap(),
-        json!([{"id":"demo", "name":"Demo printer", "model":"Example model", "state":"idle", "needs_clearing":true}])
+        json!([{"id":"demo", "name":"Demo printer", "model":"Example model", "state":"idle", "needs_clearing":true, "controls":["start","pause","resume","cancel","stop","clear"]}])
     );
     let input = dir.path().join("part.3mf");
     std::fs::write(&input, model()).unwrap();
@@ -1296,4 +1300,22 @@ async fn challenges_bind_actions_observations_expiry_and_survive_restart() {
     );
     let request = confirmed(&app, &format!("/api/v1/jobs/{id}/cancel"), &"4".repeat(64)).await;
     assert_eq!(send(&app, request).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn simulated_stop_matches_its_advertised_support() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let app = router(simulation(clock.clone()), settings(dir.path(), clock));
+    let job = ready(&app).await;
+    let id = job["id"].as_str().unwrap();
+    let request = confirmed(&app, &format!("/api/v1/jobs/{id}/start"), &"e".repeat(64)).await;
+    accepted(&app, request, 200).await;
+    let request = confirmed(&app, "/api/v1/printers/demo/stop", &"f".repeat(64)).await;
+    let printer = accepted(&app, request, 200).await;
+    assert_eq!(printer["state"], "idle");
+    assert_eq!(
+        accepted(&app, get(&format!("/api/v1/jobs/{id}")), 200).await["state"],
+        "cancelled"
+    );
 }

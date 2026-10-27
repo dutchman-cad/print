@@ -8,6 +8,15 @@ use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
 
+pub(crate) const RESUME: &str = "Resume behaviour has not been commissioned. Review the printer macros and set resume_commissioned before resuming.";
+pub(crate) fn controls(printer: &crate::config::Printer) -> Vec<&'static str> {
+    crate::backend::ALL_CONTROLS
+        .iter()
+        .copied()
+        .filter(|action| *action != "resume" || printer.resume_commissioned)
+        .collect()
+}
+
 const STATUS_TIMEOUT: Duration = Duration::from_secs(4);
 trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for T {}
@@ -594,11 +603,13 @@ impl Client {
             "info":tools.map_or_else(|| json!({"nozzle_diameter":nozzle}), |t| json!({"tools":t})),"configuration":crate::safety::hash(&config),"min":bounds("axis_minimum"),"max":bounds("axis_maximum")}),
         )
     }
-    pub fn resume_commissioned(&self) -> bool {
-        self.config.resume_commissioned
-    }
+
     pub fn offline(&self, error: &Error) -> Printer {
         Printer {
+            controls: controls(&self.config)
+                .into_iter()
+                .map(String::from)
+                .collect(),
             id: self.config.id.clone(),
             name: self.config.name.clone(),
             model: self.config.model.clone(),

@@ -1,6 +1,8 @@
 //! Handwritten protocol fixtures served only on a test-owned loopback socket.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
+#[path = "helpers/controls.rs"]
+mod controls;
 #[path = "helpers/slicer.rs"]
 mod slicer_fixture;
 
@@ -1752,4 +1754,11 @@ async fn cli_stop_requires_confirmation_and_can_stop_an_external_job() {
         assert_eq!(stops, usize::from(yes));
         assert_eq!(machine.state, if yes { "STOPPED" } else { "PRINTING" });
     }
+}
+
+#[tokio::test]
+async fn api_reports_configured_controls() {
+    let f = Fake::new().await;
+    let (_dir, app) = controls::app(f.config());
+    controls::listed(&app, controls::ALL).await;
 }

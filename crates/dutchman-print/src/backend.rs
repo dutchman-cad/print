@@ -70,6 +70,7 @@ pub struct Printer {
     pub name: String,
     pub model: String,
     pub state: PrinterState,
+    pub controls: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,8 +153,26 @@ pub struct Job {
     pub seconds_left: Option<u64>,
 }
 
+/// Stable report order for backends supporting every machine action.
+pub const ALL_CONTROLS: &[&str] = &["start", "pause", "resume", "cancel", "stop", "clear"];
+
 /// Errors must be safe to show to callers, without credentials or backend addresses.
 pub trait Backend: Send + Sync {
+    /// Supported machine actions in configuration order, independent of live state.
+    fn controls(&self, _printer: &str) -> Vec<&'static str> {
+        ALL_CONTROLS.to_vec()
+    }
+    /// Refuse unsupported actions before reading telemetry.
+    fn check_action(&self, printer: &str, action: &str) -> Result<(), Error> {
+        if self.controls(printer).contains(&action) {
+            Ok(())
+        } else {
+            Err(Error::Refused(format!(
+                "This printer does not support {action}. Choose a supported control."
+            )))
+        }
+    }
+
     fn restore_jobs<'a>(&'a self, _path: &'a Path) -> Reply<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -223,6 +242,10 @@ pub trait Backend: Send + Sync {
     }
     fn pause<'a>(&'a self, printer: &'a str) -> Reply<'a, Job>;
     fn resume<'a>(&'a self, printer: &'a str) -> Reply<'a, Job>;
+    /// Resolve a stored job's printer without reading machine status.
+    fn job_printer<'a>(&'a self, job: &'a str) -> Reply<'a, String> {
+        Box::pin(async move { Ok(self.job(job).await?.printer) })
+    }
     fn job<'a>(&'a self, job_id: &'a str) -> Reply<'a, Job>;
     /// Release expired job state as well as its files.
     fn forget<'a>(&'a self, job_id: &'a str) -> Reply<'a, ()>;

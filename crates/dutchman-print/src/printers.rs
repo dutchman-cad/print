@@ -60,6 +60,17 @@ pub struct Printers {
     // this gate and takes only the command mutex, which polls release.
     transitions: BTreeMap<String, Mutex<()>>,
 }
+/// The same configuration support used by reports and action guards.
+pub(crate) fn configured_controls(printer: &crate::config::Printer) -> Vec<&'static str> {
+    match printer.kind.as_deref() {
+        Some("bambu") => crate::bambu::controls(printer),
+        Some("elegoo-sdcp") => crate::elegoo_sdcp::controls(printer),
+        Some("snapmaker-2" | "snapmaker-j1") => crate::snapmaker::controls(),
+        Some("repetier") => crate::repetier::controls(),
+        Some("moonraker" | "snapmaker-u1") => crate::moonraker::controls(printer),
+        _ => crate::backend::ALL_CONTROLS.to_vec(),
+    }
+}
 fn refuse(message: &str) -> Error {
     Error::Refused(message.into())
 }
@@ -1162,9 +1173,7 @@ impl Printers {
             return Err(refuse("No matching live job or readiness is unknown. Read fresh status to reconcile the printer."));
         }
         if action == "resume" {
-            if !client.resume_commissioned() {
-                return Err(refuse("Resume behaviour has not been commissioned. Review the printer macros and set resume_commissioned before resuming."));
-            }
+            self.check_action(&target.job.printer, action)?;
             if client.review(&live).await? != target.info {
                 return Err(refuse("Machine configuration or resume macros changed. Review the printer before resuming."));
             }
@@ -1335,12 +1344,7 @@ impl Printers {
         target: &mut Prepared,
         guard: &mut MachineGuard,
     ) -> Result<Job, Error> {
-        if let Some(client) = self.sdcp.get(&target.job.printer) {
-            return Err(client.refusal("start"));
-        }
-        if let Some(client) = self.snapmaker.get(&target.job.printer) {
-            return Err(client.refusal());
-        }
+        self.check_action(&target.job.printer, "start")?;
         if self.moonraker.contains_key(&target.job.printer) {
             return self.start_moonraker(target, guard).await;
         }
@@ -1516,6 +1520,45 @@ impl Printers {
 }
 
 impl Backend for Printers {
+    fn controls(&self, printer: &str) -> Vec<&'static str> {
+        self.configs
+            .iter()
+            .find(|p| p.id == printer)
+            .map(configured_controls)
+            .unwrap_or_default()
+    }
+    fn check_action(&self, printer: &str, action: &str) -> Result<(), Error> {
+        if !self.configs.iter().any(|p| p.id == printer) {
+            return Err(Error::NotFound);
+        }
+        if self.controls(printer).contains(&action) {
+            return Ok(());
+        }
+        if let Some(client) = self.bambu.get(printer) {
+            client.check_control()?;
+        }
+        if let Some(client) = self.sdcp.get(printer) {
+            return Err(client.refusal(action));
+        }
+        if let Some(client) = self.snapmaker.get(printer) {
+            return Err(client.refusal());
+        }
+        if self.moonraker.contains_key(printer) && action == "resume" {
+            return Err(refuse(crate::moonraker::RESUME));
+        }
+        if self.repetier.contains_key(printer) {
+            return Err(refuse(match action {
+                "pause" => crate::repetier::PAUSE,
+                "resume" => crate::repetier::RESUME,
+                "stop" => crate::repetier::STOP,
+                _ => "This printer does not support this action. Choose a supported control.",
+            }));
+        }
+        Err(refuse(
+            "This printer does not support this action. Choose a supported control.",
+        ))
+    }
+
     fn review_action<'a>(
         &'a self,
         action: &'a str,
@@ -1523,20 +1566,9 @@ impl Backend for Printers {
         job: Option<&'a str>,
     ) -> Reply<'a, ()> {
         Box::pin(async move {
-            if action == "stop" {
-                if let Some(client) = self.repetier.get(printer) {
-                    return self.review_repetier_stop(client, printer).await;
-                }
-            }
+            self.check_action(printer, action)?;
             if matches!(action, "clear" | "stop") {
                 return Ok(());
-            }
-            self.check_control(printer)?;
-            if let Some(client) = self.sdcp.get(printer) {
-                return Err(client.refusal(action));
-            }
-            if let Some(client) = self.snapmaker.get(printer) {
-                return Err(client.refusal());
             }
             if let Some(client) = self.bambu.get(printer) {
                 let live = client.snapshot().await;
@@ -1621,10 +1653,7 @@ impl Backend for Printers {
                     {
                         return Err(refuse("The live job differs from the reviewed job or readiness is unknown. Read fresh status."));
                     }
-                    if action == "resume"
-                        && (!client.resume_commissioned()
-                            || client.review(&live).await? != target.info)
-                    {
+                    if action == "resume" && client.review(&live).await? != target.info {
                         return Err(refuse("Review the printer configuration and commission resume before resuming."));
                     }
                 }
@@ -1877,6 +1906,7 @@ impl Backend for Printers {
     }
     fn clear<'a>(&'a self, id: &'a str) -> Reply<'a, ()> {
         Box::pin(async move {
+            self.check_action(id, "clear")?;
             if let Some(client) = self.bambu.get(id) {
                 client.acknowledge();
             }
@@ -2202,7 +2232,7 @@ impl Backend for Printers {
             let printer = self.tracked(id).await?.job.printer;
             let mut guard = self.machine(&printer).await?;
             let mut target = self.tracked(id).await?;
-            self.check_control(&printer)?;
+            self.check_action(&printer, "cancel")?;
             if target.job.state == JobState::Cancelled {
                 return Ok(target.job);
             }
@@ -2239,31 +2269,18 @@ impl Backend for Printers {
     }
     fn pause<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {
-            if let Some(client) = self.sdcp.get(printer) {
-                return Err(client.refusal("pause"));
-            }
-            if let Some(client) = self.snapmaker.get(printer) {
-                return Err(client.refusal());
-            }
-            if self.repetier.contains_key(printer) {
-                return Err(refuse(crate::repetier::PAUSE));
-            }
+            self.check_action(printer, "pause")?;
             self.control(printer, "pause", JobState::Printing).await
         })
     }
     fn resume<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {
-            if let Some(client) = self.sdcp.get(printer) {
-                return Err(client.refusal("resume"));
-            }
-            if let Some(client) = self.snapmaker.get(printer) {
-                return Err(client.refusal());
-            }
-            if self.repetier.contains_key(printer) {
-                return Err(refuse(crate::repetier::RESUME));
-            }
+            self.check_action(printer, "resume")?;
             self.control(printer, "resume", JobState::Paused).await
         })
+    }
+    fn job_printer<'a>(&'a self, id: &'a str) -> Reply<'a, String> {
+        Box::pin(async move { Ok(self.tracked(id).await?.job.printer) })
     }
     fn job<'a>(&'a self, id: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {

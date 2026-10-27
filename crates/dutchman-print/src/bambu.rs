@@ -30,6 +30,14 @@ pub fn unsupported() -> Error {
     )
 }
 
+pub(crate) fn controls(printer: &crate::config::Printer) -> Vec<&'static str> {
+    if printer.lan_control {
+        crate::backend::ALL_CONTROLS.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
 pub fn validate(p: &crate::config::Printer) -> Result<(), String> {
     validate_enrollment(p, false)
 }
@@ -589,6 +597,7 @@ impl Telemetry {
             }
         };
         Printer {
+            controls: controls(p).into_iter().map(String::from).collect(),
             id: p.id.clone(),
             name: p.name.clone(),
             model: p.model.clone(),
@@ -714,7 +723,7 @@ impl Client {
     }
 
     pub fn check_control(&self) -> Result<(), Error> {
-        if self.config.lan_control {
+        if controls(&self.config).contains(&"start") {
             Ok(())
         } else {
             Err(unsupported())
