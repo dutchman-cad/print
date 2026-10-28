@@ -1,4 +1,7 @@
-//! Moonraker REST transport, handwritten from its public documentation.
+//! Moonraker HTTP commands and WebSocket monitoring from public protocol facts.
+
+#[path = "moonraker_monitor.rs"]
+mod monitor;
 
 use crate::backend::{Error, Printer, PrinterState};
 use axum::body::Bytes;
@@ -27,6 +30,7 @@ pub struct Client {
     tls: Arc<rustls::ClientConfig>,
     observation: tokio::sync::Mutex<Option<Value>>,
     changed: std::sync::atomic::AtomicBool,
+    monitor: monitor::Monitor,
 }
 pub struct Snapshot {
     pub printer: Printer,
@@ -111,6 +115,7 @@ impl Client {
             tls: Arc::new(tls),
             observation: tokio::sync::Mutex::new(None),
             changed: std::sync::atomic::AtomicBool::new(false),
+            monitor: monitor::Monitor::new(),
         })
     }
     pub async fn request(
@@ -308,13 +313,21 @@ impl Client {
         ))
         .await
     }
+    pub async fn shutdown(&self) {
+        self.monitor.shutdown().await;
+    }
     pub async fn snapshot(&self) -> Result<Snapshot, Error> {
         tokio::time::timeout(STATUS_TIMEOUT, self.snapshot_in())
             .await
             .map_err(|_| Error::Unavailable)?
     }
     async fn snapshot_in(&self) -> Result<Snapshot, Error> {
-        let server = self.json("/server/info").await?;
+        let cached = self.monitor.read(self).await?;
+        let generation = cached.as_ref().map(|(_, _, generation)| *generation);
+        let server = match &cached {
+            Some((server, _, _)) => server.clone(),
+            None => self.json("/server/info").await?,
+        };
         let mut printer = self.offline(&Error::Unavailable);
         let connected = server.get("klippy_connected").and_then(Value::as_bool);
         let klippy = server.get("klippy_state").and_then(Value::as_str);
@@ -343,54 +356,21 @@ impl Client {
                 history: Value::Null,
             });
         }
-        let available = self.json("/printer/objects/list").await?;
-        let available = available
-            .get("objects")
-            .and_then(Value::as_array)
-            .ok_or(Error::Unavailable)?;
-        if available.len() > 1024 {
-            return Err(Error::Unavailable);
-        }
-        let names = [
-            "webhooks",
-            "print_stats",
-            "virtual_sdcard",
-            "display_status",
-            "extruder",
-            "heater_bed",
-            "toolhead",
-            "configfile",
-            "pause_resume",
-        ];
-        let mut query = names
-            .iter()
-            .filter(|name| available.iter().any(|v| v.as_str() == Some(**name)))
-            .copied()
-            .collect::<Vec<_>>()
-            .join("&");
-        for name in available.iter().filter_map(Value::as_str).filter(|s| {
-            *s == "mcu"
-                || s.starts_with("mcu ")
-                || s.strip_prefix("extruder")
-                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-        }) {
-            if name.len() > 128 || query.len() > 8192 {
-                return Err(Error::Unavailable);
+        let objects = match cached {
+            Some((_, objects, _)) => objects,
+            None => {
+                let names = self.status_objects().await?;
+                let query = names
+                    .iter()
+                    .map(|name| encode(name))
+                    .collect::<Vec<_>>()
+                    .join("&");
+                let data = self
+                    .json(&format!("/printer/objects/query?{query}"))
+                    .await?;
+                monitor::baseline(&data, &names)?
             }
-            query.push('&');
-            query.push_str(&encode(name));
-        }
-        let data = self
-            .json(&format!("/printer/objects/query?{query}"))
-            .await?;
-        if data
-            .get("eventtime")
-            .and_then(Value::as_f64)
-            .is_none_or(|t| t < 0.0)
-        {
-            return Err(Error::Unavailable);
-        }
-        let objects = data.get("status").cloned().ok_or(Error::Unavailable)?;
+        };
         let state = objects
             .pointer("/print_stats/state")
             .and_then(Value::as_str);
@@ -501,12 +481,52 @@ impl Client {
                 printer.job_id = Some(id.into());
             }
         }
+        self.monitor.check(generation)?;
         Ok(Snapshot {
             printer,
             server,
             objects,
             history,
         })
+    }
+    async fn status_objects(&self) -> Result<Vec<String>, Error> {
+        let available = self.json("/printer/objects/list").await?;
+        let available = available
+            .get("objects")
+            .and_then(Value::as_array)
+            .ok_or(Error::Unavailable)?;
+        if available.len() > 1024 {
+            return Err(Error::Unavailable);
+        }
+        let names = [
+            "webhooks",
+            "print_stats",
+            "virtual_sdcard",
+            "display_status",
+            "extruder",
+            "heater_bed",
+            "toolhead",
+            "configfile",
+            "pause_resume",
+        ];
+        let mut selected = names
+            .iter()
+            .filter(|name| available.iter().any(|v| v.as_str() == Some(**name)))
+            .copied()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for name in available.iter().filter_map(Value::as_str).filter(|s| {
+            *s == "mcu"
+                || s.starts_with("mcu ")
+                || s.strip_prefix("extruder")
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        }) {
+            if name.len() > 128 || selected.iter().map(String::len).sum::<usize>() > 8192 {
+                return Err(Error::Unavailable);
+            }
+            selected.push(name.to_owned());
+        }
+        Ok(selected)
     }
     pub async fn review(&self, live: &Snapshot) -> Result<Value, Error> {
         let host = self.json("/printer/info").await?;

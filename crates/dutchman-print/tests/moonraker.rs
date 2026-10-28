@@ -1208,3 +1208,268 @@ async fn uncommissioned_resume_is_omitted_and_refused_without_reads() {
     assert!(f.shared.machine.lock().await.records.is_empty());
     controls::listed(&app, &["start", "pause", "cancel", "stop", "clear"]).await;
 }
+
+async fn until(mut condition: impl AsyncFnMut() -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        while !condition().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn websocket_baseline(f: &Fake, c: &Client) {
+    // A delta observable only through the socket proves the baseline was installed.
+    until(async || !f.shared.machine.lock().await.subscriptions.is_empty()).await;
+    f.shared.ws_messages.send(json!({"jsonrpc":"2.0","method":"notify_status_update","params":[{"heater_bed":{"temperature":61}},2]})).unwrap();
+    until(async || {
+        c.snapshot()
+            .await
+            .is_ok_and(|s| s.printer.bed_temperature == Some(61.0))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn websocket_baseline_deltas_ignore_unsubscribed_and_keep_http_commands() {
+    let f = Fake::new().await;
+    {
+        let mut m = f.shared.machine.lock().await;
+        m.websocket = true;
+        m.state = "printing".into();
+    }
+    let c = Client::new(f.config().printers.remove(0)).unwrap();
+    assert_eq!(f.shared.machine.lock().await.ws_connections, 0);
+    c.snapshot().await.unwrap();
+    websocket_baseline(&f, &c).await;
+    {
+        let mut m = f.shared.machine.lock().await;
+        assert_eq!(m.ws_connections, 1);
+        let subscribe = &m.subscriptions[0];
+        assert_eq!(subscribe["method"], "printer.objects.subscribe");
+        assert_eq!(
+            subscribe["params"]["objects"].get("extruder"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            subscribe["params"]["objects"].as_object().unwrap().len(),
+            10
+        );
+        assert!(subscribe["params"]["objects"].get("extruder1").is_none());
+        m.records.clear();
+    }
+    f.shared.ws_messages.send(json!({"method":"notify_status_update","params":[{"display_status":{"progress":0.75},"extruder1":{"temperature":999},"heater_bed":{"temperature":62}},3]})).unwrap();
+    until(async || {
+        c.snapshot()
+            .await
+            .is_ok_and(|s| s.printer.progress == Some(0.75))
+    })
+    .await;
+    let s = c.snapshot().await.unwrap();
+    assert_eq!(s.printer.state, PrinterState::Printing);
+    assert_eq!(s.printer.nozzle_temperature, Some(201.5));
+    assert_eq!(s.printer.bed_temperature, Some(62.0));
+    assert!(s.objects.get("extruder1").is_none());
+    for _ in 0..3 {
+        c.snapshot().await.unwrap();
+    }
+    assert!(!f
+        .shared
+        .machine
+        .lock()
+        .await
+        .records
+        .iter()
+        .any(|(_, path, _)| matches!(
+            path.as_str(),
+            "/server/info" | "/printer/objects/list" | "/printer/objects/query"
+        )));
+    c.command("/printer/print/pause").await.unwrap();
+    assert_eq!(f.commands().await, vec!["/printer/print/pause"]);
+    c.shutdown().await;
+    until(async || f.shared.machine.lock().await.ws_closed == 1).await;
+    assert!(c.snapshot().await.is_err());
+    assert_eq!(f.shared.machine.lock().await.ws_connections, 1);
+}
+
+#[tokio::test]
+async fn websocket_drop_falls_back_until_reconnected_baseline() {
+    let f = Fake::new().await;
+    f.shared.machine.lock().await.websocket = true;
+    let c = Client::new(f.config().printers.remove(0)).unwrap();
+    c.snapshot().await.unwrap();
+    websocket_baseline(&f, &c).await;
+    {
+        let mut m = f.shared.machine.lock().await;
+        m.hold_baseline = true;
+        m.state = "paused".into();
+        m.records.clear();
+    }
+    f.shared.ws_messages.send(json!("drop")).unwrap();
+    until(async || {
+        c.snapshot()
+            .await
+            .is_ok_and(|s| s.printer.state == PrinterState::Paused)
+    })
+    .await;
+    assert!(f
+        .shared
+        .machine
+        .lock()
+        .await
+        .records
+        .iter()
+        .any(|(_, path, _)| path == "/printer/objects/query"));
+    until(async || f.shared.machine.lock().await.subscriptions.len() == 2).await;
+    assert_eq!(
+        c.snapshot().await.unwrap().printer.state,
+        PrinterState::Paused
+    );
+    f.shared.baseline_release.notify_one();
+    f.shared
+        .ws_messages
+        .send(
+            json!({"method":"notify_status_update","params":[{"heater_bed":{"temperature":61}},4]}),
+        )
+        .unwrap();
+    until(async || {
+        c.snapshot()
+            .await
+            .is_ok_and(|s| s.printer.bed_temperature == Some(61.0))
+    })
+    .await;
+    f.shared.machine.lock().await.records.clear();
+    assert_eq!(
+        c.snapshot().await.unwrap().printer.state,
+        PrinterState::Paused
+    );
+    assert!(!f
+        .shared
+        .machine
+        .lock()
+        .await
+        .records
+        .iter()
+        .any(|(_, path, _)| path == "/printer/objects/query"));
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn websocket_klippy_faults_require_a_new_baseline() {
+    for notification in ["notify_klippy_shutdown", "notify_klippy_disconnected"] {
+        let f = Fake::new().await;
+        f.shared.machine.lock().await.websocket = true;
+        let b = Safety::new(Arc::new(Printers::new(f.config()).unwrap()));
+        b.printer("test").await.unwrap();
+        until(async || !f.shared.machine.lock().await.subscriptions.is_empty()).await;
+        f.shared
+            .ws_messages
+            .send(json!({"method":notification,"params":[]}))
+            .unwrap();
+        until(async || b.printer("test").await.unwrap().state == PrinterState::Offline).await;
+        assert!(b.clear("test").await.is_err());
+        assert!(f.commands().await.is_empty());
+        until(async || f.shared.machine.lock().await.subscriptions.len() == 2).await;
+        until(async || b.printer("test").await.unwrap().state == PrinterState::Idle).await;
+        b.shutdown().await.unwrap();
+        until(async || f.shared.machine.lock().await.ws_closed == 2).await;
+    }
+}
+
+#[tokio::test]
+async fn websocket_monitor_preserves_guarded_command_reconciliation() {
+    let f = Fake::new().await;
+    f.shared.machine.lock().await.websocket = true;
+    let dir = tempfile::tempdir().unwrap();
+    let b = backend(&f, dir.path()).await;
+    until(async || !f.shared.machine.lock().await.subscriptions.is_empty()).await;
+    // This field differs from HTTP and makes baseline installation observable.
+    f.shared
+        .ws_messages
+        .send(
+            json!({"method":"notify_status_update","params":[{"heater_bed":{"temperature":61}},2]}),
+        )
+        .unwrap();
+    until(async || b.printer("test").await.unwrap().bed_temperature == Some(61.0)).await;
+    b.clear("test").await.unwrap();
+    assert_eq!(b.start("one").await.unwrap().state, JobState::Printing);
+    assert_eq!(b.pause("test").await.unwrap().state, JobState::Paused);
+    assert_eq!(b.resume("test").await.unwrap().state, JobState::Printing);
+    assert_eq!(b.cancel("one").await.unwrap().state, JobState::Cancelled);
+    assert_eq!(
+        f.commands().await,
+        vec![
+            "/printer/print/start",
+            "/printer/print/pause",
+            "/printer/print/resume",
+            "/printer/print/cancel"
+        ]
+    );
+    b.shutdown().await.unwrap();
+    until(async || f.shared.machine.lock().await.ws_closed == 1).await;
+}
+
+#[tokio::test]
+async fn websocket_loss_invalidates_a_status_read_waiting_for_http_history() {
+    let f = Fake::new().await;
+    f.shared.machine.lock().await.websocket = true;
+    let c = Arc::new(Client::new(f.config().printers.remove(0)).unwrap());
+    c.snapshot().await.unwrap();
+    websocket_baseline(&f, &c).await;
+    f.shared.machine.lock().await.block = Some("/server/history/list".into());
+    let pending = tokio::spawn({
+        let c = c.clone();
+        async move { c.snapshot().await }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        f.shared.entered.notified(),
+    )
+    .await
+    .unwrap();
+    f.shared.ws_messages.send(json!("drop")).unwrap();
+    until(async || {
+        c.snapshot()
+            .await
+            .is_ok_and(|s| s.printer.bed_temperature == Some(59.0))
+    })
+    .await;
+    f.shared.release.notify_one();
+    assert!(pending.await.unwrap().is_err());
+    c.shutdown().await;
+}
+
+#[tokio::test]
+async fn websocket_subscribes_to_listed_additional_tools_and_tracks_the_active_tool() {
+    let f = Fake::new().await;
+    {
+        let mut m = f.shared.machine.lock().await;
+        m.websocket = true;
+        m.toolheads = 4;
+        m.active_tool = "extruder2".into();
+    }
+    let mut p = f.config().printers.remove(0);
+    p.kind = Some("snapmaker-u1".into());
+    let c = Client::new(p).unwrap();
+    c.snapshot().await.unwrap();
+    websocket_baseline(&f, &c).await;
+    let s = c.snapshot().await.unwrap();
+    assert_eq!(s.printer.nozzle_temperature, Some(202.0));
+    {
+        let m = f.shared.machine.lock().await;
+        let names = &m.subscriptions[0]["params"]["objects"];
+        for name in ["mcu", "extruder1", "extruder2", "extruder3"] {
+            assert_eq!(names.get(name), Some(&Value::Null));
+            assert!(s.objects.get(name).is_some());
+        }
+    }
+    f.shared.ws_messages.send(json!({"method":"notify_status_update","params":[{"toolhead":{"extruder":"extruder3"},"extruder3":{"temperature":209}},3]})).unwrap();
+    until(async || {
+        c.snapshot()
+            .await
+            .is_ok_and(|s| s.printer.nozzle_temperature == Some(209.0))
+    })
+    .await;
+    c.shutdown().await;
+}

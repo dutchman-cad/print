@@ -174,6 +174,12 @@ reported by OctoPrint require operator review before confirmation. See the
 
 Moonraker (Klipper) uses the same routes, server-issued challenges, reviewed-byte checks,
 and bed-clear policy. The running server holds clearance and polls the latest history entry.
+Status objects come from a lazy authenticated WebSocket subscription, with a fresh baseline
+on every connection and merged field updates. Cached status requires a live socket and
+an incoming message within 30 seconds. Until a baseline arrives or after socket loss,
+status reads use the existing HTTP query; Klippy disconnect/shutdown notifications block
+readiness until a new baseline. History and file identity checks and all commands remain
+HTTP operations. Reconnect never resends a command. No v1 fields change.
 A changed execution ID or fractional start timestamp, or an observed `print_stats` state or
 filename change, withdraws clearance. Timestamps are finite floating-point Unix seconds and
 retain fractions. Jobs are checkpointed after changes, including reconciled outcomes.
