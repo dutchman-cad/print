@@ -37,7 +37,11 @@ model = "Example printer"
 
 To write this file for one printer, run `dutchman-print init` (see [Commands](#commands)).
 Repeat `[[printers]]` to add printers. Leave it out for an empty fleet. Unknown backend kinds
-produce an error naming the kind. Config files are limited to 1 MiB and 64 printers.
+produce an error naming the kind. With `kind = "printers"`, each printer's `kind` must be one
+of `prusalink`, `octoprint`, `moonraker`, `snapmaker-u1`, `snapmaker-2`, `snapmaker-j1`,
+`duet`, `duet-sbc`, `repetier`, `bambu` or `elegoo-sdcp`; any other kind is refused with that
+list. Every printer that can start a job also asks for the bed check.
+Config files are limited to 1 MiB and 64 printers.
 IDs must be unique, with 1–64 ASCII letters, digits, hyphens, or underscores. Names are
 nonempty plain text, at most 256 bytes; model descriptions are free text up to 256 bytes.
 
