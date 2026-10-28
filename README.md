@@ -34,6 +34,7 @@ Choose `simulated` in step 2 to try Print without a printer.
 
 | Printer or software | `kind` | Status | Control |
 | --- | --- | --- | --- |
+| Thermal label printers (TSC and compatible TSPL) | `label` | Simulated only | Start of PNG labels; cancel only before a label is sent |
 | Document printers (IPP Everywhere, IPP) | `ipp` | Simulated only | Start and cancel of PDF documents |
 | Simulated printers | `simulated` | Built in, for trying the API | Start, pause, resume, cancel, Stop |
 | Prusa printers with PrusaLink | `prusalink` | Simulated only | Start, pause, resume, cancel, Stop |
@@ -55,7 +56,8 @@ for 3D printers that list `clear`. Moonraker and U1 include resume only after
 
 Every machine action needs a confirmation the server issues for that printer and job.
 For 3D printers, a person must also check the bed. IPP document printers print PDF files
-without a slicer. [docs/print.md](docs/print.md) describes each kind's setup and what still
+without a slicer. TSPL label printers print PNG images at the configured stock resolution.
+[docs/print.md](docs/print.md) describes each kind's setup and what still
 needs checking on real hardware.
 
 ## Build from source

@@ -275,6 +275,9 @@ impl Safety {
     }
 }
 impl Backend for Safety {
+    fn label_printer(&self, printer: &str) -> bool {
+        self.inner.label_printer(printer)
+    }
     fn document_printer(&self, printer: &str) -> bool {
         self.inner.document_printer(printer)
     }

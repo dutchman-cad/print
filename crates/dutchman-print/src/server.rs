@@ -404,9 +404,16 @@ async fn create_in(
         .to_ascii_lowercase();
     let raw = matches!(
         content_type.as_str(),
-        "model/3mf" | "application/vnd.ms-package.3dmanufacturing-3dmodel+xml" | "application/pdf"
+        "model/3mf"
+            | "application/vnd.ms-package.3dmanufacturing-3dmodel+xml"
+            | "application/pdf"
+            | "image/png"
     );
+    let mut png = content_type == "image/png";
     let mut pdf = content_type == "application/pdf";
+    if png {
+        path = dir.join("input.png");
+    }
     if pdf {
         path = dir.join("input.pdf");
     }
@@ -433,12 +440,21 @@ async fn create_in(
             }
         }
         file.flush().await.map_err(internal)?;
-        filename = Some(if pdf { "input.pdf" } else { "input.3mf" }.to_owned());
+        filename = Some(
+            if png {
+                "input.png"
+            } else if pdf {
+                "input.pdf"
+            } else {
+                "input.3mf"
+            }
+            .to_owned(),
+        );
     } else {
         if content_type != "multipart/form-data" {
             return Err((
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "Send model/3mf, application/pdf, or multipart/form-data.".into(),
+                "Send model/3mf, application/pdf, image/png, or multipart/form-data.".into(),
             ));
         }
         let mut form = Multipart::from_request(request, &())
@@ -453,17 +469,25 @@ async fn create_in(
             let key = field.name().unwrap_or_default().to_owned();
             if key == "file" {
                 if filename.is_some() {
-                    return Err(bad("Choose exactly one .3mf or .pdf file."));
+                    return Err(bad("Choose exactly one .3mf, .pdf, or .png file."));
                 }
                 let name = upload::safe_name(
                     field
                         .file_name()
-                        .ok_or_else(|| bad("Choose one .3mf or .pdf file."))?,
+                        .ok_or_else(|| bad("Choose one .3mf, .pdf, or .png file."))?,
                 );
                 if !std::path::Path::new(&name).extension().is_some_and(|ext| {
-                    ext.eq_ignore_ascii_case("3mf") || ext.eq_ignore_ascii_case("pdf")
+                    ext.eq_ignore_ascii_case("3mf")
+                        || ext.eq_ignore_ascii_case("pdf")
+                        || ext.eq_ignore_ascii_case("png")
                 }) {
-                    return Err(bad("Choose one .3mf or .pdf file."));
+                    return Err(bad("Choose one .3mf, .pdf, or .png file."));
+                }
+                png = std::path::Path::new(&name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
+                if png {
+                    path = dir.join("input.png");
                 }
                 pdf = std::path::Path::new(&name)
                     .extension()
@@ -506,14 +530,21 @@ async fn create_in(
     let name = fields
         .remove("name")
         .or(filename.clone())
-        .ok_or_else(|| bad("Choose one .3mf or .pdf file."))?;
+        .ok_or_else(|| bad("Choose one .3mf, .pdf, or .png file."))?;
     if !path.is_file() {
-        return Err(bad("Choose one .3mf or .pdf file."));
+        return Err(bad("Choose one .3mf, .pdf, or .png file."));
     }
     let printer = fields
         .remove("printer")
         .ok_or_else(|| bad("Choose a printer."))?;
-    if app.backend.document_printer(&printer) != pdf {
+    if app.backend.label_printer(&printer) != png {
+        return Err(bad(if png {
+            "PNG images require a label printer. Choose a PDF for IPP or a 3MF for a 3D printer."
+        } else {
+            "Label printers require PNG images. PDF and 3MF jobs cannot be printed here."
+        }));
+    }
+    if !png && app.backend.document_printer(&printer) != pdf {
         return Err(bad(if pdf {
             "PDF documents require an IPP printer. Choose a 3MF model for this 3D printer."
         } else {
@@ -527,7 +558,7 @@ async fn create_in(
                 .map_err(backend_error)?,
         )
         .map_err(|e| bad(e.to_string()))?;
-    } else {
+    } else if !png {
         let checked = path.clone();
         let scratch = dir.join("check");
         let limits = app.config.storage.zip;

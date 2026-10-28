@@ -408,7 +408,9 @@ async fn command(
                     let _ = tokio::fs::remove_dir_all(&dir).await;
                 }
                 let estimate = estimate?;
-                if !json && backend.document_printer(&printer) {
+                if !json && backend.label_printer(&printer) {
+                    eprintln!("Estimate: unavailable.");
+                } else if !json && backend.document_printer(&printer) {
                     eprintln!("Estimate: page count unavailable.");
                 } else if !json {
                     eprintln!(
@@ -517,19 +519,33 @@ async fn prepare_cli(
     use dutchman_print::backend::Error;
     options.validate().map_err(Error::Refused)?;
     let settings = dutchman_print::StorageConfig::default();
+    let png = file
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
     let pdf = file
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"));
     if !pdf
+        && !png
         && !file
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("3mf"))
     {
         return Err(Error::Refused(
-            "Choose a .3mf model or .pdf document.".into(),
+            "Choose a .3mf model, .pdf document, or .png label image.".into(),
         ));
     }
-    if backend.document_printer(printer) != pdf {
+    if backend.label_printer(printer) != png {
+        return Err(Error::Refused(
+            if png {
+                "PNG images require a label printer."
+            } else {
+                "Label printers require PNG images. PDF and 3MF jobs cannot be printed here."
+            }
+            .into(),
+        ));
+    }
+    if !png && backend.document_printer(printer) != pdf {
         return Err(Error::Refused(
             if pdf {
                 "PDF documents require an IPP printer. Choose a 3MF model for this 3D printer."
@@ -553,7 +569,13 @@ async fn prepare_cli(
     tokio::fs::create_dir(dir)
         .await
         .map_err(|_| Error::Failed("Cannot create a job folder.".into()))?;
-    let input = dir.join(if pdf { "input.pdf" } else { "input.3mf" });
+    let input = dir.join(if png {
+        "input.png"
+    } else if pdf {
+        "input.pdf"
+    } else {
+        "input.3mf"
+    });
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let source = tokio::fs::File::open(file)
         .await
@@ -575,7 +597,7 @@ async fn prepare_cli(
         .await
         .map_err(|_| Error::Failed("Cannot keep the print file.".into()))?;
     drop(target);
-    if !pdf {
+    if !pdf && !png {
         let checked = input.clone();
         let scratch = dir.join("check");
         tokio::task::spawn_blocking(move || {
@@ -584,7 +606,7 @@ async fn prepare_cli(
         .await
         .map_err(|_| Error::Failed("Cannot check the 3MF file.".into()))?
         .map_err(Error::Refused)?;
-    } else {
+    } else if pdf {
         dutchman_print::ipp::check_pdf(&dutchman_print::safety::file_bytes(&input).await?)?;
     }
     backend.prepare(id, &input, printer, options).await

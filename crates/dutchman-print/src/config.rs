@@ -41,6 +41,7 @@ pub(crate) const PRINTER_KINDS: &[&str] = &[
     "duet-sbc",
     "repetier",
     "ipp",
+    "label",
     "bambu",
     "elegoo-sdcp",
 ];
@@ -53,6 +54,11 @@ pub struct Printer {
     pub url: Option<String>,
     pub host: Option<String>,
     pub port: Option<u16>,
+    pub language: Option<String>,
+    pub width_mm: Option<f64>,
+    pub height_mm: Option<f64>,
+    pub gap_mm: Option<f64>,
+    pub dpi: Option<u16>,
     pub ftps_port: Option<u16>,
     #[serde(default)]
     pub lan_control: bool,
@@ -191,6 +197,7 @@ impl Config {
                     Some("duet" | "duet-sbc") => crate::duet::validate(printer)?,
                     Some("repetier") => crate::repetier::validate(printer)?,
                     Some("ipp") => crate::ipp::validate(printer)?,
+                    Some("label") => crate::labels::validate(printer)?,
                     Some("elegoo-sdcp") => crate::elegoo_sdcp::validate(printer)?,
                     Some("snapmaker-2" | "snapmaker-j1") => crate::snapmaker::validate(printer)?,
                     Some("bambu") => {
@@ -205,6 +212,15 @@ impl Config {
                             PRINTER_KINDS.join(", ")
                         ))
                     }
+                }
+                if printer.kind.as_deref() != Some("label")
+                    && (printer.language.is_some()
+                        || printer.width_mm.is_some()
+                        || printer.height_mm.is_some()
+                        || printer.gap_mm.is_some()
+                        || printer.dpi.is_some())
+                {
+                    return Err("Set language, width_mm, height_mm, gap_mm, and dpi only for label printers.".into());
                 }
                 if printer.storage.is_some() && printer.kind.as_deref() != Some("prusalink") {
                     return Err("Set storage only for PrusaLink printers.".into());
@@ -321,8 +337,10 @@ impl Config {
 
 /// Kinds that require no slicer: document and monitoring-only printers.
 pub(crate) fn sliceless(printer: &Printer) -> bool {
-    matches!(printer.kind.as_deref(), Some("elegoo-sdcp" | "ipp"))
-        || crate::snapmaker::is_kind(printer.kind.as_deref())
+    matches!(
+        printer.kind.as_deref(),
+        Some("elegoo-sdcp" | "ipp" | "label")
+    ) || crate::snapmaker::is_kind(printer.kind.as_deref())
 }
 
 /// The user's platform config folder; this does not read any files.

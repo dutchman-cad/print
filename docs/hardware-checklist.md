@@ -623,3 +623,19 @@ server starts by itself at that moment would be stopped.
   is queued and verify only the tracked job is canceled. Locate the printer's own cancel UI.
 - [ ] Interrupt the submission reply and read status: the same job must reconcile by name
   without another Print-Job. Check restart reconciliation and the printer's history retention.
+
+## TSPL label printers
+
+- [ ] Record the printer model, TSPL firmware, installed 203/300 dpi resolution, stock width,
+  height, and gap. Confirm `<ESC>!.` support (V7.00 EZ or later); use an exclusive raw TCP
+  connection on a trusted local network. Locate the physical cancel control.
+- [ ] Read status first. Check idle, printing, paused, head open, paper empty/jam, ribbon
+  empty, and offline against the printer screen. The query has no separate ribbon-jam bit.
+- [ ] Prepare a synthetic PNG at stock resolution. Check a wrong size and PDF/3MF are refused.
+  Check black/white polarity, row padding, orientation, stock feed, and copies physically.
+- [ ] Confirm Start once without bed acknowledgement; check printing followed by idle and
+  exactly the requested labels. Check that Cancel of a sent label is refused and sends
+  nothing, and that the printer's own cancel control stops it.
+- [ ] Interrupt a transfer and restart Print. Check uncertainty persists and Start is never
+  resent. Inspect output and clear the printer locally before new work. Save status results
+  beside the firmware version, including prints too short to observe.

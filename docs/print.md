@@ -1,11 +1,11 @@
 # Dutchman Print
 
 Dutchman Print is a local print companion for SolidCraft and a standalone command line.
-A backend prepares 3MF models or PDF documents, estimates jobs, and controls printers. The included
+A backend prepares 3MF models, PDF documents, or PNG labels, estimates jobs, and controls printers. The included
 `simulated` backend is a demo: it contacts no printers and can optionally run a local slicer.
 The `printers` backend supports individually configured local PrusaLink, OctoPrint, Moonraker (Klipper),
 Snapmaker U1, Duet (standalone or with Duet Software Framework), Repetier-Server, Bambu,
-and IPP document printers. It monitors Elegoo printers that speak SDCP and Snapmaker 2.0,
+IPP document printers, and TSPL label printers. It monitors Elegoo printers that speak SDCP and Snapmaker 2.0,
 J1, and Artisan printers.
 
 Build `dutchman-print` from this checkout with Rust 1.88 or newer:
@@ -185,9 +185,10 @@ dutchman-print init --kind bambu --host 192.168.1.40 --serial SERIAL --access-co
 
 | Flag | Answer |
 |---|---|
-| `--kind` | `simulated`, `prusalink`, `octoprint`, `moonraker`, `snapmaker-u1`, `duet`, `duet-sbc`, `repetier`, `bambu`, `elegoo-sdcp`, `snapmaker-2`, `snapmaker-j1`, or `ipp` |
+| `--kind` | `simulated`, `prusalink`, `octoprint`, `moonraker`, `snapmaker-u1`, `duet`, `duet-sbc`, `repetier`, `bambu`, `elegoo-sdcp`, `snapmaker-2`, `snapmaker-j1`, `ipp`, or `label` |
 | `--url` | Address for PrusaLink, OctoPrint, Moonraker, Snapmaker U1, Duet (either kind), Repetier-Server, and IPP; `http://` is added when left out |
-| `--host`, `--port` | Address for Bambu, Elegoo, Snapmaker 2.0, and J1; the port only when it is not the usual one |
+| `--host`, `--port` | Address for Bambu, Elegoo, Snapmaker 2.0, J1, and TSPL label printers; the port only when it is not the usual one |
+| `--language`, `--width-mm`, `--height-mm`, `--gap-mm`, `--dpi` | TSPL label language, stock size and gap in mm, and required 203 or 300 dpi resolution |
 | `--api-key` | PrusaLink, OctoPrint, Repetier-Server, and Moonraker or Snapmaker U1 (optional there) |
 | `--username`, `--password` | PrusaLink login instead of an API key, or optional IPP HTTP Basic login over TLS; `--password` is also the optional Duet machine password, for either Duet kind |
 | `--serial`, `--access-code` | Bambu serial number and LAN access code |
@@ -220,7 +221,7 @@ written as monitoring only, without a slicer.
 `printers` writes one line per printer, such as `Workbench demo: idle`. `--json` returns
 the same array as `GET /api/v1/printers`. The CLI calls the backend directly; no server is needed.
 
-`print` accepts a single `.3mf` for 3D printers or `.pdf` for IPP printers, `--printer ID`, and optional `--printer-profile`,
+`print` accepts a single `.3mf` for 3D printers `.pdf` for IPP printers, or `.png` for label printers, `--printer ID`, and optional `--printer-profile`,
 `--print-profile`, and `--filament-profile` names. It checks the file and prepares a job,
 shows the estimate, then asks two separate questions on a terminal: acknowledge the checked,
 clear bed, then start the named job. Each challenge summary shows the current printer state.
@@ -1720,6 +1721,74 @@ canceled as `cancelled`, and aborted as `failed`. Command outcome waits are boun
 25 seconds and never resend a command. Inspect fresh status after an uncertain result.
 No remote file is staged separately or deleted: IPP manages its own document spool.
 The 3D printer bed-clear policy is unchanged.
+
+## Label printers (TSPL)
+
+Thermal label printers use `kind = "label"`, with the required `language = "tspl"`.
+Configure the exact host; Print uses raw TCP port 9100 by default and performs no discovery
+or scanning. TSPL-compatible firmware must implement the immediate status query. Check
+compatibility before use. Transport is unencrypted;
+use a trusted local network. Testing so far uses simulated printers only.
+
+```toml
+[backend]
+kind = "printers"
+
+[[printers]]
+kind = "label"
+language = "tspl"
+id = "shipping"
+name = "Shipping labels"
+model = "TSC-compatible TSPL printer"
+host = "label-printer.local"
+# port = 9100
+width_mm = 50
+height_mm = 25
+gap_mm = 2
+dpi = 203
+```
+
+Set the installed resolution explicitly to 203 or 300 dpi; Print never guesses. Width and
+height must be positive and at most 1000 mm; gap must be 0–25.4 mm. There is no slicer,
+PDF renderer, scaling, discovery, or automatic calibration. Export a PNG already matching
+`round(mm × dpi / 25.4)` dots on each axis, within one dot. A refusal names both sizes.
+Only noninterlaced 8-bit grayscale, RGB, grayscale-alpha, and RGBA PNGs are accepted;
+export indexed, 1-bit, 16-bit, interlaced, animated, or transparency-key images in one of
+these formats first. PNG files are capped at 16 MiB, 12000 dots per axis, four million
+pixels, and 4096 chunks. PNG parsing and filters are local; zlib inflation uses the
+MIT/Apache `flate2` crate already in the dependency lockfile.
+
+Pixels use integer luminance `(299R + 587G + 114B) / 1000`; alpha composites onto white.
+Values below 128 print black, and other values print white, without dithering. Rows are
+packed most significant bit first, with white padding to whole bytes. The job contains
+`SIZE`, `GAP` with zero offset, `CLS`, `BITMAP 0,0,...,0,` (overwrite), and `PRINT 1,copies`.
+Copies defaults to one; allowed values are 1–999999999. Sides, media, and slicer profiles
+are refused. PNGs cannot go to IPP or 3D printers; PDFs and 3MFs cannot go to label printers.
+
+```sh
+dutchman-print init --kind label --language tspl --host label-printer.local --width-mm 50 --height-mm 25 --gap-mm 2 --dpi 203
+dutchman-print print shipping.png --printer shipping --copies 2 --yes
+```
+
+Controls are Start and Cancel, using separate fresh confirmations and no bed-clear step.
+Start first reads status, sends exactly once, and waits up to 25 seconds to observe
+printing. A later idle observation establishes completion only after printing was seen.
+A very short print that finishes between polls remains unconfirmed. A failed transfer or
+lost status connection is uncertain, survives restart, blocks further starts on that
+printer, and is never resent. Inspect the physical output and printer buffer; unresolved
+records must expire or be forgotten before preparing more work. Do not repeat a label
+whose output is uncertain. Status queries have a two-second deadline; the bounded transfer
+has a 30-second deadline. There is no automatic reconnect-and-resend.
+
+TSPL status contains no execution identity, progress, or job history. Use this printer
+exclusively with Print during tracked work: another client or front-panel print cannot be
+distinguished from the tracked print. Cancel withdraws a label that has not been sent and
+sends nothing. Print never cancels a sent label: TSPL's only cancel command clears every job
+on the printer, whoever sent it. Use the printer's own cancel or feed control for that, and
+locate it before use.
+Status reports head open, paper jam/empty, and ribbon empty as attention, paused as paused,
+printing as printing, normal as idle, other or unknown errors as error, and no reply as
+offline. The immediate query documents no separate ribbon-jam flag.
 
 ## Releasing
 

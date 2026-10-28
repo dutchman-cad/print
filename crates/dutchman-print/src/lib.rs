@@ -9,6 +9,7 @@ pub mod elegoo_sdcp;
 pub mod init;
 pub mod ipp;
 mod ipp_codec;
+pub mod labels;
 pub mod moonraker;
 pub mod octoprint;
 pub mod printers;

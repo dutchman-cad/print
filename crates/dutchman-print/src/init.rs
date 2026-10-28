@@ -15,12 +15,27 @@ pub struct Flags {
     /// Printer address for PrusaLink, OctoPrint, Moonraker, Snapmaker U1, and Duet.
     #[arg(long)]
     pub url: Option<String>,
-    /// Hostname or IP address for Bambu, Elegoo, Snapmaker 2.0, and J1 printers.
+    /// Hostname or IP address for Bambu, Elegoo, Snapmaker, and TSPL label printers.
     #[arg(long)]
     pub host: Option<String>,
-    /// Port, only when a Bambu, Elegoo, or Snapmaker 2.0 or J1 printer uses another one.
+    /// Optional port for a host-based printer; TSPL labels default to 9100.
     #[arg(long)]
     pub port: Option<u16>,
+    /// Label language (tspl).
+    #[arg(long)]
+    pub language: Option<String>,
+    /// Label stock width in mm.
+    #[arg(long)]
+    pub width_mm: Option<f64>,
+    /// Label stock height in mm.
+    #[arg(long)]
+    pub height_mm: Option<f64>,
+    /// Label stock gap in mm.
+    #[arg(long)]
+    pub gap_mm: Option<f64>,
+    /// Label resolution, 203 or 300 dpi.
+    #[arg(long)]
+    pub dpi: Option<u16>,
     /// API key for PrusaLink, OctoPrint, Moonraker, or Snapmaker U1.
     #[arg(long)]
     pub api_key: Option<String>,
@@ -106,7 +121,7 @@ struct Kind {
     model: &'static str,
 }
 
-const KINDS: [Kind; 13] = [
+const KINDS: [Kind; 14] = [
     Kind {
         name: "simulated",
         about: "A built-in demo printer for trying Print. Contacts nothing.",
@@ -197,6 +212,13 @@ const KINDS: [Kind; 13] = [
         address: Address::Url,
         slicing: Slicing::None,
         model: "IPP document printer",
+    },
+    Kind {
+        name: "label",
+        about: "Thermal label printers using TSPL. Prints PNG images.",
+        address: Address::Host,
+        slicing: Slicing::None,
+        model: "TSPL label printer",
     },
 ];
 
@@ -394,6 +416,7 @@ pub struct Setup {
 
 #[derive(Default)]
 struct Answers {
+    label: Option<(String, f64, f64, f64, u16)>,
     url: Option<String>,
     host: Option<String>,
     port: Option<u16>,
@@ -555,6 +578,11 @@ fn check_flags(flags: &Flags, kind: &Kind) -> Result<(), String> {
     }
     let slices = kind.slicing != Slicing::None;
     let unused = [
+        ("language", flags.language.is_some() && name != "label"),
+        ("width-mm", flags.width_mm.is_some() && name != "label"),
+        ("height-mm", flags.height_mm.is_some() && name != "label"),
+        ("gap-mm", flags.gap_mm.is_some() && name != "label"),
+        ("dpi", flags.dpi.is_some() && name != "label"),
         (
             "port",
             flags.port.is_some() && kind.address != Address::Host,
@@ -677,6 +705,53 @@ pub fn build(flags: &Flags, ask: Option<&mut dyn Ask>) -> Result<Setup, String> 
             )?);
         }
         Address::None => {}
+    }
+    if kind.name == "label" {
+        let language = session.required(
+            flags.language.as_ref(),
+            "language",
+            "Label language",
+            Some("tspl"),
+        )?;
+        let mut stock = Vec::new();
+        for (flag, prompt, value) in [
+            ("width-mm", "Label width in mm", flags.width_mm),
+            ("height-mm", "Label height in mm", flags.height_mm),
+            ("gap-mm", "Label gap in mm", flags.gap_mm),
+        ] {
+            let text = value.map(|v| v.to_string());
+            stock.push(
+                session
+                    .required(text.as_ref(), flag, prompt, None)?
+                    .parse::<f64>()
+                    .map_err(|_| format!("Set a numeric --{flag}."))?,
+            );
+        }
+        let given = flags.dpi.map(|v| v.to_string());
+        let dpi = session
+            .required(
+                given.as_ref(),
+                "dpi",
+                "Printer resolution (203 or 300 dpi)",
+                None,
+            )?
+            .parse::<u16>()
+            .map_err(|_| "Set --dpi to 203 or 300.")?;
+        answers.label = Some((
+            language,
+            *stock.first().ok_or("Missing width.")?,
+            *stock.get(1).ok_or("Missing height.")?,
+            *stock.get(2).ok_or("Missing gap.")?,
+            dpi,
+        ));
+        if session.ask.is_some() && flags.port.is_none() {
+            answers.port = Some(
+                session
+                    .required(None, "port", "Raw TCP port", Some("9100"))?
+                    .parse()
+                    .map_err(|_| "Set a numeric port.")?,
+            );
+        }
     }
     secrets(flags, kind, &mut session, &mut answers)?;
     if kind.name == "repetier" {
@@ -1141,6 +1216,19 @@ fn printer_fields(t: &mut Text, kind: &Kind, a: &Answers) {
     let url = a.url.as_deref().unwrap_or_default();
     let host = a.host.as_deref().unwrap_or_default();
     match kind.name {
+        "label" => {
+            t.comment(
+                "TSPL over raw TCP. No discovery or scanning. Use V7.00 EZ or later for cancel.",
+            );
+            t.string("host", host);
+            t.line(&format!("port = {}", a.port.unwrap_or(9100)));
+            if let Some((language, width, height, gap, dpi)) = &a.label {
+                t.string("language", language);
+                t.line(&format!(
+                    "width_mm = {width}\nheight_mm = {height}\ngap_mm = {gap}\ndpi = {dpi}"
+                ));
+            }
+        }
         "ipp" => {
             t.comment(
                 "Configured IPP resource URL, such as ipps://printer.local:631/ipp/print.
@@ -1433,7 +1521,7 @@ mod tests {
         assert_eq!(setup.kind, "prusalink");
         assert_eq!(setup.id, "workbench-mini");
         assert!(!setup.needs_trust);
-        assert!(script.shown.contains("Choose a number from 1 to 13"));
+        assert!(script.shown.contains("Choose a number from 1 to 14"));
         assert!(script.shown.contains("  8. repetier"));
         assert!(script.shown.contains("  9. bambu"));
         assert_eq!(script.secrets.len(), 1);

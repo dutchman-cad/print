@@ -194,6 +194,10 @@ pub trait Backend: Send + Sync {
     fn document_printer(&self, _printer: &str) -> bool {
         false
     }
+    /// Whether this printer accepts PNG label images.
+    fn label_printer(&self, _printer: &str) -> bool {
+        false
+    }
     /// Document filename and copy count for a confirmation summary.
     fn document_summary<'a>(&'a self, _job: &'a str) -> Reply<'a, Option<String>> {
         Box::pin(async { Ok(None) })

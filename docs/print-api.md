@@ -342,7 +342,7 @@ replace a newer cancellation or restore a forgotten job.
 | `name` | string | Required |
 | `state` | string | Required: `ready`, `printing`, `paused`, `done`, `cancelled`, `failed`, or `ended` |
 | `estimate` | object | Required; may be empty |
-| `detail` | string | Optional; safe staged-file cleanup failure explanation |
+| `detail` | string | Optional; safe staged-file cleanup failure or uncertain label outcome explanation |
 | `progress` | number or null | Required; fraction from 0 to 1, null when unavailable |
 | `seconds_left` | nonnegative integer or null | Required; null when unavailable |
 
@@ -559,3 +559,53 @@ Pending, pending-held, processing, and processing-stopped map to tracked `printi
 completed maps to `done`, canceled to `cancelled`, and aborted to `failed`. Printer idle
 alone never establishes a job outcome. Start/cancel outcome waits are bounded to 25 seconds.
 IPP manages spool cleanup; no separate staged file is deleted.
+
+## TSPL PNG label jobs
+
+For `kind = "label"`, send a raw `image/png` body with the usual query fields, or one
+multipart `file` part with a `.png` filename. Raw images default to `input.png`.
+A PNG sent to IPP or a 3D printer, or a PDF/3MF sent to a label printer, returns 400.
+PNG magic, chunk bounds and CRCs, decompressed length, and scanline filters are checked.
+Supported PNGs are noninterlaced, 8-bit grayscale, RGB, grayscale-alpha, or RGBA, without
+transparency keys or animation. The limit is 16 MiB compressed, 12000 dots on either axis,
+four million pixels, and 4096 chunks. Existing streaming upload/storage limits also apply.
+Invalid image content, dimensions, or backend options are refused with 409 in preparation.
+
+The PNG dimensions must match `round(stock_mm × configured_dpi / 25.4)` within one dot
+per axis. No scaling or rendering occurs. Alpha composites on white; integer luminance
+`(299R + 587G + 114B) / 1000` below 128 prints black, otherwise white. `copies` is accepted
+through query, multipart, and CLI, defaults to one, and ranges from 1 to 999999999.
+`sides`, `media`, and slicer profiles are refused. Estimates may be empty.
+
+Printer JSON lists `["start", "cancel"]`, `needs_clearing: false`, and no job identity,
+temperatures, or progress. `<ESC>!?` requests one status byte with a two-second timeout:
+
+| Bit/value | State and detail |
+|---|---|
+| `0x00` | `idle`, Ready |
+| `0x01` | `attention`, Head open |
+| `0x02` | `attention`, Paper jam |
+| `0x04` | `attention`, Paper empty |
+| `0x08` | `attention`, Ribbon empty |
+| `0x10` | `paused`, Paused |
+| `0x20` | `printing`, Printing |
+| `0x80`, reserved `0x40` | `error`, Other error |
+| No answer | `offline` |
+
+Fault reasons combine; error bits take precedence over attention, which takes precedence
+over pause and printing. No separate ribbon-jam bit is documented by this query.
+
+Start retains the single-use observation-bound challenge, confirmation header, fresh idle
+check, input digest, and durable attempt checkpoint. Its summary includes the PNG filename
+and copies, without bed clearance. One raw TCP job sends `SIZE`, `GAP`, `CLS`, `BITMAP`
+overwrite raster, and `PRINT 1,copies`. Printing must be observed within 25 seconds to
+confirm Start; subsequent idle maps the tracked job to `done`. Idle alone never confirms
+an attempted job. The 30-second transfer deadline, a lost connection, or a missing printing
+observation yields 409 and prohibits resending Start. Transport uncertainty is retained
+across restart and blocks further starts on that printer. Such records remain unresolved
+until expiry/forgetting; inspect output and the printer before submitting new work.
+
+Cancel withdraws a ready label that has not been sent, locally, and sends nothing. A sent
+label is refused with 409: TSPL's only cancel command clears every job on the printer,
+whoever sent it, so a sent label is cancelled on the printer itself. Pause, resume, Stop,
+and clear are unsupported. No staged remote file needs deletion.
