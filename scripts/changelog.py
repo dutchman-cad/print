@@ -77,7 +77,8 @@ def preview(root: Path = ROOT) -> str:
     return "## Unreleased\n" + (f"\n{content}\n" if content else "")
 
 
-def release(version: str, release_date: str | None = None, root: Path = ROOT) -> None:
+def release(version: str, release_date: str | None = None, root: Path = ROOT,
+            write: bool = False) -> str:
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
         raise ValueError("Use a release version in X.Y.Z form.")
     stamp = release_date if release_date is not None else date.today().isoformat()
@@ -87,8 +88,13 @@ def release(version: str, release_date: str | None = None, root: Path = ROOT) ->
     check(root)
     path = root / "CHANGELOG.md"
     changelog = path.read_text(encoding="utf-8")
-    if re.search(rf"^## {re.escape(version)}(?:\s|$)", changelog, re.MULTILINE):
-        raise ValueError(f"CHANGELOG.md: version {version} already has an entry.")
+    existing = re.search(rf"^## {re.escape(version)}(?:[ \t][^\n]*)?$", changelog, re.MULTILINE)
+    if existing:
+        if write:
+            raise ValueError(f"CHANGELOG.md: version {version} already has an entry.")
+        following = re.search(r"^## ", changelog[existing.end():], re.MULTILINE)
+        end = existing.end() + following.start() if following else len(changelog)
+        return changelog[existing.start():end].rstrip() + "\n"
     entries = fragments(root)
     if not entries:
         raise ValueError("changelog.d/: add a fragment before releasing.")
@@ -96,10 +102,12 @@ def release(version: str, release_date: str | None = None, root: Path = ROOT) ->
     if newest is None:
         raise ValueError("CHANGELOG.md: no version heading found for release insertion.")
     entry = f"## {version} ({stamp})\n\n{assembled(entries)}\n\n"
-    path.write_text(changelog[:newest.start()] + entry + changelog[newest.start():],
-                    encoding="utf-8")
-    for fragment, _, _ in entries:
-        fragment.unlink()
+    if write:
+        path.write_text(changelog[:newest.start()] + entry + changelog[newest.start():],
+                        encoding="utf-8")
+        for fragment, _, _ in entries:
+            fragment.unlink()
+    return entry.rstrip() + "\n"
 
 
 def main() -> int:
@@ -107,9 +115,11 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("check", help="Validate fragments and version headings")
     commands.add_parser("preview", help="Print the assembled Unreleased section")
-    command = commands.add_parser("release", help="Insert a release and delete its fragments")
+    command = commands.add_parser("release", help="Print a version section without changing files")
     command.add_argument("version", metavar="X.Y.Z")
     command.add_argument("--date", dest="release_date", metavar="YYYY-MM-DD")
+    command.add_argument("--write", action="store_true",
+                         help="Also insert into CHANGELOG.md and delete included fragments")
     args = parser.parse_args()
     try:
         if args.command == "check":
@@ -117,7 +127,7 @@ def main() -> int:
         elif args.command == "preview":
             sys.stdout.write(preview())
         else:
-            release(args.version, args.release_date)
+            sys.stdout.write(release(args.version, args.release_date, write=args.write))
     except (OSError, ValueError) as error:
         print(f"Changelog: {error}", file=sys.stderr)
         return 1

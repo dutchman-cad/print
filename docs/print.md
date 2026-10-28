@@ -1655,3 +1655,37 @@ that printer's `start_profile` table. These details use
 [Bambu's temperature field documentation](https://portal.bblmw.com/fleet-hub/wb76oog4i8k/files/Bambu%20Fleet%20Hub%20HTTP%20API%20EN%20v1.0.0.pdf),
 [community MQTT field notes](https://github.com/Doridian/OpenBambuAPI/blob/main/mqtt.md)
 and [community activity code notes](https://github.com/Doridian/OpenBambuAPI/blob/main/gcode.md#m1002).
+
+## Releasing
+
+Dutchman Print is not released. No release may be published before testing on a real
+printer using the [hardware checklist](hardware-checklist.md). Simulated tests alone
+do not satisfy this project rule.
+
+The `Release drafts` workflow builds on pushed `v*` tags and through `workflow_dispatch`.
+The tag must match the workspace version in `Cargo.toml` (for example, `v0.1.0`). A manual
+run on a branch only keeps build artifacts; a run on an existing version tag also creates
+a draft. The workflow never creates a tag, publishes a release, or marks one as latest.
+An existing draft or published release for that tag is refused, rather than replaced.
+
+Archives contain `dutchman-print`, `README.md`, `LICENSE`, `NOTICE`, and the version's
+changelog section as `CHANGELOG.md`, with an adjacent SHA-256 checksum. Linux x86_64 and
+ARM64, macOS ARM64 and x86_64, and Windows x86_64 are built with `--locked`, using the
+same runners and targets as Dutchman. The same changelog section supplies the draft notes.
+
+Print notes with `python3 scripts/changelog.py release X.Y.Z`. This leaves fragments and
+`CHANGELOG.md` untouched; `--write` explicitly records the section and deletes its fragments.
+`--date YYYY-MM-DD` overrides the date; draft builds use the tagged commit's date when
+assembling fragments. If a version section already exists, it supplies the notes instead.
+After hardware testing, check the archives, checksums, and notes, then publish manually
+on GitHub. Publishing is never a workflow step.
+
+CI checks the changelog, script tests, and release YAML without building release binaries:
+
+```sh
+python3 scripts/changelog.py check
+python3 -m unittest discover -s scripts/tests -v
+python3 scripts/changelog.py release 0.1.0
+python3 -m pip install PyYAML==6.0.3
+python3 scripts/check-release-workflow.py
+```
