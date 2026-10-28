@@ -926,6 +926,18 @@ as `X-Api-Key`. Omit `api_key` only when the installation explicitly trusts this
 Other authentication forms are not implemented. No cloud account is required. See
 [Moonraker authorization](https://moonraker.readthedocs.io/en/latest/external_api/authorization/).
 
+Status opens one monitoring WebSocket lazily at `/websocket` (WSS for HTTPS), using
+that same API key header and reverse-proxy base path. It subscribes only to available
+objects, uses the subscription reply as a baseline, and merges changed object fields.
+A live connection and a message within 30 seconds are required to reuse that baseline.
+Before the first baseline, after socket loss, and while reconnecting, each status read
+falls back to the existing HTTP status query. Reconnects use exponential backoff from
+one to 30 seconds and never replay commands. Klippy disconnect or shutdown notifications
+invalidate readiness until a new subscription baseline arrives. Graceful shutdown closes
+the socket. Messages and merged object state are each limited to 1 MiB.
+Uploads, machine commands, file metadata, and execution history continue to use HTTP;
+execution identity, confirmation, readiness, and bed-clear checks still apply.
+
 Commission profiles for the actual model, build volume, nozzle, tooling, material, and
 plate. Only a single extruder is supported for control; unresolved material slots are
 refused. [Snapmaker U1](#snapmaker-u1) printers have their own tool rule. Loaded material and physical plate identity have no universal telemetry here:
@@ -933,8 +945,9 @@ check them before confirming each start. Set `resume_commissioned = true` only a
 checking that this printer's installed pause/resume macros behave safely. A changed
 machine configuration, including macros, requires fresh preparation and review.
 
-Status polls server connectivity and available printer objects, then reads a full object
-snapshot. Klippy startup reports busy while it connects; shutdown, error, missing objects,
+The HTTP fallback reads server connectivity, available objects, and a full object
+snapshot. The same mapping applies to subscription baselines and merged updates.
+Klippy startup reports busy while it connects; shutdown, error, missing objects,
 and contradictory states block movement; disconnection or unavailable telemetry reports offline. `print_stats` standby,
 complete, and cancelled map to idle; printing and paused retain those states; unknown
 states map to error. `detail` contains the known state or a safe explanation. Raw fault

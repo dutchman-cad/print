@@ -1575,6 +1575,12 @@ impl Backend for Printers {
                     Ok(())
                 }));
             }
+            for client in self.moonraker.values() {
+                pending.push(Box::pin(async move {
+                    client.shutdown().await;
+                    Ok(())
+                }));
+            }
             for client in self.duet.values() {
                 pending.push(Box::pin(client.shutdown()));
             }
