@@ -91,6 +91,11 @@ pub struct Printer {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Options {
+    pub copies: Option<u32>,
+    pub sides: Option<String>,
+    pub media: Option<String>,
+    #[serde(skip)]
+    pub document_name: Option<String>,
     pub printer_profile: Option<String>,
     pub print_profile: Option<String>,
     pub filament_profile: Option<String>,
@@ -120,6 +125,29 @@ impl Options {
         .flatten()
         {
             validate_profile_name(name)?;
+        }
+        if self.copies.is_some_and(|n| n == 0 || n > i32::MAX as u32) {
+            return Err("Use a positive copy count no greater than 2147483647.".into());
+        }
+        for v in self.sides.iter() {
+            if v.is_empty()
+                || v.len() > 255
+                || !v
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_.".contains(&b))
+            {
+                return Err("Use supported IPP keyword values for sides and media.".into());
+            }
+        }
+        if self
+            .media
+            .as_ref()
+            .is_some_and(|s| s.is_empty() || s.len() > 255 || s.chars().any(char::is_control))
+        {
+            return Err(
+                "Use a supported media name of at most 255 bytes without control characters."
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -161,6 +189,14 @@ pub trait Backend: Send + Sync {
     /// Supported machine actions in configuration order, independent of live state.
     fn controls(&self, _printer: &str) -> Vec<&'static str> {
         ALL_CONTROLS.to_vec()
+    }
+    /// Whether this printer accepts PDF documents rather than 3MF models.
+    fn document_printer(&self, _printer: &str) -> bool {
+        false
+    }
+    /// Document filename and copy count for a confirmation summary.
+    fn document_summary<'a>(&'a self, _job: &'a str) -> Reply<'a, Option<String>> {
+        Box::pin(async { Ok(None) })
     }
     /// Refuse unsupported actions before reading telemetry.
     fn check_action(&self, printer: &str, action: &str) -> Result<(), Error> {

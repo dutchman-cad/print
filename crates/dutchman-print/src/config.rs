@@ -28,6 +28,23 @@ pub struct Backend {
     pub slice: bool,
 }
 
+/// Every printer kind the printers backend accepts. A kind missing here is refused, so
+/// every backend is listed and the controls test below covers it.
+pub(crate) const PRINTER_KINDS: &[&str] = &[
+    "prusalink",
+    "octoprint",
+    "moonraker",
+    "snapmaker-u1",
+    "snapmaker-2",
+    "snapmaker-j1",
+    "duet",
+    "duet-sbc",
+    "repetier",
+    "ipp",
+    "bambu",
+    "elegoo-sdcp",
+];
+
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Printer {
@@ -155,6 +172,16 @@ impl Config {
         let mut ids = HashSet::new();
         for printer in &self.printers {
             if self.backend.kind == "printers" {
+                if !printer
+                    .kind
+                    .as_deref()
+                    .is_some_and(|kind| PRINTER_KINDS.contains(&kind))
+                {
+                    return Err(format!(
+                        "Set each printer kind to one of: {}.",
+                        PRINTER_KINDS.join(", ")
+                    ));
+                }
                 match printer.kind.as_deref() {
                     Some("prusalink") => {
                         crate::prusalink::validate(printer)?;
@@ -163,6 +190,7 @@ impl Config {
                     Some("moonraker" | "snapmaker-u1") => crate::moonraker::validate(printer)?,
                     Some("duet" | "duet-sbc") => crate::duet::validate(printer)?,
                     Some("repetier") => crate::repetier::validate(printer)?,
+                    Some("ipp") => crate::ipp::validate(printer)?,
                     Some("elegoo-sdcp") => crate::elegoo_sdcp::validate(printer)?,
                     Some("snapmaker-2" | "snapmaker-j1") => crate::snapmaker::validate(printer)?,
                     Some("bambu") => {
@@ -171,10 +199,12 @@ impl Config {
                             enrollment == Some(printer.id.as_str()),
                         )?;
                     }
-                    _ => return Err(
-                        "Set each printer kind to prusalink, octoprint, moonraker, snapmaker-u1, snapmaker-2, snapmaker-j1, duet, duet-sbc, repetier, bambu, or elegoo-sdcp."
-                            .into(),
-                    ),
+                    _ => {
+                        return Err(format!(
+                            "Set each printer kind to one of: {}.",
+                            PRINTER_KINDS.join(", ")
+                        ))
+                    }
                 }
                 if printer.storage.is_some() && printer.kind.as_deref() != Some("prusalink") {
                     return Err("Set storage only for PrusaLink printers.".into());
@@ -289,10 +319,9 @@ impl Config {
     }
 }
 
-/// Kinds Print never slices or sends jobs to: Elegoo SDCP and the monitoring-only Snapmaker
-/// kinds.
+/// Kinds that require no slicer: document and monitoring-only printers.
 pub(crate) fn sliceless(printer: &Printer) -> bool {
-    printer.kind.as_deref() == Some("elegoo-sdcp")
+    matches!(printer.kind.as_deref(), Some("elegoo-sdcp" | "ipp"))
         || crate::snapmaker::is_kind(printer.kind.as_deref())
 }
 

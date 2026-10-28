@@ -1,11 +1,12 @@
 # Dutchman Print
 
 Dutchman Print is a local print companion for SolidCraft and a standalone command line.
-A backend prepares 3MF files, estimates jobs, and controls printers. The included
+A backend prepares 3MF models or PDF documents, estimates jobs, and controls printers. The included
 `simulated` backend is a demo: it contacts no printers and can optionally run a local slicer.
 The `printers` backend supports individually configured local PrusaLink, OctoPrint, Moonraker (Klipper),
-Snapmaker U1, Duet (standalone or with Duet Software Framework), Repetier-Server, and Bambu printers, and monitors Elegoo printers
-that speak SDCP and Snapmaker 2.0, J1, and Artisan printers.
+Snapmaker U1, Duet (standalone or with Duet Software Framework), Repetier-Server, Bambu,
+and IPP document printers. It monitors Elegoo printers that speak SDCP and Snapmaker 2.0,
+J1, and Artisan printers.
 
 Build `dutchman-print` from this checkout with Rust 1.88 or newer:
 
@@ -184,11 +185,11 @@ dutchman-print init --kind bambu --host 192.168.1.40 --serial SERIAL --access-co
 
 | Flag | Answer |
 |---|---|
-| `--kind` | `simulated`, `prusalink`, `octoprint`, `moonraker`, `snapmaker-u1`, `duet`, `duet-sbc`, `repetier`, `bambu`, `elegoo-sdcp`, `snapmaker-2`, or `snapmaker-j1` |
-| `--url` | Address for PrusaLink, OctoPrint, Moonraker, Snapmaker U1, Duet (either kind), and Repetier-Server; `http://` is added when left out |
+| `--kind` | `simulated`, `prusalink`, `octoprint`, `moonraker`, `snapmaker-u1`, `duet`, `duet-sbc`, `repetier`, `bambu`, `elegoo-sdcp`, `snapmaker-2`, `snapmaker-j1`, or `ipp` |
+| `--url` | Address for PrusaLink, OctoPrint, Moonraker, Snapmaker U1, Duet (either kind), Repetier-Server, and IPP; `http://` is added when left out |
 | `--host`, `--port` | Address for Bambu, Elegoo, Snapmaker 2.0, and J1; the port only when it is not the usual one |
 | `--api-key` | PrusaLink, OctoPrint, Repetier-Server, and Moonraker or Snapmaker U1 (optional there) |
-| `--username`, `--password` | PrusaLink login instead of an API key; `--password` is also the optional Duet machine password, for either Duet kind |
+| `--username`, `--password` | PrusaLink login instead of an API key, or optional IPP HTTP Basic login over TLS; `--password` is also the optional Duet machine password, for either Duet kind |
 | `--serial`, `--access-code` | Bambu serial number and LAN access code |
 | `--cert-sha256` or `--ca-file` | Bambu trust; leave both out to read the fingerprint later |
 | `--profile` | Elegoo `centauri` or `resin` |
@@ -219,7 +220,7 @@ written as monitoring only, without a slicer.
 `printers` writes one line per printer, such as `Workbench demo: idle`. `--json` returns
 the same array as `GET /api/v1/printers`. The CLI calls the backend directly; no server is needed.
 
-`print` accepts a single `.3mf`, `--printer ID`, and optional `--printer-profile`,
+`print` accepts a single `.3mf` for 3D printers or `.pdf` for IPP printers, `--printer ID`, and optional `--printer-profile`,
 `--print-profile`, and `--filament-profile` names. It checks the file and prepares a job,
 shows the estimate, then asks two separate questions on a terminal: acknowledge the checked,
 clear bed, then start the named job. Each challenge summary shows the current printer state.
@@ -1655,6 +1656,70 @@ that printer's `start_profile` table. These details use
 [Bambu's temperature field documentation](https://portal.bblmw.com/fleet-hub/wb76oog4i8k/files/Bambu%20Fleet%20Hub%20HTTP%20API%20EN%20v1.0.0.pdf),
 [community MQTT field notes](https://github.com/Doridian/OpenBambuAPI/blob/main/mqtt.md)
 and [community activity code notes](https://github.com/Doridian/OpenBambuAPI/blob/main/gcode.md#m1002).
+
+## IPP document printers
+
+`kind = "ipp"` prints PDF documents to one configured IPP resource. No discovery or
+network scanning is performed. An IPP Everywhere printer need not accept PDF: Print reads
+`document-format-supported` and refuses preparation unless it includes `application/pdf`,
+naming the supported formats. Print does not convert documents or run a slicer for IPP.
+
+```toml
+[backend]
+kind = "printers"
+
+[[printers]]
+kind = "ipp"
+id = "paper"
+name = "Drawing printer"
+model = "Document printer"
+url = "ipps://printer.example:631/ipp/print"
+# username = "workshop"
+# password = "private password"
+```
+
+Use the exact resource URL from the printer's public documentation or settings. `ipp://`
+uses HTTP and `ipps://` uses HTTPS, both defaulting to port 631; `http://` and `https://`
+addresses are also accepted, defaulting to 631 when no port is specified. TLS verifies the
+hostname and system certificate trust normally. Certificate overrides and redirects are
+not supported. Optional username/password authentication uses HTTP Basic only over TLS;
+Digest-only printers require another supported endpoint. Credentials stay in private config.
+`init --kind ipp --url URL` writes this configuration without slicer questions.
+
+Status reads Get-Printer-Attributes: idle maps to `idle`, processing to `printing`, and
+stopped to `attention` for paper, tray, cover, door, interlock, toner, developer, and marker
+supply/waste conditions. Other stopped reasons, mixed hardware errors, and unknown states
+map to `error`. A printer not accepting jobs maps to `busy`; unreachable status maps to
+`offline`. Bounded, sanitised reasons, supported formats, and available `media-ready`
+keywords appear in `detail`. Missing required telemetry blocks Start.
+
+```sh
+dutchman-print print drawing.pdf --printer paper --copies 2 --sides one-sided --media iso_a4_210x297mm
+dutchman-print print drawing.pdf --printer paper --yes --json
+```
+
+PDF preparation checks the `%PDF-` signature, the upload limit (at most 200 MiB), and live
+format support. It stores the document in the private job folder without rendering it.
+The estimate is empty when no inexpensive reliable page count is available. 3MF documents
+sent to IPP and PDF documents sent to a 3D printer are refused. Slicer profile options do
+not apply. Optional `copies`, `sides`, and `media` must be advertised by the printer;
+copy count defaults explicitly to one. Media may use an advertised keyword or name.
+
+IPP controls are `["start", "cancel"]`. There is no bed and no `clear` action. Start still
+requires a fresh challenge and confirmation; the summary names the printer, PDF filename,
+and copy count. The CLI needs `--yes` for unattended Start, without `--bed-clear`.
+Start validates the exact options with Validate-Job, then sends Print-Job once with the
+PDF bytes. A durable attempt is recorded first. A missing reply is reconciled through
+Get-Jobs by the unique submitted job name, including retained completed jobs; it never
+resends Print-Job. If the printer has forgotten the job, the outcome remains unresolved.
+Cancel sends Cancel-Job for that tracked positive job-id only, after checking its name.
+Printer Stop, pause, resume, and clear are refused.
+
+Get-Job-Attributes tracks pending/held/processing jobs as `printing`, completed as `done`,
+canceled as `cancelled`, and aborted as `failed`. Command outcome waits are bounded to
+25 seconds and never resend a command. Inspect fresh status after an uncertain result.
+No remote file is staged separately or deleted: IPP manages its own document spool.
+The 3D printer bed-clear policy is unchanged.
 
 ## Releasing
 

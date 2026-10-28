@@ -348,7 +348,7 @@ async fn create(State(app): State<Shared>, request: Request) -> Result<impl Into
 fn too_big() -> Problem {
     (
         StatusCode::PAYLOAD_TOO_LARGE,
-        "The upload is too big. Choose a smaller 3MF file.".into(),
+        "The upload is too big. Choose a smaller 3MF or PDF file.".into(),
     )
 }
 
@@ -359,7 +359,14 @@ fn job_field(
 ) -> Result<(), Problem> {
     if !matches!(
         key.as_str(),
-        "printer" | "printer_profile" | "print_profile" | "filament_profile" | "name"
+        "printer"
+            | "printer_profile"
+            | "print_profile"
+            | "filament_profile"
+            | "name"
+            | "copies"
+            | "sides"
+            | "media"
     ) || fields.contains_key(&key)
     {
         return Err(bad("Use each documented job field once."));
@@ -386,7 +393,7 @@ async fn create_in(
     dir: &std::path::Path,
     request: Request,
 ) -> Result<Job, Problem> {
-    let path = dir.join("input.3mf");
+    let mut path = dir.join("input.3mf");
     let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -397,8 +404,12 @@ async fn create_in(
         .to_ascii_lowercase();
     let raw = matches!(
         content_type.as_str(),
-        "model/3mf" | "application/vnd.ms-package.3dmanufacturing-3dmodel+xml"
+        "model/3mf" | "application/vnd.ms-package.3dmanufacturing-3dmodel+xml" | "application/pdf"
     );
+    let mut pdf = content_type == "application/pdf";
+    if pdf {
+        path = dir.join("input.pdf");
+    }
     let mut fields = HashMap::new();
     let mut filename = None;
     if raw {
@@ -415,19 +426,19 @@ async fn create_in(
             let frame = frame.map_err(|_| bad("Cannot read the file upload."))?;
             if let Ok(chunk) = frame.into_data() {
                 total = total.saturating_add(chunk.len() as u64);
-                if total > app.config.storage.max_upload {
+                if total > app.config.storage.max_upload.min(200 << 20) {
                     return Err(too_big());
                 }
                 file.write_all(&chunk).await.map_err(internal)?;
             }
         }
         file.flush().await.map_err(internal)?;
-        filename = Some("input.3mf".to_owned());
+        filename = Some(if pdf { "input.pdf" } else { "input.3mf" }.to_owned());
     } else {
         if content_type != "multipart/form-data" {
             return Err((
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "Send a 3MF body with Content-Type: model/3mf, or use multipart/form-data.".into(),
+                "Send model/3mf, application/pdf, or multipart/form-data.".into(),
             ));
         }
         let mut form = Multipart::from_request(request, &())
@@ -442,18 +453,23 @@ async fn create_in(
             let key = field.name().unwrap_or_default().to_owned();
             if key == "file" {
                 if filename.is_some() {
-                    return Err(bad("Choose exactly one .3mf file."));
+                    return Err(bad("Choose exactly one .3mf or .pdf file."));
                 }
                 let name = upload::safe_name(
                     field
                         .file_name()
-                        .ok_or_else(|| bad("Choose one .3mf file."))?,
+                        .ok_or_else(|| bad("Choose one .3mf or .pdf file."))?,
                 );
-                if !std::path::Path::new(&name)
+                if !std::path::Path::new(&name).extension().is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("3mf") || ext.eq_ignore_ascii_case("pdf")
+                }) {
+                    return Err(bad("Choose one .3mf or .pdf file."));
+                }
+                pdf = std::path::Path::new(&name)
                     .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("3mf"))
-                {
-                    return Err(bad("Choose one .3mf file."));
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"));
+                if pdf {
+                    path = dir.join("input.pdf");
                 }
                 filename = Some(name);
                 let mut file = tokio::fs::File::create(&path).await.map_err(internal)?;
@@ -463,7 +479,7 @@ async fn create_in(
                     .map_err(|err| (err.status(), "Cannot read the file upload.".into()))?
                 {
                     total = total.saturating_add(chunk.len() as u64);
-                    if total > app.config.storage.max_upload {
+                    if total > app.config.storage.max_upload.min(200 << 20) {
                         return Err(too_big());
                     }
                     file.write_all(&chunk).await.map_err(internal)?;
@@ -489,27 +505,55 @@ async fn create_in(
     }
     let name = fields
         .remove("name")
-        .or(filename)
-        .ok_or_else(|| bad("Choose one .3mf file."))?;
+        .or(filename.clone())
+        .ok_or_else(|| bad("Choose one .3mf or .pdf file."))?;
     if !path.is_file() {
-        return Err(bad("Choose one .3mf file."));
+        return Err(bad("Choose one .3mf or .pdf file."));
     }
     let printer = fields
         .remove("printer")
         .ok_or_else(|| bad("Choose a printer."))?;
-    let checked = path.clone();
-    let scratch = dir.join("check");
-    let limits = app.config.storage.zip;
-    tokio::task::spawn_blocking(move || crate::upload::check_3mf(&checked, &scratch, limits))
-        .await
-        .map_err(internal)?
-        .map_err(bad)?;
+    if app.backend.document_printer(&printer) != pdf {
+        return Err(bad(if pdf {
+            "PDF documents require an IPP printer. Choose a 3MF model for this 3D printer."
+        } else {
+            "IPP document printers require a PDF document. A 3MF model cannot be printed here."
+        }));
+    }
+    if pdf {
+        crate::ipp::check_pdf(
+            &crate::safety::file_bytes(&path)
+                .await
+                .map_err(backend_error)?,
+        )
+        .map_err(|e| bad(e.to_string()))?;
+    } else {
+        let checked = path.clone();
+        let scratch = dir.join("check");
+        let limits = app.config.storage.zip;
+        tokio::task::spawn_blocking(move || crate::upload::check_3mf(&checked, &scratch, limits))
+            .await
+            .map_err(internal)?
+            .map_err(bad)?;
+    }
+    let copies = fields
+        .remove("copies")
+        .map(|s| {
+            s.parse::<u32>()
+                .map_err(|_| bad("Use a positive integer copy count."))
+        })
+        .transpose()?;
     let options = Options {
         name: Some(name),
+        document_name: filename,
+        copies,
+        sides: fields.remove("sides"),
+        media: fields.remove("media"),
         printer_profile: fields.remove("printer_profile"),
         print_profile: fields.remove("print_profile"),
         filament_profile: fields.remove("filament_profile"),
     };
+    options.validate().map_err(bad)?;
     let _run = app.runs.acquire().await.map_err(internal)?;
     let estimate = app
         .backend

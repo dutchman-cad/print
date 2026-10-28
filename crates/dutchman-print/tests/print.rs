@@ -229,6 +229,51 @@ async fn simulator_printer_stop_ends_only_the_confirmed_live_job() {
 }
 
 #[tokio::test]
+async fn three_d_start_still_requires_bed_clearance() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let app = router(
+        simulation(clock.clone()),
+        settings(dir.path(), clock.clone()),
+    );
+    let job = accepted(
+        &app,
+        upload(
+            &[("bracket.3mf", &model())],
+            &[
+                ("printer", "demo"),
+                ("name", "Bracket"),
+                ("printer_profile", "Demo"),
+                ("print_profile", "Fine"),
+                ("filament_profile", "PLA"),
+            ],
+        ),
+        201,
+    )
+    .await;
+    let id = job["id"].as_str().unwrap();
+    // No bed acknowledgement: a 3D printer refuses the start challenge.
+    let (status, _, body) = send(
+        &app,
+        Request::post("/api/v1/confirmations")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"action":"start","printer":"demo","job":id}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let printers = accepted(&app, get("/api/v1/printers"), 200).await;
+    assert_eq!(printers[0]["needs_clearing"], true);
+}
+
+#[tokio::test]
 async fn simulator_lifecycle_uses_clock_without_sleeping() {
     let clock = Arc::new(TestClock::default());
     let backend = simulation(clock.clone());

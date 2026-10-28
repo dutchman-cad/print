@@ -14,6 +14,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 #[path = "printers_duet.rs"]
 mod duet;
+#[path = "printers_ipp.rs"]
+mod ipp;
 #[path = "printers_repetier.rs"]
 mod repetier;
 #[path = "printers_stop.rs"]
@@ -49,6 +51,7 @@ pub struct Printers {
     octoprint: BTreeMap<String, Arc<crate::octoprint::Client>>,
     moonraker: BTreeMap<String, Arc<crate::moonraker::Client>>,
     duet: BTreeMap<String, Arc<crate::duet::Client>>,
+    ipp: BTreeMap<String, Arc<crate::ipp::Client>>,
     repetier: BTreeMap<String, Arc<crate::repetier::Client>>,
     sdcp: BTreeMap<String, Arc<crate::elegoo_sdcp::Client>>,
     snapmaker: BTreeMap<String, Arc<crate::snapmaker::Client>>,
@@ -61,12 +64,18 @@ pub struct Printers {
     transitions: BTreeMap<String, Mutex<()>>,
 }
 /// The same configuration support used by reports and action guards.
+/// Printers without a bed: their jobs need no bed-clearance acknowledgement. This is the
+/// only exemption from the bed check, so it names the kinds rather than inferring them.
+pub(crate) fn document_kind(kind: Option<&str>) -> bool {
+    matches!(kind, Some("ipp"))
+}
 pub(crate) fn configured_controls(printer: &crate::config::Printer) -> Vec<&'static str> {
     match printer.kind.as_deref() {
         Some("bambu") => crate::bambu::controls(printer),
         Some("elegoo-sdcp") => crate::elegoo_sdcp::controls(printer),
         Some("snapmaker-2" | "snapmaker-j1") => crate::snapmaker::controls(),
         Some("repetier") => crate::repetier::controls(),
+        Some("ipp") => vec!["start", "cancel"],
         Some("moonraker" | "snapmaker-u1") => crate::moonraker::controls(printer),
         _ => crate::backend::ALL_CONTROLS.to_vec(),
     }
@@ -103,7 +112,8 @@ impl Printers {
                 if matches!(
                     p.kind.as_deref(),
                     Some(
-                        "bambu"
+                        "ipp"
+                            | "bambu"
                             | "octoprint"
                             | "moonraker"
                             | "snapmaker-u1"
@@ -159,6 +169,12 @@ impl Printers {
             .filter(|p| p.kind.as_deref() == Some("repetier"))
             .map(|p| crate::repetier::Client::new(p.clone()).map(|c| (p.id.clone(), Arc::new(c))))
             .collect::<Result<_, _>>()?;
+        let ipp = config
+            .printers
+            .iter()
+            .filter(|p| p.kind.as_deref() == Some("ipp"))
+            .map(|p| crate::ipp::Client::new(p.clone()).map(|c| (p.id.clone(), Arc::new(c))))
+            .collect::<Result<_, _>>()?;
         let sdcp = config
             .printers
             .iter()
@@ -193,6 +209,7 @@ impl Printers {
             moonraker,
             duet,
             repetier,
+            ipp,
             sdcp,
             snapmaker,
             slicers,
@@ -354,6 +371,8 @@ impl Printers {
             self.reconcile_moonraker(target).await?;
         } else if self.duet.contains_key(&target.job.printer) {
             self.reconcile_duet(target).await?;
+        } else if self.ipp.contains_key(&target.job.printer) {
+            self.reconcile_ipp(target).await?;
         } else if self.repetier.contains_key(&target.job.printer) {
             self.reconcile_repetier(target).await?;
         } else {
@@ -647,6 +666,8 @@ impl Printers {
             self.moonraker_control(target, action, guard).await
         } else if self.duet.contains_key(&target.job.printer) {
             self.duet_control(target, action, guard).await
+        } else if self.ipp.contains_key(&target.job.printer) {
+            self.cancel_ipp(target, guard).await
         } else if self.repetier.contains_key(&target.job.printer) {
             self.repetier_control(target, action).await
         } else if self.octoprint.contains_key(&target.job.printer) {
@@ -1362,6 +1383,9 @@ impl Printers {
         guard: &mut MachineGuard,
     ) -> Result<Job, Error> {
         self.check_action(&target.job.printer, "start")?;
+        if self.ipp.contains_key(&target.job.printer) {
+            return self.start_ipp(target, guard).await;
+        }
         if self.moonraker.contains_key(&target.job.printer) {
             return self.start_moonraker(target, guard).await;
         }
@@ -1509,6 +1533,33 @@ impl Printers {
 }
 
 impl Backend for Printers {
+    fn document_printer(&self, printer: &str) -> bool {
+        self.configs
+            .iter()
+            .find(|p| p.id == printer)
+            .is_some_and(|p| document_kind(p.kind.as_deref()))
+    }
+    fn document_summary<'a>(&'a self, id: &'a str) -> Reply<'a, Option<String>> {
+        Box::pin(async move {
+            let target = self.tracked(id).await?;
+            if !self.document_printer(&target.job.printer) {
+                return Ok(None);
+            }
+            Ok(Some(format!(
+                "'{}' ({} copies)",
+                target
+                    .info
+                    .get("document_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&target.job.name),
+                target
+                    .info
+                    .get("copies")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1)
+            )))
+        })
+    }
     fn controls(&self, printer: &str) -> Vec<&'static str> {
         self.configs
             .iter()
@@ -1604,6 +1655,9 @@ impl Backend for Printers {
     ) -> Reply<'a, ()> {
         Box::pin(async move {
             self.check_action(printer, action)?;
+            if self.ipp.contains_key(printer) {
+                return self.review_ipp(action, printer, job).await;
+            }
             if matches!(action, "clear" | "stop") {
                 return Ok(());
             }
@@ -1850,6 +1904,12 @@ impl Backend for Printers {
     }
     fn printer<'a>(&'a self, id: &'a str) -> Reply<'a, Printer> {
         Box::pin(async move {
+            if let Some(client) = self.ipp.get(id) {
+                return Ok(match client.snapshot().await {
+                    Ok(s) => s.printer,
+                    Err(e) => client.offline(&e),
+                });
+            }
             if let Some(bambu) = self.bambu.get(id) {
                 return Ok(bambu.snapshot().await);
             }
@@ -1970,7 +2030,17 @@ impl Backend for Printers {
             let targets: Vec<_> = self.jobs.lock().await.values().cloned().collect();
             let mut tasks = tokio::task::JoinSet::new();
             for (index, config) in self.configs.iter().enumerate() {
-                if let Some(client) = self.moonraker.get(&config.id).cloned() {
+                if let Some(client) = self.ipp.get(&config.id).cloned() {
+                    tasks.spawn(async move {
+                        (
+                            index,
+                            match client.snapshot().await {
+                                Ok(s) => s.printer,
+                                Err(e) => client.offline(&e),
+                            },
+                        )
+                    });
+                } else if let Some(client) = self.moonraker.get(&config.id).cloned() {
                     tasks.spawn(async move {
                         (
                             index,
@@ -2060,6 +2130,20 @@ impl Backend for Printers {
         options: Options,
     ) -> Reply<'a, Estimate> {
         Box::pin(async move {
+            options.validate().map_err(Error::Refused)?;
+            if self.ipp.contains_key(printer) {
+                return self.prepare_ipp(id, path, printer, options).await;
+            }
+            if options.copies.is_some() || options.sides.is_some() || options.media.is_some() {
+                return Err(refuse(
+                    "Copies, sides, and media apply only to IPP document printers.",
+                ));
+            }
+            if file_bytes(path).await?.starts_with(b"%PDF-") {
+                return Err(refuse(
+                    "PDF documents require an IPP printer. Choose a 3MF model for this 3D printer.",
+                ));
+            }
             let profile = self
                 .configs
                 .iter()
@@ -2472,5 +2556,49 @@ mod locking_tests {
             backend.tracked("one").await.unwrap().job.state,
             JobState::Ready
         );
+    }
+}
+
+#[cfg(test)]
+mod bed_rule_tests {
+    use super::{configured_controls, document_kind};
+    use crate::config::{Printer, PRINTER_KINDS};
+
+    /// Every configuration of every kind: a printer that can start a job either has a bed
+    /// check (`clear`) or is a document printer. A new kind that breaks this fails here.
+    #[test]
+    fn every_kind_that_starts_has_a_bed_check_unless_it_has_no_bed() {
+        for kind in PRINTER_KINDS {
+            for (lan_control, resume_commissioned, profile) in [
+                (false, false, None),
+                (true, true, None),
+                (false, false, Some("resin")),
+                (false, false, Some("centauri")),
+            ] {
+                let printer = Printer {
+                    kind: Some((*kind).into()),
+                    lan_control,
+                    resume_commissioned,
+                    profile: profile.map(Into::into),
+                    ..Default::default()
+                };
+                let controls = configured_controls(&printer);
+                if controls.contains(&"start") && !document_kind(printer.kind.as_deref()) {
+                    assert!(
+                        controls.contains(&"clear"),
+                        "{kind} can start without a bed check: {controls:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn document_kinds_are_named_explicitly() {
+        assert!(document_kind(Some("ipp")));
+        for kind in PRINTER_KINDS.iter().filter(|k| **k != "ipp") {
+            assert!(!document_kind(Some(kind)), "{kind}");
+        }
+        assert!(!document_kind(None));
     }
 }

@@ -211,16 +211,28 @@ impl Confirmations {
             "resume" => "Resume printing",
             _ => "Acknowledge the checked, clear bed",
         };
-        let name = job
-            .as_ref()
-            .map(|j| format!(" '{}'", j.name))
-            .or_else(|| printer.job_name.as_ref().map(|n| format!(" '{n}'")))
+        let document = if intent.action == "start" {
+            if let Some(job) = &intent.job {
+                safety.document_summary(job).await?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let name = document
+            .map(|text| format!(" {text}"))
+            .or_else(|| {
+                job.as_ref()
+                    .map(|j| format!(" '{}'", j.name))
+                    .or_else(|| printer.job_name.as_ref().map(|n| format!(" '{n}'")))
+            })
             .unwrap_or_default();
         let detail = printer
             .detail
             .clone()
             .unwrap_or_else(|| printer.state.to_string());
-        let bed = if intent.action == "stop" {
+        let bed = if intent.action == "stop" || safety.document_printer(&intent.printer) {
             ""
         } else if printer.needs_clearing == Some(false) {
             ", bed clear"

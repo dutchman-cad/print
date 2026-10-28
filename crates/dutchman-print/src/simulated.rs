@@ -228,6 +228,20 @@ impl Backend for Simulated {
     ) -> Reply<'a, Estimate> {
         Box::pin(async move {
             options.validate().map_err(Error::Refused)?;
+            if input
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+            {
+                return Err(Error::Refused(
+                    "PDF documents require an IPP printer. Choose a 3MF model for this 3D printer."
+                        .into(),
+                ));
+            }
+            if options.copies.is_some() || options.sides.is_some() || options.media.is_some() {
+                return Err(Error::Refused(
+                    "Copies, sides, and media apply only to IPP document printers.".into(),
+                ));
+            }
             let profile = self
                 .printers
                 .iter()

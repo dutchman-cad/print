@@ -1,6 +1,6 @@
 # Print job API version 1
 
-This is an open HTTP protocol for preparing 3MF print jobs and controlling their execution.
+This is an open HTTP protocol for preparing 3MF model jobs and PDF document jobs and controlling their execution.
 Any server can implement it; it does not require Dutchman or a particular printer backend.
 SolidCraft's host and standalone clients can use the same protocol. All paths below are
 relative to the server's base URL. JSON uses UTF-8 and `Content-Type: application/json`.
@@ -16,7 +16,7 @@ response fields. Breaking changes require a new path version such as `/api/v2`.
 |---|---|---|
 | `GET /healthz` | No body | 200, `{"service":"dutchman-print","api":1}` for Dutchman Print |
 | `GET /api/v1/printers` | No body | 200, array of printer objects |
-| `POST /api/v1/jobs` | Raw 3MF or multipart, described below | 201, prepared job object |
+| `POST /api/v1/jobs` | Raw 3MF, PDF, or multipart, described below | 201, prepared job object |
 | `GET /api/v1/jobs/{id}` | No body | 200, current job object |
 | `GET /api/v1/jobs/{id}/preview.png` | No body | 200, `image/png`, or 404 when unavailable |
 | `POST /api/v1/confirmations` | Action, printer, optional job JSON | 201, confirmation challenge |
@@ -52,7 +52,7 @@ Content-Type: model/3mf
 ```
 
 Scripts may instead send `multipart/form-data` with exactly one `file` part whose filename
-ends in `.3mf`, and the following text parts. Multipart fields come from the body, not the
+ends in `.3mf` or `.pdf`, and the following text parts. Multipart fields come from the body, not the
 query string.
 
 | Field | Type | Required | Meaning |
@@ -62,6 +62,9 @@ query string.
 | `printer_profile` | string | No | Backend printer profile name |
 | `print_profile` | string | No | Backend print profile name |
 | `filament_profile` | string | No | Backend filament profile name |
+| `copies` | positive integer text | No | IPP PDF copy count; defaults to one; must be listed in copies-supported |
+| `sides` | string | No | IPP keyword listed in sides-supported |
+| `media` | string | No | IPP keyword or name listed in media-supported |
 
 Each supplied field is nonempty plain UTF-8 text, at most 256 bytes, with no control
 characters. Duplicate and unknown fields are refused with 400. Preparing a job never starts
@@ -105,8 +108,8 @@ Unavailable optional fields are omitted. An empty fleet is `[]`.
 `controls` lists supported actions independently of the printer's current state: `start`,
 `pause`, `resume`, `cancel`, `stop`, and `clear`. `stop` means printer-level Stop of any live
 job, including external work; `cancel` acts on a tracked job. `clear` is listed wherever
-`start` is. Clients use this list to choose which controls to show, then use fresh state and
-confirmation challenges to determine what is possible now. Unsupported actions return 409
+`start` is for 3D printers; IPP has no `clear`. Clients use this list to choose controls,
+then use fresh state and confirmation challenges to determine what is possible now. Unsupported actions return 409
 from both confirmations and action routes, before reading printer status.
 
 Simulated, PrusaLink, OctoPrint, and Duet printers list all six. Moonraker and Snapmaker U1
@@ -512,3 +515,47 @@ If `nozzle_temper` is unavailable, the scalar nozzle temperature uses extruder 0
 back to extruder 1; `detail` lists the available per-extruder temperatures. Packed temperatures
 use the low sixteen bits for current temperature. Bed leveling defaults on and can be
 disabled explicitly with `start_profile.bed_leveling = false`.
+
+
+## IPP PDF documents
+
+For `kind = "ipp"`, send a raw `application/pdf` body with the same query fields, or one
+multipart `file` part named with a `.pdf` extension. Raw documents default to `input.pdf`.
+PDF sent to a 3D printer, or 3MF sent to IPP, returns 400 with a type-specific message.
+PDF signature validation requires `%PDF-` at the beginning. The same streaming upload and
+private storage limits apply, with an absolute 200 MiB maximum (413 on excess). Preparation
+reads live `document-format-supported` and refuses unsupported PDF with 409, naming the
+supported formats. No slicing or conversion occurs; unsupported slicer options are refused.
+The estimate may be empty; no page count is inferred from unreliable PDF text patterns.
+
+The optional fields `copies`, `sides`, and `media` are accepted through raw query parameters,
+multipart text fields, and corresponding CLI flags. Copies defaults explicitly to one and
+must be in `copies-supported`; sides must be a listed keyword, and media must be a listed
+keyword or name in its supported attribute. Invalid syntax returns 400; unsupported values return 409. These
+fields are refused on 3D printers. Validate-Job checks the identical document format and
+job template before Print-Job, with attribute fidelity required.
+
+IPP Printer JSON lists `["start", "cancel"]` and `needs_clearing: false`. Start uses the
+same single-use observation-bound challenge and confirmation header, without bed clearance.
+Its summary names the configured printer, document filename, and copies. Every existing
+3D printer that lists `clear` retains its bed-clear requirement.
+
+Get-Printer-Attributes provides `printer-state`, `printer-state-reasons`,
+`printer-is-accepting-jobs`, `document-format-supported`, and optional `media-ready`.
+States 3 (idle) and 4 (processing) map to `idle` and `printing`. State 5 (stopped) maps to
+`attention` for media, tray, open door/cover/interlock, toner, developer, and marker supply
+or waste conditions; any other stopped reason or unknown state maps to `error`. A false
+accepting-jobs value maps to `busy`; unavailable status maps to `offline`. Required missing
+or malformed telemetry cannot establish readiness. `detail` contains bounded sanitised
+reason keywords, document formats, and media-ready keywords when present; arbitrary vendor
+messages and addresses are not returned. IPP does not report temperatures or progress.
+
+Print-Job sends once after the durable start attempt. A lost reply returns 409 and
+Get-Jobs reconciles the unique submitted name across active and retained completed jobs.
+No match leaves the attempt unresolved; it never authorises a resend. Once a positive
+job-id is known, Get-Job-Attributes checks both that id and the submitted name. Cancel-Job
+addresses only that id, after fresh reconciliation, and never cancels external jobs.
+Pending, pending-held, processing, and processing-stopped map to tracked `printing`;
+completed maps to `done`, canceled to `cancelled`, and aborted to `failed`. Printer idle
+alone never establishes a job outcome. Start/cancel outcome waits are bounded to 25 seconds.
+IPP manages spool cleanup; no separate staged file is deleted.

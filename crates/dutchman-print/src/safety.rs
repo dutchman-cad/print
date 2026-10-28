@@ -202,6 +202,17 @@ impl Safety {
     fn observe(&self, state: &mut State, printers: &mut [Printer]) {
         let now = self.clock.now();
         for printer in printers {
+            if self.inner.document_printer(&printer.id) {
+                state.observed.insert(
+                    printer.id.clone(),
+                    (printer.job_id.clone(), printer.detail.clone()),
+                );
+                state
+                    .job_names
+                    .insert(printer.id.clone(), printer.job_name.clone());
+                printer.needs_clearing = Some(false);
+                continue;
+            }
             let observation = (printer.job_id.clone(), printer.detail.clone());
             let terminal_changed = printer.needs_clearing == Some(true)
                 && (state.observed.get(&printer.id) != Some(&observation)
@@ -264,6 +275,12 @@ impl Safety {
     }
 }
 impl Backend for Safety {
+    fn document_printer(&self, printer: &str) -> bool {
+        self.inner.document_printer(printer)
+    }
+    fn document_summary<'a>(&'a self, job: &'a str) -> Reply<'a, Option<String>> {
+        self.inner.document_summary(job)
+    }
     fn controls(&self, printer: &str) -> Vec<&'static str> {
         self.inner.controls(printer)
     }
@@ -390,7 +407,8 @@ impl Backend for Safety {
             if printer.state != PrinterState::Idle {
                 return Err(Error::Refused("Printer readiness is unknown or the printer is busy. Read fresh status before starting.".into()));
             }
-            if !state.cleared.get(&job.printer).copied().unwrap_or(false)
+            if !self.inner.document_printer(&job.printer)
+                && !state.cleared.get(&job.printer).copied().unwrap_or(false)
                 && !self
                     .inner
                     .bed_ready(&job.printer, printer.detail.as_deref())

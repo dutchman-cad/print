@@ -43,7 +43,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Prepare a 3MF and ask before starting it.
+    /// Prepare a 3MF model or PDF document and ask before starting it.
     Print {
         file: PathBuf,
         #[arg(long)]
@@ -54,6 +54,15 @@ enum Command {
         print_profile: Option<String>,
         #[arg(long)]
         filament_profile: Option<String>,
+        /// Copy count for an IPP PDF document.
+        #[arg(long)]
+        copies: Option<u32>,
+        /// Supported IPP sides keyword.
+        #[arg(long)]
+        sides: Option<String>,
+        /// Supported IPP media keyword.
+        #[arg(long)]
+        media: Option<String>,
         /// Acknowledge the checked, clear bed in this run.
         #[arg(long)]
         bed_clear: bool,
@@ -364,6 +373,9 @@ async fn command(
                 printer_profile,
                 print_profile,
                 filament_profile,
+                copies,
+                sides,
+                media,
                 bed_clear,
                 yes,
                 json,
@@ -381,6 +393,10 @@ async fn command(
                     &printer,
                     Options {
                         name: Some(name.clone()),
+                        document_name: Some(name.clone()),
+                        copies,
+                        sides,
+                        media,
                         printer_profile,
                         print_profile,
                         filament_profile,
@@ -392,7 +408,9 @@ async fn command(
                     let _ = tokio::fs::remove_dir_all(&dir).await;
                 }
                 let estimate = estimate?;
-                if !json {
+                if !json && backend.document_printer(&printer) {
+                    eprintln!("Estimate: page count unavailable.");
+                } else if !json {
                     eprintln!(
                         "Estimate: {} seconds, {} mm filament, {} g, {} layers.",
                         estimate
@@ -414,11 +432,13 @@ async fn command(
                     );
                 }
                 let start = if json && !yes { false } else {
+                    if !backend.document_printer(&printer) {
                     if yes && !bed_clear {
                         return Err(dutchman_print::backend::Error::Refused("Use --bed-clear --yes after checking the bed, or confirm interactively.".into()));
                     }
                     if !confirm_action(backend, &confirmations, "clear", &printer, None, yes && bed_clear).await? { return Ok(()) }
                     backend.clear(&printer).await?;
+                    }
                     confirm_action(backend, &confirmations, "start", &printer, Some(&id), yes).await?
                 };
                 let job = if start {
@@ -497,17 +517,33 @@ async fn prepare_cli(
     use dutchman_print::backend::Error;
     options.validate().map_err(Error::Refused)?;
     let settings = dutchman_print::StorageConfig::default();
-    if !file
+    let pdf = file
         .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("3mf"))
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"));
+    if !pdf
+        && !file
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("3mf"))
     {
-        return Err(Error::Refused("Choose a .3mf file.".into()));
+        return Err(Error::Refused(
+            "Choose a .3mf model or .pdf document.".into(),
+        ));
+    }
+    if backend.document_printer(printer) != pdf {
+        return Err(Error::Refused(
+            if pdf {
+                "PDF documents require an IPP printer. Choose a 3MF model for this 3D printer."
+            } else {
+                "IPP document printers require PDF. Choose a PDF document instead of a 3MF model."
+            }
+            .into(),
+        ));
     }
     let metadata = tokio::fs::metadata(file)
         .await
-        .map_err(|_| Error::Failed("Cannot read the 3MF file.".into()))?;
+        .map_err(|_| Error::Failed("Cannot read the print file.".into()))?;
     if metadata.len() > settings.max_upload {
-        return Err(Error::Refused("The 3MF file is too big.".into()));
+        return Err(Error::Refused("The print file is too big.".into()));
     }
     hardening_storage(
         dir.parent().unwrap_or(dir),
@@ -517,36 +553,40 @@ async fn prepare_cli(
     tokio::fs::create_dir(dir)
         .await
         .map_err(|_| Error::Failed("Cannot create a job folder.".into()))?;
-    let input = dir.join("input.3mf");
+    let input = dir.join(if pdf { "input.pdf" } else { "input.3mf" });
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let source = tokio::fs::File::open(file)
         .await
-        .map_err(|_| Error::Failed("Cannot read the 3MF file.".into()))?;
+        .map_err(|_| Error::Failed("Cannot read the print file.".into()))?;
     let mut target = tokio::fs::File::create(&input)
         .await
-        .map_err(|_| Error::Failed("Cannot keep the 3MF file.".into()))?;
+        .map_err(|_| Error::Failed("Cannot keep the print file.".into()))?;
     let copied = tokio::io::copy(
         &mut source.take(settings.max_upload.saturating_add(1)),
         &mut target,
     )
     .await
-    .map_err(|_| Error::Failed("Cannot keep the 3MF file.".into()))?;
+    .map_err(|_| Error::Failed("Cannot keep the print file.".into()))?;
     if copied > settings.max_upload {
-        return Err(Error::Refused("The 3MF file is too big.".into()));
+        return Err(Error::Refused("The print file is too big.".into()));
     }
     target
         .flush()
         .await
-        .map_err(|_| Error::Failed("Cannot keep the 3MF file.".into()))?;
+        .map_err(|_| Error::Failed("Cannot keep the print file.".into()))?;
     drop(target);
-    let checked = input.clone();
-    let scratch = dir.join("check");
-    tokio::task::spawn_blocking(move || {
-        dutchman_print::upload::check_3mf(&checked, &scratch, settings.zip)
-    })
-    .await
-    .map_err(|_| Error::Failed("Cannot check the 3MF file.".into()))?
-    .map_err(Error::Refused)?;
+    if !pdf {
+        let checked = input.clone();
+        let scratch = dir.join("check");
+        tokio::task::spawn_blocking(move || {
+            dutchman_print::upload::check_3mf(&checked, &scratch, settings.zip)
+        })
+        .await
+        .map_err(|_| Error::Failed("Cannot check the 3MF file.".into()))?
+        .map_err(Error::Refused)?;
+    } else {
+        dutchman_print::ipp::check_pdf(&dutchman_print::safety::file_bytes(&input).await?)?;
+    }
     backend.prepare(id, &input, printer, options).await
 }
 fn hardening_storage(

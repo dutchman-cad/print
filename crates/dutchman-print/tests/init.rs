@@ -516,3 +516,38 @@ fn pi_init_writes_storage_and_nozzle_and_refuses_bad_values() {
         }
     }
 }
+
+#[test]
+fn ipp_writes_url_and_optional_credentials_without_slicer_or_connections() {
+    let (listener, port) = listener();
+    for authenticated in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.toml");
+        let url = format!(
+            "{}://127.0.0.1:{port}/ipp/print",
+            if authenticated { "ipps" } else { "ipp" }
+        );
+        let mut args = vec![
+            "--kind",
+            "ipp",
+            "--url",
+            &url,
+            "--output",
+            path.to_str().unwrap(),
+        ];
+        if authenticated {
+            args.extend(["--username", "workshop", "--password", SECRET]);
+        }
+        let result = init(dir.path(), &args);
+        assert!(result.status.success(), "{}", text(&result.stderr));
+        assert!(!text(&result.stdout).contains(SECRET));
+        assert!(!text(&result.stderr).contains(SECRET));
+        let config = Config::load(&path).unwrap();
+        assert!(config.slicer.is_none());
+        assert!(config.slicers.is_empty());
+        assert_eq!(config.printers[0].url.as_deref(), Some(url.as_str()));
+        assert_eq!(config.printers[0].password.is_some(), authenticated);
+        assert_private(&path);
+    }
+    assert_untouched(&listener);
+}

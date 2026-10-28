@@ -34,6 +34,7 @@ Choose `simulated` in step 2 to try Print without a printer.
 
 | Printer or software | `kind` | Status | Control |
 | --- | --- | --- | --- |
+| Document printers (IPP Everywhere, IPP) | `ipp` | Simulated only | Start and cancel of PDF documents |
 | Simulated printers | `simulated` | Built in, for trying the API | Start, pause, resume, cancel, Stop |
 | Prusa printers with PrusaLink | `prusalink` | Simulated only | Start, pause, resume, cancel, Stop |
 | OctoPrint | `octoprint` | Simulated only | Start, pause, resume, cancel, Stop |
@@ -49,11 +50,13 @@ Choose `simulated` in step 2 to try Print without a printer.
 | Bambu Lab in LAN mode | `bambu` | Simulated only | Monitoring; control is experimental and off unless `lan_control = true` |
 
 The API reports each printer's supported actions in `controls`; bed clear is available
-wherever Start is. Moonraker and U1 include resume only after `resume_commissioned = true`.
+for 3D printers that list `clear`. Moonraker and U1 include resume only after
+`resume_commissioned = true`.
 
-Every machine action needs a confirmation the server issues for that printer and job, and
-a person who has checked the bed. [docs/print.md](docs/print.md) describes each kind's
-setup and what still needs checking on real hardware.
+Every machine action needs a confirmation the server issues for that printer and job.
+For 3D printers, a person must also check the bed. IPP document printers print PDF files
+without a slicer. [docs/print.md](docs/print.md) describes each kind's setup and what still
+needs checking on real hardware.
 
 ## Build from source
 

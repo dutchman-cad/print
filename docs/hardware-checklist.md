@@ -16,6 +16,7 @@ Sections:
 8. [Elegoo SDCP: resin and Centauri Carbon](#elegoo-sdcp-resin-and-centauri-carbon)
 9. [Snapmaker 2.0 and J1/Artisan](#snapmaker-20-and-j1artisan)
 10. [Repetier-Server](#repetier-server)
+11. [IPP document printers](#ipp-document-printers)
 
 Sections 8 to 10 are only for you if you have that hardware.
 
@@ -25,7 +26,7 @@ Sections 8 to 10 are only for you if you have that hardware.
 
 - [ ] Run the read-only checks for a printer first. Do not start, pause, resume, cancel or
   stop anything on that printer until every read-only check in its section passes.
-- [ ] Check the bed yourself before every start: empty, clean, the right plate fitted. Answer
+- [ ] For 3D printers, check the bed yourself before every start: empty, clean, the right plate fitted. Answer
   the bed question only after looking at it.
 - [ ] Stay at the printer for every machine action and for the whole of each test print.
 - [ ] Before the first action, find how to stop a print from the printer's own screen, and keep
@@ -606,3 +607,19 @@ server starts by itself at that moment would be stopped.
 ### Recording
 
 - [ ] Save every read and record the server version beside each result.
+
+
+## IPP document printers
+
+- [ ] Configure the exact IPP resource URL from printer settings; check read-only status
+  first. Confirm idle/processing/stopped, accepting-jobs, paper/supply reasons, PDF support,
+  and loaded media against the printer screen.
+- [ ] For ipps/https, check the certificate is normally trusted and the hostname matches.
+  Optional HTTP Basic credentials require TLS. Check output contains no credentials.
+- [ ] Prepare a small synthetic PDF. Check unsupported formats, copies, sides, and media
+  are refused. Confirm the challenge names the printer, filename, and copy count without a
+  bed question, then confirm one submission and check its paper output.
+- [ ] Check completed/canceled/aborted outcomes, then Cancel a tracked job while another job
+  is queued and verify only the tracked job is canceled. Locate the printer's own cancel UI.
+- [ ] Interrupt the submission reply and read status: the same job must reconcile by name
+  without another Print-Job. Check restart reconciliation and the printer's history retention.

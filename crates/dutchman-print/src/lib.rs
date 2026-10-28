@@ -7,6 +7,8 @@ pub mod confirmation;
 pub mod duet;
 pub mod elegoo_sdcp;
 pub mod init;
+pub mod ipp;
+mod ipp_codec;
 pub mod moonraker;
 pub mod octoprint;
 pub mod printers;

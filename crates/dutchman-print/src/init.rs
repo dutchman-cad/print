@@ -106,7 +106,7 @@ struct Kind {
     model: &'static str,
 }
 
-const KINDS: [Kind; 12] = [
+const KINDS: [Kind; 13] = [
     Kind {
         name: "simulated",
         about: "A built-in demo printer for trying Print. Contacts nothing.",
@@ -190,6 +190,13 @@ const KINDS: [Kind; 12] = [
         address: Address::Host,
         slicing: Slicing::None,
         model: "Snapmaker J1",
+    },
+    Kind {
+        name: "ipp",
+        about: "Document printers using IPP Everywhere or IPP. Prints PDF documents.",
+        address: Address::Url,
+        slicing: Slicing::None,
+        model: "IPP document printer",
     },
 ];
 
@@ -561,10 +568,13 @@ fn check_flags(flags: &Flags, kind: &Kind) -> Result<(), String> {
                 ),
         ),
         ("storage", flags.storage.is_some() && name != "prusalink"),
-        ("username", flags.username.is_some() && name != "prusalink"),
+        (
+            "username",
+            flags.username.is_some() && !matches!(name, "prusalink" | "ipp"),
+        ),
         (
             "password",
-            flags.password.is_some() && !matches!(name, "prusalink" | "duet" | "duet-sbc"),
+            flags.password.is_some() && !matches!(name, "prusalink" | "duet" | "duet-sbc" | "ipp"),
         ),
         ("serial", flags.serial.is_some() && name != "bambu"),
         (
@@ -749,6 +759,23 @@ fn secrets(
     answers: &mut Answers,
 ) -> Result<(), String> {
     match kind.name {
+        "ipp" => {
+            answers.username = session.optional(
+                flags.username.as_ref(),
+                "IPP username (leave empty for no authentication)",
+            )?;
+            if answers.username.is_some() {
+                answers.password = session.secret(
+                    flags.password.as_ref(),
+                    "password",
+                    "IPP password (HTTP Basic over TLS)",
+                    true,
+                )?;
+            } else if flags.password.is_some() {
+                return Err("Set --username with --password for IPP.".into());
+            }
+        }
+
         "prusalink" => {
             if flags.username.is_some() || flags.password.is_some() {
                 answers.username = Some(session.required(
@@ -1114,6 +1141,19 @@ fn printer_fields(t: &mut Text, kind: &Kind, a: &Answers) {
     let url = a.url.as_deref().unwrap_or_default();
     let host = a.host.as_deref().unwrap_or_default();
     match kind.name {
+        "ipp" => {
+            t.comment(
+                "Configured IPP resource URL, such as ipps://printer.local:631/ipp/print.
+No discovery or scanning. TLS verifies the normal system certificate trust.",
+            );
+            t.string("url", url);
+            t.comment(
+                "Optional HTTP Basic credentials require ipps or https. No slicer is needed.",
+            );
+            t.maybe("username", a.username.as_ref(), "");
+            t.maybe("password", a.password.as_ref(), "");
+        }
+
         "prusalink" => {
             t.comment(
                 "The printer's local address as http://host or http://host:port, without a path.\n\
@@ -1393,7 +1433,7 @@ mod tests {
         assert_eq!(setup.kind, "prusalink");
         assert_eq!(setup.id, "workbench-mini");
         assert!(!setup.needs_trust);
-        assert!(script.shown.contains("Choose a number from 1 to 12"));
+        assert!(script.shown.contains("Choose a number from 1 to 13"));
         assert!(script.shown.contains("  8. repetier"));
         assert!(script.shown.contains("  9. bambu"));
         assert_eq!(script.secrets.len(), 1);
