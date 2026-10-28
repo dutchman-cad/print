@@ -28,6 +28,22 @@ pub struct Backend {
     pub slice: bool,
 }
 
+/// Every printer kind the printers backend accepts. A kind missing here is refused, so
+/// every backend is listed and covered by the bed-check test in printers.rs.
+pub(crate) const PRINTER_KINDS: &[&str] = &[
+    "prusalink",
+    "octoprint",
+    "moonraker",
+    "snapmaker-u1",
+    "snapmaker-2",
+    "snapmaker-j1",
+    "duet",
+    "duet-sbc",
+    "repetier",
+    "bambu",
+    "elegoo-sdcp",
+];
+
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Printer {
@@ -155,6 +171,13 @@ impl Config {
         let mut ids = HashSet::new();
         for printer in &self.printers {
             if self.backend.kind == "printers" {
+                if !printer
+                    .kind
+                    .as_deref()
+                    .is_some_and(|kind| PRINTER_KINDS.contains(&kind))
+                {
+                    return Err(unknown_kind());
+                }
                 match printer.kind.as_deref() {
                     Some("prusalink") => {
                         crate::prusalink::validate(printer)?;
@@ -171,10 +194,7 @@ impl Config {
                             enrollment == Some(printer.id.as_str()),
                         )?;
                     }
-                    _ => return Err(
-                        "Set each printer kind to prusalink, octoprint, moonraker, snapmaker-u1, snapmaker-2, snapmaker-j1, duet, duet-sbc, repetier, bambu, or elegoo-sdcp."
-                            .into(),
-                    ),
+                    _ => return Err(unknown_kind()),
                 }
                 if printer.storage.is_some() && printer.kind.as_deref() != Some("prusalink") {
                     return Err("Set storage only for PrusaLink printers.".into());
@@ -310,4 +330,11 @@ pub fn default_path() -> Result<PathBuf, String> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
     base.map(|base| base.join("dutchman-print/config.toml"))
         .ok_or_else(|| "Cannot find your config folder. Set --config FILE.".into())
+}
+
+fn unknown_kind() -> String {
+    format!(
+        "Set each printer kind to one of: {}.",
+        PRINTER_KINDS.join(", ")
+    )
 }

@@ -2474,3 +2474,48 @@ mod locking_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod bed_rule_tests {
+    use super::configured_controls;
+    use crate::config::{Printer, PRINTER_KINDS};
+
+    /// Every printer is a 3D printer with a bed, so any configuration that can start a job
+    /// must also offer the bed-clear acknowledgement. A new kind that breaks this fails here.
+    #[test]
+    fn every_kind_that_starts_has_a_bed_check() {
+        for kind in PRINTER_KINDS {
+            for (lan_control, resume_commissioned, profile) in [
+                (false, false, None),
+                (true, true, None),
+                (false, false, Some("resin")),
+                (false, false, Some("centauri")),
+            ] {
+                let printer = Printer {
+                    kind: Some((*kind).into()),
+                    lan_control,
+                    resume_commissioned,
+                    profile: profile.map(Into::into),
+                    ..Default::default()
+                };
+                let controls = configured_controls(&printer);
+                if controls.contains(&"start") {
+                    assert!(
+                        controls.contains(&"clear"),
+                        "{kind} can start without a bed check: {controls:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_unlisted_kind_is_refused_naming_the_listed_ones() {
+        let text = "[backend]\nkind = \"printers\"\n\n[[printers]]\nkind = \"plotter\"\nid = \"p\"\nname = \"P\"\nmodel = \"P\"\n";
+        let error = crate::config::Config::from_text(text, None).err().unwrap();
+        assert!(error.contains("one of: prusalink"), "{error}");
+        for kind in PRINTER_KINDS {
+            assert!(error.contains(kind), "{error}");
+        }
+    }
+}
