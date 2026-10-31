@@ -2001,3 +2001,168 @@ async fn farm_queue_in_flight_dispatch_reserves_sensor_ready_printer() {
     accepted(&app, queue_dispatch(second_id, &challenge), 200).await;
     assert_eq!(backend.starts.load(Ordering::SeqCst), 2);
 }
+
+#[test]
+fn persistent_history_cli_filters_and_preserves_input_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = private_config(dir.path(), CONFIG);
+    let input = dir.path().join("original-part.3mf");
+    std::fs::write(&input, model()).unwrap();
+    let prepared = cli(
+        &path,
+        &[
+            "print",
+            input.to_str().unwrap(),
+            "--printer",
+            "demo",
+            "--json",
+        ],
+    );
+    assert!(
+        prepared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    let job: Value = serde_json::from_slice(&prepared.stdout).unwrap();
+    let cancelled = cli(&path, &["cancel", job["id"].as_str().unwrap(), "--yes"]);
+    assert!(
+        cancelled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cancelled.stderr)
+    );
+    for _ in 0..2 {
+        let result = cli(
+            &path,
+            &[
+                "history",
+                "--printer",
+                "demo",
+                "--outcome",
+                "cancelled",
+                "--since",
+                "2020-01-01T00:00:00Z",
+                "--limit",
+                "1",
+                "--json",
+            ],
+        );
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let rows: Vec<Value> = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["file_name"], "original-part.3mf");
+        assert_eq!(rows[0]["source"], "original-part.3mf");
+        assert_eq!(rows[0]["file_size"], model().len());
+        assert_eq!(rows[0]["started_at"], Value::Null);
+        assert_eq!(rows[0]["duration_seconds"], Value::Null);
+    }
+    let text = cli(&path, &["history"]);
+    assert!(text.status.success());
+    assert!(String::from_utf8_lossy(&text.stdout).contains("demo cancelled original-part.3mf"));
+    assert!(!cli(&path, &["history", "--since", "yesterday"])
+        .status
+        .success());
+    assert!(!cli(&path, &["history", "--limit", "10001"])
+        .status
+        .success());
+    std::fs::write(
+        dir.path().join("data/history.jsonl"),
+        b"corrupt complete line\n",
+    )
+    .unwrap();
+    let prepared = cli(
+        &path,
+        &[
+            "print",
+            input.to_str().unwrap(),
+            "--printer",
+            "demo",
+            "--json",
+        ],
+    );
+    assert!(
+        prepared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    let job: Value = serde_json::from_slice(&prepared.stdout).unwrap();
+    let cancelled = cli(&path, &["cancel", job["id"].as_str().unwrap(), "--yes"]);
+    assert!(
+        cancelled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cancelled.stderr)
+    );
+    assert!(!cli(&path, &["history", "--json"]).status.success());
+}
+
+#[tokio::test]
+async fn persistent_history_api_archives_before_expiry_and_keeps_confirmation_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let app = router(
+        simulation(clock.clone()),
+        settings(dir.path(), clock.clone()),
+    );
+    let job = ready(&app).await;
+    let id = job["id"].as_str().unwrap();
+    let start = format!("/api/v1/jobs/{id}/start");
+    assert_eq!(
+        send(&app, action(&start, None)).await.0,
+        StatusCode::FORBIDDEN
+    );
+    let token = || dutchman_print::new_job_id().unwrap().repeat(2);
+    accepted(&app, confirmed(&app, &start, &token()).await, 200).await;
+    accepted(
+        &app,
+        confirmed(&app, "/api/v1/printers/demo/pause", &token()).await,
+        200,
+    )
+    .await;
+    clock.advance(3601);
+    // A paused job stays tracked after the ordinary one-hour expiry.
+    let paused = accepted(&app, get(&format!("/api/v1/jobs/{id}")), 200).await;
+    assert_eq!(paused["state"], "paused");
+    accepted(
+        &app,
+        confirmed(&app, "/api/v1/printers/demo/resume", &token()).await,
+        200,
+    )
+    .await;
+    clock.advance(120);
+    assert_eq!(
+        send(&app, get(&format!("/api/v1/jobs/{id}"))).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let rows = accepted(&app, get("/api/v1/history?outcome=done"), 200).await;
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["job_id"], id);
+    assert_eq!(rows[0]["file_name"], "bracket.3mf");
+    assert_eq!(rows[0]["source"], "bracket.3mf");
+    assert_eq!(rows[0]["job_name"], "Bracket");
+    assert_eq!(rows[0]["printer_kind"], "simulated");
+    drop(app);
+    let restarted = router(simulation(clock.clone()), settings(dir.path(), clock));
+    let again = accepted(&restarted, get("/api/v1/history?outcome=done"), 200).await;
+    assert_eq!(again, rows);
+    let clear = accepted(&restarted, get("/api/v1/history?outcome=bed_clear"), 200).await;
+    assert_eq!(clear.as_array().unwrap().len(), 1);
+    std::fs::write(dir.path().join("history.jsonl"), b"corrupt complete line\n").unwrap();
+    let job = ready(&restarted).await;
+    let id = job["id"].as_str().unwrap();
+    let cancelled = accepted(
+        &restarted,
+        confirmed(&restarted, &format!("/api/v1/jobs/{id}/cancel"), &token()).await,
+        200,
+    )
+    .await;
+    assert_eq!(cancelled["state"], "cancelled");
+    let status = accepted(&restarted, get(&format!("/api/v1/jobs/{id}")), 200).await;
+    assert_eq!(status["state"], "cancelled");
+    assert_eq!(
+        send(&restarted, get("/api/v1/history")).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+}

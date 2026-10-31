@@ -251,6 +251,68 @@ The service persists its separate job state in its private data folder. Only one
 use a data folder at once; after a killed process, remove `serve.lock` only once it has stopped. Tracked jobs are
 reloaded and reconciled from live status before control after a restart.
 
+## Print history
+
+Finished tracked jobs and bed-clear acknowledgements are saved in `history.jsonl` in
+`--data-dir` (or `DUTCHMAN_PRINT_DATA`). Use the same private data folder for history and
+`serve`. Choose a persistent folder: the default is in the operating system's temporary
+folder and can be removed by system cleanup.
+
+```sh
+dutchman-print --data-dir private-jobs history --printer workbench --outcome done --since 2026-10-01T00:00:00Z --limit 20 --json
+```
+
+`history` lists newest records first, with a default limit of 100 (1–10,000 allowed).
+Omit `--json` for one readable line per record. `--printer`, `--outcome`, and `--since`
+combine; since is an inclusive RFC 3339 timestamp, including an explicit UTC offset.
+Outcomes are `done`, `cancelled`, `failed`, `stopped` (a tracked job ended by printer Stop),
+`ended` (the printer could not establish how it ended), `unresolved_after_restart`, and
+`bed_clear`. External printer jobs are not tracked and do not get job-history records.
+A ready job cancelled before Start has no start time or duration.
+
+Each job record includes the printer id and kind, job id and name, prepared filename and
+size in bytes (the input file for simulation), source input label when known, estimates,
+and UTC RFC 3339 times. Start
+is the companion's Start-attempt time; end is when it observes the terminal result.
+Duration is elapsed wall-clock seconds, including pauses, and is absent without a start.
+History is polled while the server runs, also on requests and CLI commands. CLI simulation
+results are archived before expired snapshots are removed. A restart preserves history;
+if an attempted job cannot be reconciled during startup's bounded read, a single
+`unresolved_after_restart` record states that uncertainty. This does not change tracked
+machine state, authorize a control, or retry Start. Known active jobs stay tracked through
+normal service expiry until a terminal outcome is observed.
+
+Records contain metadata only: no file contents, credentials, confirmation values, backend
+addresses, or local directory paths. Input labels are basenames, limited to 256 bytes;
+URL-shaped labels are redacted. Bed-clear records contain printer identity, `bed_clear`,
+and the acknowledgement time; job fields are null. No operator identity is collected.
+History never restores bed clearance after a restart. History is best effort: a write
+problem is logged and never blocks, delays, or changes a print action or status read.
+Action-side writes run in a bounded background queue; an overloaded queue is logged
+without changing the machine result. The history command and API
+route still report storage errors, so repair storage if the journal cannot be read.
+
+Pending job metadata uses its own mutex and a separate `history-pending.json` file in the
+service's private data folder. CLI state uses a matching `*.history-pending.json` file,
+so CLI and service records do not overwrite each other's pending metadata. A background
+writer receives serialized snapshots and performs disk I/O after data locks are released;
+it never holds the machine safety mutex. Stop reaches the backend before any bookkeeping,
+even when a history write is stalled. A failed Stop still withdraws bed clearance.
+
+Startup reloads the pending file and migrates a legacy `history` map from older safety
+state. The legacy payload remains recoverable until the new file is synced, then the next
+safety checkpoint omits it. An existing pending file is authoritative, including an empty
+one, so old safety snapshots cannot resurrect finished jobs.
+
+The JSON Lines journal retains the newest **10,000 records**, including acknowledgements.
+Writes append a complete line and sync it to disk. A torn final line is ignored on read
+and removed before the next append. Rotation writes and syncs a replacement before an
+atomic rename, preserving earlier complete lines if interrupted. An operating-system lock
+on the private `history.lock` file serializes readers and writers across CLI and service
+processes and releases automatically if a process crashes. Leave the lock file in place.
+Other corrupt complete lines cause a storage error; they are never silently discarded.
+Back up the data folder if longer retention is needed.
+
 ## Plugin API
 
 ```sh
@@ -598,8 +660,8 @@ the server polls that printer every 5 seconds (`--clearance-interval-seconds`, 2
 It is withdrawn on any non-idle or unknown state, failed read, observation gap longer than
 twice that interval, reconnect following unavailable telemetry, job identity or finished-job
 signal change, or expiry after 15 minutes (`--clearance-expiry-minutes`, 1–120). A Start
-attempt consumes it even if the result is uncertain or fails. Polling stops when no remote
-acknowledgement is held. Activity entirely between polls with no identity or terminal signal
+attempt consumes it even if the result is uncertain or fails. Bed-clear polling stops when no remote
+acknowledgement is held; separate history polling continues for tracked jobs. Activity entirely between polls with no identity or terminal signal
 change cannot be detected; clearance is not proof that no physical activity occurred.
 PrusaLink `READY` is the operator's printer-side bed-clear signal and substitutes for the
 remote acknowledgement; `IDLE` still requires one. Restarting never restores remote clearance.

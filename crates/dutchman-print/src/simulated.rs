@@ -73,6 +73,10 @@ impl Simulated {
     pub fn restore(&self, path: &Path) -> Result<(), String> {
         self.restore_inner(path, false)
     }
+    /// Retain expired entries until the history layer has observed their outcome.
+    pub fn restore_for_history(&self, path: &Path) -> Result<(), String> {
+        self.restore_inner(path, true)
+    }
 
     fn restore_inner(&self, path: &Path, service: bool) -> Result<(), String> {
         use std::io::Read as _;
@@ -94,13 +98,11 @@ impl Simulated {
         if jobs.len() > 5000 {
             return Err("Too many simulated jobs.".into());
         }
-        let now = self.clock.now();
         jobs.retain(|id, r| {
-            let expired = !service && now.saturating_sub(r.created) > Duration::from_secs(3600);
-            if expired && id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
-                if let Some(root) = path.parent() {
-                    let _ = std::fs::remove_dir_all(root.join(id));
-                }
+            let expired =
+                !service && self.clock.now().saturating_sub(r.created) > Duration::from_secs(3600);
+            if expired {
+                remove_job_files(path, id);
             }
             !expired && self.printers.iter().any(|p| p.id == r.job.printer)
         });
@@ -109,7 +111,15 @@ impl Simulated {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let jobs = self.jobs().map_err(|error| error.to_string())?;
+        let mut jobs = self.jobs().map_err(|error| error.to_string())?;
+        jobs.retain(|id, r| {
+            let keep = matches!(r.job.state, JobState::Printing | JobState::Paused)
+                || self.clock.now().saturating_sub(r.created) <= Duration::from_secs(3600);
+            if !keep {
+                remove_job_files(path, id);
+            }
+            keep
+        });
         let bytes = serde_json::to_vec(&*jobs).map_err(|_| "Cannot save simulated jobs.")?;
         let temporary = path.with_extension("new");
         std::fs::write(&temporary, bytes).map_err(|_| "Cannot save simulated jobs.")?;
@@ -137,6 +147,16 @@ impl Simulated {
             }
         }
         Ok(jobs)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn history_finish(&self, id: &str, outcome: JobState) {
+        if let Ok(mut jobs) = self.jobs.lock() {
+            if let Some(running) = jobs.get_mut(id) {
+                running.job.state = outcome;
+                running.since = None;
+            }
+        }
     }
 
     fn change(&self, printer: &str, pause: bool) -> Result<Job, Error> {
@@ -404,5 +424,13 @@ impl Backend for Simulated {
             self.jobs()?.remove(job_id);
             Ok(())
         })
+    }
+}
+
+fn remove_job_files(path: &Path, id: &str) {
+    if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if let Some(root) = path.parent() {
+            let _ = std::fs::remove_dir_all(root.join(id));
+        }
     }
 }

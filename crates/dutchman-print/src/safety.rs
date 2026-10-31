@@ -32,11 +32,24 @@ struct Review {
     hash: String,
 }
 
+enum HistoryTask {
+    Job(Job, Option<&'static str>),
+    Clear(crate::history::Record),
+    Stop(Vec<String>),
+    Poll(bool, Vec<crate::history::Record>),
+    Started(String, String),
+}
+
+#[derive(Clone)]
 pub struct Safety {
     inner: Arc<dyn Backend>,
-    state: Mutex<State>,
-    stops: Mutex<HashMap<String, bool>>,
+    state: Arc<Mutex<State>>,
+    stops: Arc<Mutex<HashMap<String, bool>>>,
+    history_pending: Arc<crate::history_pending::Pending>,
+    history_poll: Arc<Mutex<()>>,
+    history_tasks: Arc<tokio::sync::Semaphore>,
     store: Option<std::path::PathBuf>,
+    history_root: Option<std::path::PathBuf>,
     clock: Arc<dyn crate::simulated::Clock>,
     interval: std::time::Duration,
     expiry: std::time::Duration,
@@ -100,13 +113,241 @@ impl Safety {
     pub fn new(inner: Arc<dyn Backend>) -> Self {
         Self {
             inner,
-            state: Mutex::new(State::default()),
-            stops: Mutex::new(HashMap::new()),
+            state: Arc::new(Mutex::new(State::default())),
+            stops: Arc::new(Mutex::new(HashMap::new())),
+            history_pending: Arc::new(crate::history_pending::Pending::default()),
+            history_poll: Arc::new(Mutex::new(())),
+            history_tasks: Arc::new(tokio::sync::Semaphore::new(64)),
             store: None,
+            history_root: None,
             clock: Arc::new(crate::simulated::SystemClock::default()),
             interval: std::time::Duration::from_secs(5),
             expiry: std::time::Duration::from_secs(900),
         }
+    }
+    pub fn with_history(mut self, root: std::path::PathBuf) -> Self {
+        self.history_root = Some(root);
+        self
+    }
+    fn queue_history(&self, task: HistoryTask) {
+        if self.history_root.is_none() {
+            return;
+        }
+        let Ok(permit) = self.history_tasks.clone().try_acquire_owned() else {
+            crate::history::log_error();
+            return;
+        };
+        let safety = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result: Result<(), Error> = async {
+                match task {
+                    HistoryTask::Job(job, outcome) => safety.record_job(&job, outcome).await,
+                    HistoryTask::Clear(record) => {
+                        if let Some(root) = &safety.history_root {
+                            crate::history::append(root, &record).await?;
+                        }
+                        Ok(())
+                    }
+                    HistoryTask::Stop(ids) => {
+                        for id in ids {
+                            let job = safety.inner.job(&id).await?;
+                            safety.record_job(&job, None).await?;
+                        }
+                        Ok(())
+                    }
+                    HistoryTask::Started(id, time) => {
+                        let mut records = safety.history_pending.records.lock().await;
+                        if let Some(record) = records.get_mut(&id) {
+                            record.started_at = Some(time);
+                            safety.checkpoint_history(&records);
+                        }
+                        Ok(())
+                    }
+                    HistoryTask::Poll(restarting, records) => {
+                        safety.poll_history_records(restarting, records).await
+                    }
+                }
+            }
+            .await;
+            if result.is_err() {
+                crate::history::log_error();
+            }
+        });
+    }
+    fn record_job_best_effort(&self, job: &Job) {
+        if matches!(
+            job.state,
+            JobState::Done | JobState::Cancelled | JobState::Failed | JobState::Ended
+        ) {
+            self.queue_history(HistoryTask::Job(job.clone(), None));
+        }
+    }
+    pub async fn poll_history_best_effort(&self, restarting: bool) {
+        let records = self.history_records(restarting).await;
+        self.queue_history(HistoryTask::Poll(restarting, records));
+    }
+    /// Waits for in-flight history writes. Only history reads and CLI shutdown
+    /// call this barrier; machine actions and status reads never call it.
+    pub async fn flush_history(&self) {
+        let permits = self.history_tasks.clone().acquire_many_owned(64).await;
+        drop(permits);
+        self.history_pending.flush().await;
+    }
+    fn history_pending_path(&self) -> Option<std::path::PathBuf> {
+        let root = self.history_root.as_ref()?;
+        match &self.store {
+            Some(store) if store.file_name().is_some_and(|name| name != "safety.json") => {
+                Some(store.with_extension("history-pending.json"))
+            }
+            _ => Some(root.join("history-pending.json")),
+        }
+    }
+    fn checkpoint_history(&self, records: &crate::history_pending::Records) {
+        if let Some(path) = self.history_pending_path() {
+            self.history_pending.changed(&path, records);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn history_write_hook(&self) -> Arc<crate::history_pending::WriteHook> {
+        self.history_pending.hook.clone()
+    }
+    async fn record_job(&self, job: &Job, outcome: Option<&str>) -> Result<(), Error> {
+        let Some(root) = &self.history_root else {
+            return Ok(());
+        };
+        let Some(mut record) = self
+            .history_pending
+            .records
+            .lock()
+            .await
+            .get(&job.id)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let terminal = match job.state {
+            JobState::Done => "done",
+            JobState::Cancelled => "cancelled",
+            JobState::Failed => "failed",
+            JobState::Ended => "ended",
+            _ => return Ok(()),
+        };
+        let stopped = terminal == "cancelled" && record.outcome == "stopped";
+        record.outcome = outcome
+            .unwrap_or(if stopped { "stopped" } else { terminal })
+            .into();
+        record.ended_at = crate::history::now();
+        record.duration_seconds = record.started_at.as_deref().and_then(|start| {
+            let start = crate::history::parse_time(start).ok()?;
+            let end = crate::history::parse_time(&record.ended_at).ok()?;
+            u64::try_from((end - start).whole_seconds()).ok()
+        });
+        crate::history::append(root, &record).await?;
+        let mut records = self.history_pending.records.lock().await;
+        // An older result must not remove a new execution of the same job id.
+        if records
+            .get(&job.id)
+            .is_some_and(|pending| pending.started_at == record.started_at)
+        {
+            records.remove(&job.id);
+            self.checkpoint_history(&records);
+        }
+        Ok(())
+    }
+    /// Polling only reads backend jobs; it never sends machine commands.
+    pub async fn poll_history(&self, restarting: bool) -> Result<(), Error> {
+        if self.history_root.is_none() {
+            return Ok(());
+        }
+        let records = self.history_records(restarting).await;
+        self.poll_history_records(restarting, records).await
+    }
+    async fn history_records(&self, restarting: bool) -> Vec<crate::history::Record> {
+        self.history_pending
+            .records
+            .lock()
+            .await
+            .values()
+            .filter(|r| restarting || r.started_at.is_some())
+            .cloned()
+            .collect()
+    }
+    async fn poll_history_records(
+        &self,
+        restarting: bool,
+        records: Vec<crate::history::Record>,
+    ) -> Result<(), Error> {
+        let _poll = if restarting {
+            self.history_poll.lock().await
+        } else {
+            match self.history_poll.try_lock() {
+                Ok(lock) => lock,
+                Err(_) => return Ok(()),
+            }
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        use futures_util::StreamExt as _;
+        let reads = futures_util::stream::iter(records)
+            .map(|record| async move {
+                let result = match record.job_id.as_deref() {
+                    Some(id) => tokio::time::timeout_at(deadline, self.inner.job(id)).await,
+                    None => Ok(Err(Error::NotFound)),
+                };
+                (record, result)
+            })
+            .buffer_unordered(64);
+        tokio::pin!(reads);
+        while let Some((record, result)) = reads.next().await {
+            let Some(id) = record.job_id.as_deref() else {
+                continue;
+            };
+            match result {
+                Ok(Ok(mut job)) => {
+                    if restarting && record.started_at.is_some() && job.state == JobState::Ready {
+                        job.state = JobState::Ended;
+                        self.record_job(&job, Some("unresolved_after_restart"))
+                            .await?;
+                    } else {
+                        self.record_job(&job, None).await?;
+                    }
+                }
+                Ok(Err(Error::NotFound)) if record.started_at.is_none() => {
+                    let mut records = self.history_pending.records.lock().await;
+                    if records.remove(id).is_some() {
+                        self.checkpoint_history(&records);
+                    }
+                }
+                _ if restarting && record.started_at.is_some() => {
+                    let job = Job {
+                        id: id.into(),
+                        printer: record.printer,
+                        name: String::new(),
+                        state: JobState::Ended,
+                        estimate: Estimate::default(),
+                        progress: None,
+                        seconds_left: None,
+                        detail: None,
+                    };
+                    self.record_job(&job, Some("unresolved_after_restart"))
+                        .await?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    pub async fn history_source(&self, id: &str, source: &str) -> Result<(), Error> {
+        let mut records = self.history_pending.records.lock().await;
+        if let Some(record) = records.get_mut(id) {
+            let label = crate::history::label(source);
+            if record.printer_kind == "simulated" {
+                record.file_name = Some(label.clone());
+            }
+            record.source = Some(label);
+            self.checkpoint_history(&records);
+        }
+        Ok(())
     }
     pub fn timing(
         mut self,
@@ -121,6 +362,7 @@ impl Safety {
     }
     /// The task owns only a weak reference; dropping the server stops polling.
     pub fn monitor(self: &Arc<Self>) {
+        self.monitor_history();
         let weak = Arc::downgrade(self);
         let interval = self.interval;
         tokio::spawn(async move {
@@ -138,6 +380,20 @@ impl Safety {
                     .collect();
                 for id in ids {
                     let _ = safety.fresh(&id).await;
+                }
+            }
+        });
+    }
+    // History reads must not delay the existing bed-clear polling cadence.
+    fn monitor_history(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let interval = self.interval;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(safety) = weak.upgrade() else { break };
+                if safety.poll_history(false).await.is_err() {
+                    crate::history::log_error();
                 }
             }
         });
@@ -163,7 +419,10 @@ impl Safety {
     }
     async fn checkpoint(&self, state: &State) -> Result<(), Error> {
         if let Some(path) = &self.store {
-            let bytes = serde_json::to_vec(state).map_err(|_| Error::Unavailable)?;
+            let bytes = self
+                .history_pending
+                .safety_bytes(state)
+                .map_err(|_| Error::Unavailable)?;
             write_state(path, &bytes)
                 .await
                 .map_err(|_| Error::Unavailable)?;
@@ -185,15 +444,26 @@ impl Safety {
                     );
                 }
                 *self.state.lock().await = state;
+                if let Some(pending) = self.history_pending_path() {
+                    self.history_pending.restore(&pending, Some(&bytes)).await;
+                }
                 Ok(())
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(pending) = self.history_pending_path() {
+                    self.history_pending.restore(&pending, None).await;
+                }
+                Ok(())
+            }
             _ => Err("Cannot read safety state. Check the private data folder.".into()),
         }
     }
     pub async fn save(&self, path: &Path) -> Result<(), String> {
         let state = self.state.lock().await;
-        let bytes = serde_json::to_vec(&*state).map_err(|_| "Cannot save safety state.")?;
+        let bytes = self
+            .history_pending
+            .safety_bytes(&*state)
+            .map_err(|_| "Cannot save safety state.")?;
         write_state(path, &bytes)
             .await
             .map_err(|_| "Cannot save safety state.".into())
@@ -333,7 +603,23 @@ impl Backend for Safety {
             state
                 .clearance
                 .insert(id.into(), (self.clock.now(), self.clock.now()));
-            self.checkpoint(&state).await
+            self.checkpoint(&state).await?;
+            drop(state);
+            self.queue_history(HistoryTask::Clear(crate::history::Record {
+                printer: id.into(),
+                printer_kind: self.inner.printer_kind(id).into(),
+                job_id: None,
+                job_name: None,
+                file_name: None,
+                file_size: None,
+                source: None,
+                outcome: "bed_clear".into(),
+                started_at: None,
+                ended_at: crate::history::now(),
+                duration_seconds: None,
+                estimate: None,
+            }));
+            Ok(())
         })
     }
     fn prepare<'a>(
@@ -346,7 +632,50 @@ impl Backend for Safety {
         Box::pin(async move {
             let digest = hash(&file_bytes(path).await?);
             let estimate = self.inner.prepare(id, path, printer, options).await?;
-            self.state.lock().await.reviews.insert(
+            let record = if self.history_root.is_some() {
+                let record = async {
+                    let name = crate::history::label(&self.inner.job(id).await?.name);
+                    let source = crate::history::label(
+                        &path.file_name().unwrap_or_default().to_string_lossy(),
+                    );
+                    let (file_name, file_size) = match self.inner.history_file(id).await? {
+                        Some(file) => file,
+                        None => (
+                            source.clone(),
+                            tokio::fs::metadata(path)
+                                .await
+                                .map_err(|_| Error::Unavailable)?
+                                .len(),
+                        ),
+                    };
+                    Ok::<_, Error>(crate::history::Record {
+                        printer: printer.into(),
+                        printer_kind: self.inner.printer_kind(printer).into(),
+                        job_id: Some(id.into()),
+                        job_name: Some(name),
+                        file_name: Some(crate::history::label(&file_name)),
+                        file_size: Some(file_size),
+                        source: Some(source),
+                        outcome: String::new(),
+                        started_at: None,
+                        ended_at: String::new(),
+                        duration_seconds: None,
+                        estimate: Some(estimate.clone()),
+                    })
+                }
+                .await;
+                match record {
+                    Ok(record) => Some(record),
+                    Err(_) => {
+                        crate::history::log_error();
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let mut state = self.state.lock().await;
+            state.reviews.insert(
                 id.into(),
                 Review {
                     printer: printer.into(),
@@ -354,6 +683,16 @@ impl Backend for Safety {
                     hash: digest,
                 },
             );
+            drop(state);
+            if let Some(record) = record {
+                let mut records = self.history_pending.records.lock().await;
+                if records.len() < 5000 {
+                    records.insert(id.into(), record);
+                    self.checkpoint_history(&records);
+                } else {
+                    crate::history::log_error();
+                }
+            }
             Ok(estimate)
         })
     }
@@ -422,15 +761,30 @@ impl Backend for Safety {
             state.cleared.insert(job.printer.clone(), false);
             self.checkpoint(&state).await?;
             drop(state);
+            let time = crate::history::now();
+            if let Ok(mut records) = self.history_pending.records.try_lock() {
+                if let Some(record) = records.get_mut(id) {
+                    record.started_at = Some(time);
+                    self.checkpoint_history(&records);
+                }
+            } else {
+                self.queue_history(HistoryTask::Started(id.into(), time));
+            }
             let result = self.inner.start(id).await;
             if self.stops.lock().await.get(id).copied().unwrap_or(false) {
                 // Backends reconcile uncertain starts and verify the live job before cancelling.
                 if let Ok(job) = self.inner.job(id).await {
                     if job.state == JobState::Cancelled {
+                        self.record_job_best_effort(&job);
                         return Ok(job);
                     }
                 }
-                return self.inner.cancel(id).await;
+                let job = self.inner.cancel(id).await?;
+                self.record_job_best_effort(&job);
+                return Ok(job);
+            }
+            if let Ok(job) = &result {
+                self.record_job_best_effort(job);
             }
             result
         })
@@ -448,6 +802,7 @@ impl Backend for Safety {
             }
             let before = self.inner.job(id).await?;
             if before.state == JobState::Cancelled {
+                self.record_job_best_effort(&before);
                 return Ok(before);
             }
             if before.state != JobState::Ready {
@@ -457,7 +812,9 @@ impl Backend for Safety {
                     .cleared
                     .insert(before.printer, false);
             }
-            self.inner.cancel(id).await
+            let job = self.inner.cancel(id).await?;
+            self.record_job_best_effort(&job);
+            Ok(job)
         })
     }
     fn stop<'a>(
@@ -469,13 +826,33 @@ impl Backend for Safety {
     ) -> Reply<'a, Printer> {
         Box::pin(async move {
             self.inner.check_action(printer, "stop")?;
+            let result = self.inner.stop(printer, identity, name, path).await;
             self.state
                 .lock()
                 .await
                 .cleared
                 .insert(printer.into(), false);
-            self.inner.stop(printer, identity, name, path).await?;
-            self.printer(printer).await
+            let ids = {
+                let mut records = self.history_pending.records.lock().await;
+                let mut ids = Vec::new();
+                let mut changed = false;
+                for record in records
+                    .values_mut()
+                    .filter(|record| record.printer == printer && record.started_at.is_some())
+                {
+                    record.outcome = "stopped".into();
+                    changed = true;
+                    if let Some(id) = &record.job_id {
+                        ids.push(id.clone());
+                    }
+                }
+                if changed {
+                    self.checkpoint_history(&records);
+                }
+                ids
+            };
+            self.queue_history(HistoryTask::Stop(ids));
+            result
         })
     }
     fn pause<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
@@ -516,14 +893,31 @@ impl Backend for Safety {
             if matches!(job.state, JobState::Printing | JobState::Paused)
                 && self.stops.lock().await.get(id).copied().unwrap_or(false)
             {
-                return self.inner.cancel(id).await;
+                let job = self.inner.cancel(id).await?;
+                self.record_job_best_effort(&job);
+                return Ok(job);
             }
+            self.record_job_best_effort(&job);
             Ok(job)
         })
     }
     fn forget<'a>(&'a self, id: &'a str) -> Reply<'a, ()> {
         Box::pin(async move {
+            let job = self.inner.job(id).await.ok();
             self.inner.forget(id).await?;
+            if let Some(job) = job.filter(|job| {
+                matches!(
+                    job.state,
+                    JobState::Done | JobState::Cancelled | JobState::Failed | JobState::Ended
+                )
+            }) {
+                self.record_job_best_effort(&job);
+            } else {
+                let mut records = self.history_pending.records.lock().await;
+                if records.remove(id).is_some() {
+                    self.checkpoint_history(&records);
+                }
+            }
             self.state.lock().await.reviews.remove(id);
             self.stops.lock().await.remove(id);
             Ok(())

@@ -84,6 +84,7 @@ struct App {
     raw: Arc<dyn Backend>,
     initialized: Mutex<bool>,
     actions: Mutex<()>,
+    expiring: Mutex<()>,
     config: ServerConfig,
     confirmations: Confirmations,
     saved: Mutex<HashMap<String, Saved>>,
@@ -118,15 +119,18 @@ pub fn router(backend: Arc<dyn Backend>, config: ServerConfig) -> Router {
         .unwrap_or(usize::MAX)
         .saturating_add(1 << 20);
     let safety = Arc::new(
-        crate::safety::Safety::new(backend.clone()).timing(
-            config.clock.clone(),
-            config
-                .clearance_interval
-                .clamp(Duration::from_secs(2), Duration::from_secs(30)),
-            config
-                .clearance_expiry
-                .clamp(Duration::from_secs(60), Duration::from_secs(7200)),
-        ),
+        crate::safety::Safety::new(backend.clone())
+            .with_store(config.storage.data_dir.join("safety.json"))
+            .with_history(config.storage.data_dir.clone())
+            .timing(
+                config.clock.clone(),
+                config
+                    .clearance_interval
+                    .clamp(Duration::from_secs(2), Duration::from_secs(30)),
+                config
+                    .clearance_expiry
+                    .clamp(Duration::from_secs(60), Duration::from_secs(7200)),
+            ),
     );
     safety.monitor();
     let confirmations =
@@ -136,6 +140,7 @@ pub fn router(backend: Arc<dyn Backend>, config: ServerConfig) -> Router {
         raw: backend,
         initialized: Mutex::new(false),
         actions: Mutex::new(()),
+        expiring: Mutex::new(()),
         uploads: Semaphore::new(config.storage.uploads.clamp(1, Semaphore::MAX_PERMITS)),
         runs: Semaphore::new(config.storage.runs.clamp(1, Semaphore::MAX_PERMITS)),
         config,
@@ -179,6 +184,7 @@ pub fn router(backend: Arc<dyn Backend>, config: ServerConfig) -> Router {
         )
         .route("/api/v1/queue/{id}/dispatch", post(queue::dispatch))
         .route("/api/v1/printers", get(printers))
+        .route("/api/v1/history", get(history))
         .route(
             "/api/v1/confirmations",
             post(challenge).layer(DefaultBodyLimit::max(4096)),
@@ -281,6 +287,7 @@ async fn initialize(app: &App) -> Result<(), Problem> {
             Err(e) => return Err(internal(e)),
         }
         *app.queue.lock().await = queue::load(app).await?;
+        app.backend.poll_history_best_effort(true).await;
         *initialized = true;
     }
     Ok(())
@@ -323,18 +330,25 @@ async fn challenge(
 }
 
 async fn expire(app: &App) -> Result<(), Problem> {
+    let Ok(_expiry) = app.expiring.try_lock() else {
+        return Ok(());
+    };
     let now = app.config.clock.now();
     // A queue preparation or dispatch must never delay another printer's Stop.
     // Expiry can safely wait until the next request.
     let Ok(queue) = app.queue.try_lock() else {
         return Ok(());
     };
-    let mut saved = app.saved.lock().await;
+    let saved = app.saved.lock().await;
     let ids: Vec<_> = saved
         .iter()
         .filter(|(_, value)| now.saturating_sub(value.created) > app.config.storage.keep)
         .map(|(id, _)| id.clone())
         .collect();
+    drop(saved);
+    if ids.is_empty() {
+        return Ok(());
+    }
     for id in ids {
         if queue
             .iter()
@@ -342,9 +356,22 @@ async fn expire(app: &App) -> Result<(), Problem> {
         {
             continue;
         }
+        match app.raw.job(&id).await {
+            Ok(job)
+                if matches!(
+                    job.state,
+                    crate::backend::JobState::Printing | crate::backend::JobState::Paused
+                ) =>
+            {
+                continue
+            }
+            Err(Error::NotFound) => {}
+            Err(_) => continue,
+            _ => {}
+        }
         app.backend.forget(&id).await.map_err(backend_error)?;
         let _ = tokio::fs::remove_dir_all(app.config.storage.data_dir.join(&id)).await;
-        saved.remove(&id);
+        app.saved.lock().await.remove(&id);
     }
     Ok(())
 }
@@ -535,7 +562,7 @@ async fn create_in(
     }
     let name = fields
         .remove("name")
-        .or(filename)
+        .or(filename.clone())
         .ok_or_else(|| bad("Choose one .3mf file."))?;
     if !path.is_file() {
         return Err(bad("Choose one .3mf file."));
@@ -562,6 +589,12 @@ async fn create_in(
         .prepare(id, &path, &printer, options.clone())
         .await
         .map_err(backend_error)?;
+    if let Some(filename) = filename {
+        app.backend
+            .history_source(id, &filename)
+            .await
+            .map_err(backend_error)?;
+    }
     let preview = if let Some(source) = estimate.preview {
         use tokio::io::AsyncReadExt as _;
         let mut bytes = Vec::new();
@@ -798,6 +831,23 @@ async fn stop(
         .await;
     checkpoint(&app).await?;
     Ok(Json(result.map_err(backend_error)?))
+}
+
+async fn history(
+    State(app): State<Shared>,
+    Query(filter): Query<crate::history::Filter>,
+) -> Result<Json<Vec<crate::history::Record>>, Problem> {
+    filter.validate().map_err(bad)?;
+    app.backend.flush_history().await;
+    app.backend
+        .poll_history(false)
+        .await
+        .map_err(backend_error)?;
+    Ok(Json(
+        crate::history::query(&app.config.storage.data_dir, &filter)
+            .await
+            .map_err(backend_error)?,
+    ))
 }
 
 #[path = "queue.rs"]
