@@ -359,7 +359,13 @@ impl Summary {
         rows.extend(self.printers.iter().map(|p| row(&p.printer, &p.totals)));
         rows.push(row("TOTAL", &self.total));
         let widths: Vec<usize> = (0..13)
-            .map(|c| rows.iter().map(|r| r[c].chars().count()).max().unwrap_or(0))
+            .map(|c| {
+                rows.iter()
+                    .filter_map(|r| r.get(c))
+                    .map(|cell| cell.chars().count())
+                    .max()
+                    .unwrap_or(0)
+            })
             .collect();
         rows.iter()
             .map(|r| {
