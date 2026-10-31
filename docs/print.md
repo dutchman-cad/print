@@ -305,6 +305,38 @@ Outcomes are `done`, `cancelled`, `failed`, `stopped` (a tracked job ended by pr
 `bed_clear`. External printer jobs are not tracked and do not get job-history records.
 A ready job cancelled before Start has no start time or duration.
 
+### Summary and CSV
+
+```sh
+dutchman-print --data-dir private-jobs history --summary --since 2026-10-01T00:00:00Z
+dutchman-print --data-dir private-jobs history --summary --printer workbench --json
+dutchman-print --data-dir private-jobs history --csv --since 2026-10-01T00:00:00Z > october.csv
+```
+
+`history --summary` reports, per printer and in total, the number of finished jobs by
+outcome (`done`, `failed`, `cancelled`, `stopped`, `ended`, `unresolved_after_restart`),
+the success rate, total and average print time, and the time of the last finished job.
+It covers every retained record that matches `--printer` and `--since`; `--outcome` and
+`--limit` are refused. Success rate is `done` divided by jobs that ran (jobs with a
+start time; a job cancelled before Start never ran), and is `-` when nothing ran.
+Print time sums `duration_seconds` over the jobs that have one; the average divides by
+that same count. Bed-clear acknowledgements are counted in their own `bed_clears` column
+and are not jobs. The default output is a table, `--json` prints the same figures as JSON:
+
+```text
+PRINTER    JOBS  DONE  FAILED  CANCELLED  STOPPED  ENDED  UNRESOLVED  SUCCESS  TOTAL TIME  AVG TIME  LAST FINISHED         BED CLEARS
+bench      3     2     1       0          0        0      0           66.7%    0h06m40s    0h03m20s  2026-10-03T01:00:00Z  1
+TOTAL      3     2     1       0          0        0      0           66.7%    0h06m40s    0h03m20s  2026-10-03T01:00:00Z  1
+```
+
+`history --csv` writes the records matching the usual filters (`--limit` still defaults to
+100) as CSV with a header row and one column per record field: `printer`, `printer_kind`,
+`job_id`, `job_name`, `file_name`, `file_size`, `source`, `outcome`, `started_at`,
+`ended_at`, `duration_seconds`, `estimate`. Fields containing commas, quotes or line breaks
+are quoted as in RFC 4180, rows end in CRLF, absent values are empty, timestamps are as
+stored, and `estimate` holds its JSON text. `--csv` cannot be combined with `--json` or
+`--summary`. JSON stays the default output.
+
 Each job record includes the printer id and kind, job id and name, prepared filename and
 size in bytes (the input file for simulation), source input label when known, estimates,
 and UTC RFC 3339 times. Start

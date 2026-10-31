@@ -36,6 +36,12 @@ enum Command {
         filter: dutchman_print::history::Filter,
         #[arg(long)]
         json: bool,
+        /// Show counts, success rate and print time per printer instead of records.
+        #[arg(long, conflicts_with = "csv")]
+        summary: bool,
+        /// Write the records as CSV with a header row.
+        #[arg(long, conflicts_with = "json")]
+        csv: bool,
     },
     /// Write a config for one printer, asking on a terminal. Contacts nothing.
     Init(Box<dutchman_print::init::Flags>),
@@ -392,16 +398,28 @@ async fn command(
     let confirmations = dutchman_print::confirmation::Confirmations::new(None);
     let result: Result<(), dutchman_print::backend::Error> = async {
         match command {
-            Command::History { filter, json } => {
+            Command::History { filter, json, summary, csv } => {
                 filter.validate().map_err(dutchman_print::backend::Error::Refused)?;
                 backend.flush_history().await;
                 backend.poll_history(false).await?;
+                if summary {
+                    if filter.outcome.is_some() || filter.limit.is_some() {
+                        return Err(dutchman_print::backend::Error::Refused(
+                            "A summary covers every outcome and record; drop --outcome and --limit.".into()));
+                    }
+                    let filter = dutchman_print::history::SummaryFilter { printer: filter.printer, since: filter.since };
+                    let summary = dutchman_print::history::summary(data, &filter).await?;
+                    if json { output(&summary).map_err(dutchman_print::backend::Error::Failed)?; } else { println!("{}", summary.table()); }
+                } else {
                 let records = dutchman_print::history::query(data, &filter).await?;
-                if json { output(&records).map_err(dutchman_print::backend::Error::Failed)?; } else {
+                if csv {
+                    print!("{}", dutchman_print::history::csv(&records));
+                } else if json { output(&records).map_err(dutchman_print::backend::Error::Failed)?; } else {
                     for record in records {
                         println!("{} {} {} {}", record.ended_at, record.printer, record.outcome,
                             record.job_name.as_deref().unwrap_or("Bed clear"));
                     }
+                }
                 }
             },
             Command::Print {

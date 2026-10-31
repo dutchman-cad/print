@@ -193,6 +193,228 @@ pub async fn query(root: &Path, filter: &Filter) -> Result<Vec<Record>, Error> {
         .take(filter.limit.unwrap_or(100))
         .collect())
 }
+/// Counts and times for one printer, or for the whole farm.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct Totals {
+    /// Finished jobs of any outcome; bed-clear acknowledgements are not jobs.
+    pub jobs: u64,
+    pub done: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+    pub stopped: u64,
+    pub ended: u64,
+    pub unresolved_after_restart: u64,
+    /// Jobs with a recorded start (cancelled-before-Start jobs never ran).
+    pub ran: u64,
+    /// `done / ran`, absent when nothing ran.
+    pub success_rate: Option<f64>,
+    /// Jobs that carry `duration_seconds`.
+    pub timed_jobs: u64,
+    pub total_seconds: u64,
+    pub average_seconds: Option<f64>,
+    pub last_finished_at: Option<String>,
+    pub bed_clears: u64,
+}
+impl Totals {
+    fn add(&mut self, r: &Record) {
+        if r.outcome == "bed_clear" {
+            self.bed_clears += 1;
+            return;
+        }
+        self.jobs += 1;
+        match r.outcome.as_str() {
+            "done" => self.done += 1,
+            "failed" => self.failed += 1,
+            "cancelled" => self.cancelled += 1,
+            "stopped" => self.stopped += 1,
+            "ended" => self.ended += 1,
+            "unresolved_after_restart" => self.unresolved_after_restart += 1,
+            _ => {}
+        }
+        self.ran += u64::from(r.started_at.is_some());
+        if let Some(seconds) = r.duration_seconds {
+            self.timed_jobs += 1;
+            self.total_seconds = self.total_seconds.saturating_add(seconds);
+        }
+        let newer = match (&self.last_finished_at, parse_time(&r.ended_at)) {
+            (_, Err(_)) => false,
+            (None, Ok(_)) => true,
+            (Some(last), Ok(t)) => parse_time(last).is_ok_and(|l| t > l),
+        };
+        if newer {
+            self.last_finished_at = Some(r.ended_at.clone());
+        }
+    }
+    fn finish(&mut self) {
+        self.success_rate = (self.ran > 0).then(|| self.done as f64 / self.ran as f64);
+        self.average_seconds =
+            (self.timed_jobs > 0).then(|| self.total_seconds as f64 / self.timed_jobs as f64);
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PrinterTotals {
+    pub printer: String,
+    #[serde(flatten)]
+    pub totals: Totals,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Summary {
+    pub total: Totals,
+    pub printers: Vec<PrinterTotals>,
+}
+
+/// Query fields of the summary route; the same names as the history filter.
+#[derive(Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryFilter {
+    pub printer: Option<String>,
+    pub since: Option<String>,
+}
+impl From<SummaryFilter> for Filter {
+    fn from(f: SummaryFilter) -> Self {
+        Filter {
+            printer: f.printer,
+            since: f.since,
+            outcome: None,
+            limit: Some(KEEP),
+        }
+    }
+}
+
+pub fn summarize(records: &[Record]) -> Summary {
+    let mut total = Totals::default();
+    let mut by_printer = std::collections::BTreeMap::<&str, Totals>::new();
+    for r in records {
+        total.add(r);
+        by_printer.entry(&r.printer).or_default().add(r);
+    }
+    total.finish();
+    Summary {
+        total,
+        printers: by_printer
+            .into_iter()
+            .map(|(printer, mut totals)| {
+                totals.finish();
+                PrinterTotals {
+                    printer: printer.into(),
+                    totals,
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Summary of every retained record matching the printer and since filters.
+pub async fn summary(root: &Path, filter: &SummaryFilter) -> Result<Summary, Error> {
+    Ok(summarize(&query(root, &filter.clone().into()).await?))
+}
+
+fn hms(seconds: f64) -> String {
+    let s = seconds.round() as u64;
+    format!("{}h{:02}m{:02}s", s / 3600, s % 3600 / 60, s % 60)
+}
+impl Summary {
+    /// Aligned human table, one row per printer and a final total row.
+    pub fn table(&self) -> String {
+        let mut rows = vec![[
+            "PRINTER",
+            "JOBS",
+            "DONE",
+            "FAILED",
+            "CANCELLED",
+            "STOPPED",
+            "ENDED",
+            "UNRESOLVED",
+            "SUCCESS",
+            "TOTAL TIME",
+            "AVG TIME",
+            "LAST FINISHED",
+            "BED CLEARS",
+        ]
+        .map(String::from)];
+        let row = |name: &str, t: &Totals| {
+            [
+                name.to_string(),
+                t.jobs.to_string(),
+                t.done.to_string(),
+                t.failed.to_string(),
+                t.cancelled.to_string(),
+                t.stopped.to_string(),
+                t.ended.to_string(),
+                t.unresolved_after_restart.to_string(),
+                t.success_rate
+                    .map_or("-".into(), |r| format!("{:.1}%", r * 100.0)),
+                if t.timed_jobs > 0 {
+                    hms(t.total_seconds as f64)
+                } else {
+                    "-".into()
+                },
+                t.average_seconds.map_or("-".into(), hms),
+                t.last_finished_at.clone().unwrap_or_else(|| "-".into()),
+                t.bed_clears.to_string(),
+            ]
+        };
+        rows.extend(self.printers.iter().map(|p| row(&p.printer, &p.totals)));
+        rows.push(row("TOTAL", &self.total));
+        let widths: Vec<usize> = (0..13)
+            .map(|c| rows.iter().map(|r| r[c].chars().count()).max().unwrap_or(0))
+            .collect();
+        rows.iter()
+            .map(|r| {
+                let cells: Vec<String> = r
+                    .iter()
+                    .zip(&widths)
+                    .map(|(cell, w)| format!("{cell:<w$}"))
+                    .collect();
+                cells.join("  ").trim_end().to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+const CSV_HEADER: &str = "printer,printer_kind,job_id,job_name,file_name,file_size,source,outcome,started_at,ended_at,duration_seconds,estimate";
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\r', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.into()
+    }
+}
+/// RFC 4180 CSV with a header row. Absent values are empty cells; the estimate
+/// is its JSON text. Lines end with CRLF.
+pub fn csv(records: &[Record]) -> String {
+    let mut out = format!("{CSV_HEADER}\r\n");
+    for r in records {
+        let estimate = r
+            .estimate
+            .as_ref()
+            .and_then(|e| serde_json::to_string(e).ok());
+        let cells = [
+            Some(r.printer.clone()),
+            Some(r.printer_kind.clone()),
+            r.job_id.clone(),
+            r.job_name.clone(),
+            r.file_name.clone(),
+            r.file_size.map(|n| n.to_string()),
+            r.source.clone(),
+            Some(r.outcome.clone()),
+            r.started_at.clone(),
+            Some(r.ended_at.clone()),
+            r.duration_seconds.map(|n| n.to_string()),
+            estimate,
+        ];
+        let line: Vec<String> = cells
+            .iter()
+            .map(|c| c.as_deref().map(csv_field).unwrap_or_default())
+            .collect();
+        out.push_str(&line.join(","));
+        out.push_str("\r\n");
+    }
+    out
+}
 pub(crate) async fn append(root: &Path, record: &Record) -> Result<(), Error> {
     let _lock = lock(root).await?;
     let (records, complete, torn) = read(root).await?;
@@ -922,5 +1144,205 @@ url = "http://127.0.0.1/?token=private-token"
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn sample(
+        printer: &str,
+        outcome: &str,
+        started: bool,
+        duration: Option<u64>,
+        ended: &str,
+    ) -> Record {
+        let mut r = record(0);
+        r.printer = printer.into();
+        r.outcome = outcome.into();
+        r.started_at = started.then(|| "2026-10-01T00:00:00Z".into());
+        r.duration_seconds = duration;
+        r.ended_at = ended.into();
+        if outcome == "bed_clear" {
+            r.job_id = None;
+            r.job_name = None;
+        }
+        r
+    }
+    fn farm() -> Vec<Record> {
+        vec![
+            sample("a", "done", true, Some(100), "2026-10-01T01:00:00Z"),
+            sample("a", "done", true, Some(300), "2026-10-03T01:00:00Z"),
+            sample("a", "failed", true, None, "2026-10-02T01:00:00Z"),
+            sample("a", "bed_clear", false, None, "2026-10-04T01:00:00Z"),
+            sample("b", "cancelled", false, None, "2026-10-05T01:00:00Z"),
+            sample("b", "stopped", true, Some(50), "2026-10-02T01:00:00Z"),
+            sample("b", "ended", true, Some(10), "2026-10-02T02:00:00Z"),
+            sample(
+                "b",
+                "unresolved_after_restart",
+                true,
+                None,
+                "2026-10-02T03:00:00Z",
+            ),
+        ]
+    }
+    #[test]
+    fn summary_counts_rates_times_and_bed_clears() {
+        let s = summarize(&farm());
+        let a = &s.printers[0];
+        assert_eq!(a.printer, "a");
+        assert_eq!((a.totals.jobs, a.totals.done, a.totals.failed), (3, 2, 1));
+        assert_eq!(a.totals.bed_clears, 1);
+        assert_eq!(a.totals.ran, 3);
+        assert!((a.totals.success_rate.unwrap() - 2.0 / 3.0).abs() < 1e-9);
+        assert_eq!((a.totals.timed_jobs, a.totals.total_seconds), (2, 400));
+        assert_eq!(a.totals.average_seconds, Some(200.0));
+        assert_eq!(
+            a.totals.last_finished_at.as_deref(),
+            Some("2026-10-03T01:00:00Z")
+        );
+        let b = &s.printers[1].totals;
+        assert_eq!((b.jobs, b.cancelled, b.stopped, b.ended), (4, 1, 1, 1));
+        assert_eq!(b.unresolved_after_restart, 1);
+        assert_eq!(b.ran, 3);
+        assert_eq!(b.success_rate, Some(0.0));
+        assert_eq!(b.average_seconds, Some(30.0));
+        assert_eq!(b.last_finished_at.as_deref(), Some("2026-10-05T01:00:00Z"));
+        assert_eq!((s.total.jobs, s.total.done, s.total.bed_clears), (7, 2, 1));
+        assert_eq!(s.total.total_seconds, 460);
+        assert!((s.total.success_rate.unwrap() - 2.0 / 6.0).abs() < 1e-9);
+        assert!(s.table().contains("TOTAL"));
+    }
+    #[test]
+    fn summary_of_nothing_has_no_rates() {
+        let s = summarize(&[sample(
+            "a",
+            "cancelled",
+            false,
+            None,
+            "2026-10-01T00:00:00Z",
+        )]);
+        assert_eq!(s.total.jobs, 1);
+        assert_eq!(s.total.success_rate, None);
+        assert_eq!(s.total.average_seconds, None);
+        assert_eq!(summarize(&[]).total, Totals::default().tap_finish());
+    }
+    impl Totals {
+        fn tap_finish(mut self) -> Self {
+            self.finish();
+            self
+        }
+    }
+    #[tokio::test]
+    async fn summary_applies_printer_and_since_filters() {
+        let root = tempfile::tempdir().unwrap();
+        for r in farm() {
+            append_unique(root.path(), r).await;
+        }
+        let all = summary(root.path(), &SummaryFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(all.total.jobs, 7);
+        let only_b = SummaryFilter {
+            printer: Some("b".into()),
+            since: None,
+        };
+        let s = summary(root.path(), &only_b).await.unwrap();
+        assert_eq!((s.printers.len(), s.total.jobs), (1, 4));
+        let since = SummaryFilter {
+            printer: None,
+            since: Some("2026-10-03T00:00:00Z".into()),
+        };
+        let s = summary(root.path(), &since).await.unwrap();
+        assert_eq!((s.total.jobs, s.total.done, s.total.bed_clears), (2, 1, 1));
+        let bad = SummaryFilter {
+            printer: None,
+            since: Some("yesterday".into()),
+        };
+        assert!(summary(root.path(), &bad).await.is_err());
+    }
+    async fn append_unique(root: &Path, mut r: Record) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if r.job_id.is_some() {
+            r.job_id = Some(N.fetch_add(1, Ordering::SeqCst).to_string());
+        }
+        append(root, &r).await.unwrap();
+    }
+    #[test]
+    fn csv_has_header_and_quotes_commas_quotes_and_newlines() {
+        let mut r = record(1);
+        r.job_name = Some("a,b \"c\"\nd".into());
+        r.job_id = None;
+        r.estimate = Some(Estimate {
+            seconds: Some(5),
+            ..Estimate::default()
+        });
+        let text = csv(&[
+            r,
+            sample("a", "bed_clear", false, None, "2026-10-04T01:00:00Z"),
+        ]);
+        let mut lines = text.split("\r\n");
+        assert_eq!(lines.next().unwrap(), CSV_HEADER);
+        assert!(text.contains(",\"a,b \"\"c\"\"\nd\","));
+        assert!(text.contains(",42,part.3mf,done,2026-10-30T00:00:00Z,2026-10-30T00:01:00Z,60,\"{\"\"seconds\"\":5}\"\r\n"));
+        assert!(text.ends_with("\r\n"));
+        assert_eq!(csv(&[]), format!("{CSV_HEADER}\r\n"));
+    }
+    #[tokio::test]
+    async fn summary_and_csv_routes_use_authentication_and_content_types() {
+        use axum::{
+            body::Body,
+            http::{header, Request, StatusCode},
+        };
+        use tower::ServiceExt as _;
+        let root = tempfile::tempdir().unwrap();
+        for r in farm() {
+            append_unique(root.path(), r).await;
+        }
+        let get = |app: axum::Router, uri: &'static str| async move {
+            let response = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let kind = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap().to_string());
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            (status, kind, String::from_utf8(bytes.to_vec()).unwrap())
+        };
+        let config = |login: bool| {
+            let mut config = crate::ServerConfig::default();
+            config.storage.data_dir = root.path().into();
+            if login {
+                config.login = Some(("user".into(), "secret".into()));
+            }
+            config
+        };
+        let app = crate::router(backend(Arc::new(TestClock::default())), config(false));
+        let (status, kind, body) = get(app.clone(), "/api/v1/history/summary?printer=a").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(kind.unwrap().starts_with("application/json"));
+        let s: Summary = serde_json::from_str(&body).unwrap();
+        assert_eq!((s.total.jobs, s.printers.len()), (3, 1));
+        let (status, _, _) = get(app.clone(), "/api/v1/history/summary?since=nope").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _, _) = get(app.clone(), "/api/v1/history/summary?outcome=done").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, kind, body) = get(app.clone(), "/api/v1/history?format=csv&printer=b").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(kind.unwrap().starts_with("text/csv"));
+        assert!(body.starts_with(CSV_HEADER));
+        assert_eq!(body.trim_end().split("\r\n").count(), 5);
+        let (status, kind, _) = get(app.clone(), "/api/v1/history?format=json").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(kind.unwrap().starts_with("application/json"));
+        let (status, _, _) = get(app, "/api/v1/history?format=xml").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let app = crate::router(backend(Arc::new(TestClock::default())), config(true));
+        for uri in ["/api/v1/history/summary", "/api/v1/history?format=csv"] {
+            let (status, _, _) = get(app.clone(), uri).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
     }
 }

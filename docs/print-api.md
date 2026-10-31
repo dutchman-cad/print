@@ -15,7 +15,8 @@ response fields. Breaking changes require a new path version such as `/api/v2`.
 | Method and path | Request | Success |
 |---|---|---|
 | `GET /healthz` | No body | 200, `{"service":"dutchman-print","api":1}` for Dutchman Print |
-| `GET /api/v1/history` | Optional `printer`, `outcome`, `since`, and `limit` query fields | 200, array of history records, newest first |
+| `GET /api/v1/history` | Optional `printer`, `outcome`, `since`, `limit`, and `format` (`json` or `csv`) query fields | 200, array of history records, newest first; `text/csv` with `format=csv` |
+| `GET /api/v1/history/summary` | Optional `printer` and `since` query fields | 200, per-printer and total job counts, rates, and print times |
 | `GET /api/v1/printers` | No body | 200, array of printer objects |
 | `POST /api/v1/jobs` | Raw 3MF or multipart, described below | 201, prepared job object |
 | `GET /api/v1/jobs/{id}` | No body | 200, current job object |
@@ -377,6 +378,30 @@ Filters combine: `printer` matches the printer id, `outcome` matches a value bel
 required), and `limit` defaults to 100, with a range of 1–10,000. Invalid filters return
 400. Encode `+` in timestamps as `%2B`. Authentication and no-store policy match other
 read routes. An empty result is `[]`.
+
+`format=csv` returns the same filtered records as `text/csv; charset=utf-8`: a header row
+of the record field names below in order, then one CRLF-terminated row per record, with
+RFC 4180 quoting, empty cells for null, timestamps as stored, and `estimate` as its JSON
+text. Any other `format` returns 400; JSON is the default.
+
+`GET /api/v1/history/summary?printer=workbench&since=2026-10-01T00:00:00Z` filters as
+above (`outcome` and `limit` are rejected) and returns every matching retained record
+aggregated:
+
+```json
+{"total":{"jobs":3,"done":2,"failed":1,"cancelled":0,"stopped":0,"ended":0,
+ "unresolved_after_restart":0,"ran":3,"success_rate":0.6667,"timed_jobs":2,
+ "total_seconds":400,"average_seconds":200.0,"last_finished_at":"2026-10-03T01:00:00Z",
+ "bed_clears":1},
+ "printers":[{"printer":"workbench","jobs":3,"done":2, "...":"same fields as total"}]}
+```
+
+`jobs` counts finished jobs of any outcome; bed-clear acknowledgements are counted only
+in `bed_clears`. `ran` is the jobs with a start time, and `success_rate` is `done / ran`
+(null when `ran` is 0). `total_seconds` sums `duration_seconds` over the `timed_jobs`
+that have one, and `average_seconds` is their mean (null when none). `last_finished_at`
+is the latest `ended_at` among jobs (null when none). Printers are sorted by id.
+Authentication and no-store policy match the history route.
 
 | Record field | Type | Meaning |
 |---|---|---|

@@ -185,6 +185,7 @@ pub fn router(backend: Arc<dyn Backend>, config: ServerConfig) -> Router {
         .route("/api/v1/queue/{id}/dispatch", post(queue::dispatch))
         .route("/api/v1/printers", get(printers))
         .route("/api/v1/history", get(history))
+        .route("/api/v1/history/summary", get(history_summary))
         .route(
             "/api/v1/confirmations",
             post(challenge).layer(DefaultBodyLimit::max(4096)),
@@ -833,18 +834,59 @@ async fn stop(
     Ok(Json(result.map_err(backend_error)?))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryQuery {
+    printer: Option<String>,
+    outcome: Option<String>,
+    since: Option<String>,
+    limit: Option<usize>,
+    format: Option<String>,
+}
+
+async fn refresh_history(app: &Shared) -> Result<(), Problem> {
+    app.backend.flush_history().await;
+    app.backend.poll_history(false).await.map_err(backend_error)
+}
+
 async fn history(
     State(app): State<Shared>,
-    Query(filter): Query<crate::history::Filter>,
-) -> Result<Json<Vec<crate::history::Record>>, Problem> {
+    Query(q): Query<HistoryQuery>,
+) -> Result<axum::response::Response, Problem> {
+    use axum::response::IntoResponse as _;
+    let csv = match q.format.as_deref() {
+        None | Some("json") => false,
+        Some("csv") => true,
+        Some(_) => return Err(bad("Choose a history format: json or csv.")),
+    };
+    let filter = crate::history::Filter {
+        printer: q.printer,
+        outcome: q.outcome,
+        since: q.since,
+        limit: q.limit,
+    };
     filter.validate().map_err(bad)?;
-    app.backend.flush_history().await;
-    app.backend
-        .poll_history(false)
+    refresh_history(&app).await?;
+    let records = crate::history::query(&app.config.storage.data_dir, &filter)
         .await
         .map_err(backend_error)?;
+    if csv {
+        let headers = [(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")];
+        return Ok((headers, crate::history::csv(&records)).into_response());
+    }
+    Ok(Json(records).into_response())
+}
+
+async fn history_summary(
+    State(app): State<Shared>,
+    Query(filter): Query<crate::history::SummaryFilter>,
+) -> Result<Json<crate::history::Summary>, Problem> {
+    crate::history::Filter::from(filter.clone())
+        .validate()
+        .map_err(bad)?;
+    refresh_history(&app).await?;
     Ok(Json(
-        crate::history::query(&app.config.storage.data_dir, &filter)
+        crate::history::summary(&app.config.storage.data_dir, &filter)
             .await
             .map_err(backend_error)?,
     ))
