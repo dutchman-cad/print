@@ -1735,6 +1735,12 @@ Dutchman Print is not released. No release may be published before testing on a 
 printer using the [hardware checklist](hardware-checklist.md). Simulated tests alone
 do not satisfy this project rule.
 
+Every push to `main` and every pull request also builds `dutchman-print` in release mode on
+Linux, macOS and Windows. The binaries are kept for 14 days as the CI run's artifacts
+(`dutchman-print-Linux-X64`, `dutchman-print-macOS-ARM64`, `dutchman-print-Windows-X64`), for
+trying a change without building it; they are test builds, not releases. For example:
+`gh run download <run-id> -R dutchman-cad/print -n dutchman-print-Linux-X64`.
+
 The `Release drafts` workflow builds on pushed `v*` tags and through `workflow_dispatch`.
 The tag must match the workspace version in `Cargo.toml` (for example, `v0.1.0`). A manual
 run on a branch only keeps build artifacts; a run on an existing version tag also creates
