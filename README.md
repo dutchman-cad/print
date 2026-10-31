@@ -57,7 +57,8 @@ setup and what still needs checking on real hardware.
 
 Print farms can keep a persistent FIFO job queue, review suitable idle printers,
 and dispatch each job with a fresh human confirmation. Queue commands support adding,
-listing, moving, removing, proposing, and dispatching jobs. See
+listing, moving, removing, proposing, and dispatching jobs. Attempted dispatches
+reserve their printers until their entries leave the queue. See
 [Print farm queue](docs/print.md#print-farm-queue).
 
 ## Build from source

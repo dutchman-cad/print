@@ -229,6 +229,9 @@ async fn matches(app: &App, entry: &Entry, printer: &Printer) -> bool {
         && entry.profile.as_ref().is_none_or(|p| Some(p) == profile)
         && entry.kind.as_ref().is_none_or(|k| k == &kind)
 }
+/// Callers hold the queue lock throughout matching, serializing queue requests while
+/// status reads wait for their timeouts (within the overall matching deadline).
+/// Stop and other printer routes never wait on this lock; expiry uses `try_lock`.
 async fn propose(app: &App, entries: &[Entry]) -> Result<Vec<Proposal>, Problem> {
     tokio::time::timeout(Duration::from_secs(30), propose_in(app, entries))
         .await
@@ -242,6 +245,13 @@ async fn propose(app: &App, entries: &[Entry]) -> Result<Vec<Proposal>, Problem>
 async fn propose_in(app: &App, entries: &[Entry]) -> Result<Vec<Proposal>, Problem> {
     let printers = app.backend.printers().await.map_err(backend_error)?;
     let mut used = HashSet::new();
+    // Reserve every attempted entry before FIFO matching, including entries moved
+    // behind unattempted work. Idle telemetry can lag a Start already in flight.
+    for entry in entries.iter().filter(|entry| entry.attempted) {
+        if let Some(job) = &entry.prepared {
+            used.insert(app.backend.job_printer(job).await.map_err(backend_error)?);
+        }
+    }
     let mut proposals = Vec::new();
     for entry in entries {
         let mut selected = None;

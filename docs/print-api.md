@@ -545,7 +545,12 @@ against the original preparation. Absent presets must match absent presets. Opti
 profile/kind filters must match too. Candidates use configured printer order; each
 printer is proposed at most once, assigned to its earliest compatible entry. Entries
 without a match do not prevent later entries matching different printers. Matching
-has a 30-second deadline (503 on expiry). Proposals are advisory, with no reservation.
+has a 30-second deadline (503 on expiry). Proposals themselves are advisory. Before
+matching, every attempted entry with a bound job reserves that job's printer while the
+entry remains queued, regardless of FIFO position or still-idle telemetry. Reservations
+also remain after refusal and restart; reconcile the execution before removing its entry.
+If a bound printer lookup fails, matching returns an error without proposals. An attempted
+entry without a bound job reserves nothing.
 
 To dispatch, first request the queue entry's challenge for its current proposed printer.
 The server reuses the original job when it was prepared for that printer, or prepares

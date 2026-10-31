@@ -1721,7 +1721,11 @@ of printers sharing presets before confirming.
 Proposals walk entries in FIFO order and configured printers in order. They skip
 busy, offline, uncleared, incompatible, and monitoring-only printers, and propose each
 printer only once. An unmatched entry does not block later entries with other targets.
-Proposals reserve nothing and never start anything. Positions for `move` are zero-based.
+Proposals themselves reserve nothing and never start anything. An attempted dispatch
+reserves its bound printer while the entry remains queued, even before telemetry reports
+printing and after an uncertain refusal. Reconcile the tracked job before removing such
+an entry. Matching fails closed if an attempted entry's bound printer cannot be resolved.
+Positions for `move` are zero-based.
 `remove` removes queue membership, retaining prepared and tracked job records.
 
 Dispatch requests a fresh server-issued Start challenge. The person must still check

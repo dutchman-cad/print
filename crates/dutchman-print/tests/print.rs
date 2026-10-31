@@ -4,7 +4,7 @@
 use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1562,14 +1562,22 @@ async fn farm_queue_one_printer_per_proposal_and_cross_printer_dispatch() {
     assert!(proposals[1]["printer"].is_null()); // busy second and incompatible third are skipped
 }
 
+#[derive(Default)]
+struct QueueStartGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    fail_lookup: AtomicBool,
+}
 struct QueueBackend {
     inner: Simulated,
     starts: AtomicU64,
     fail: bool,
+    start_gate: Option<Arc<QueueStartGate>>,
 }
 impl Backend for QueueBackend {
     fn bed_ready(&self, printer: &str, detail: Option<&str>) -> bool {
-        printer == "monitor" && detail == Some("READY")
+        (printer == "monitor" && detail == Some("READY"))
+            || (printer == "demo" && self.start_gate.is_some())
     }
     fn controls(&self, printer: &str) -> Vec<&'static str> {
         if printer == "monitor" {
@@ -1618,7 +1626,13 @@ impl Backend for QueueBackend {
         id: &'a str,
     ) -> dutchman_print::backend::Reply<'a, dutchman_print::backend::Job> {
         Box::pin(async move {
-            self.starts.fetch_add(1, Ordering::SeqCst);
+            let previous = self.starts.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.start_gate {
+                if previous == 0 {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                }
+            }
             if self.fail {
                 Err(Error::Refused(
                     "Start outcome is uncertain. Read job status.".into(),
@@ -1646,6 +1660,18 @@ impl Backend for QueueBackend {
     ) -> dutchman_print::backend::Reply<'a, dutchman_print::backend::Job> {
         self.inner.resume(id)
     }
+    fn job_printer<'a>(&'a self, id: &'a str) -> dutchman_print::backend::Reply<'a, String> {
+        Box::pin(async move {
+            if self
+                .start_gate
+                .as_ref()
+                .is_some_and(|gate| gate.fail_lookup.load(Ordering::SeqCst))
+            {
+                return Err(Error::Unavailable);
+            }
+            self.inner.job_printer(id).await
+        })
+    }
     fn job<'a>(
         &'a self,
         id: &'a str,
@@ -1664,6 +1690,7 @@ async fn farm_queue_uncertain_dispatch_is_never_retried_even_after_restart() {
         inner: Simulated::new(toml::from_str(CONFIG).unwrap(), clock.clone()).unwrap(),
         starts: AtomicU64::new(0),
         fail: true,
+        start_gate: None,
     });
     let app = router(backend.clone(), settings(dir.path(), clock.clone()));
     let entry = queue_add(&app, "demo").await;
@@ -1708,6 +1735,7 @@ async fn farm_queue_skips_monitoring_busy_and_filter_mismatches() {
         inner: Simulated::new(toml::from_str(&config).unwrap(), clock.clone()).unwrap(),
         starts: AtomicU64::new(0),
         fail: false,
+        start_gate: None,
     });
     let app = router(backend, settings(dir.path(), clock));
     let first = queue_add(&app, "any").await;
@@ -1860,4 +1888,116 @@ async fn farm_queue_cli_round_trip_uses_the_server_and_human_confirmation() {
     .await;
     assert!(out.status.success());
     server.abort();
+}
+
+#[tokio::test]
+async fn farm_queue_in_flight_dispatch_reserves_sensor_ready_printer() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let gate = Arc::new(QueueStartGate::default());
+    let backend = Arc::new(QueueBackend {
+        inner: Simulated::new(toml::from_str(CONFIG).unwrap(), clock.clone()).unwrap(),
+        starts: AtomicU64::new(0),
+        fail: false,
+        start_gate: Some(gate.clone()),
+    });
+    let app = router(backend.clone(), settings(dir.path(), clock.clone()));
+    let first = queue_add(&app, "demo").await;
+    let second = queue_add(&app, "demo").await;
+    let first_id = first["id"].as_str().unwrap();
+    let second_id = second["id"].as_str().unwrap();
+    let challenge_path = |id| format!("/api/v1/queue/{id}/confirmations");
+    let move_path = |id| format!("/api/v1/queue/{id}/move");
+    let first_challenge = accepted(
+        &app,
+        queue_json(&challenge_path(first_id), json!({"printer":"demo"})),
+        201,
+    )
+    .await;
+    // Obtain a valid, bound challenge for the second entry before either Start.
+    accepted(
+        &app,
+        queue_json(&move_path(second_id), json!({"position":0})),
+        200,
+    )
+    .await;
+    let second_challenge = accepted(
+        &app,
+        queue_json(&challenge_path(second_id), json!({"printer":"demo"})),
+        201,
+    )
+    .await;
+    accepted(
+        &app,
+        queue_json(&move_path(first_id), json!({"position":0})),
+        200,
+    )
+    .await;
+    let request = queue_dispatch(first_id, &first_challenge);
+    let dispatch_app = app.clone();
+    let dispatch = tokio::spawn(async move { send(&dispatch_app, request).await });
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .unwrap();
+    // The reservation must apply even when the attempted entry is now later in FIFO.
+    accepted(
+        &app,
+        queue_json(&move_path(second_id), json!({"position":0})),
+        200,
+    )
+    .await;
+    let printers = accepted(&app, get("/api/v1/printers"), 200).await;
+    assert_eq!(printers[0]["state"], "idle");
+    assert_eq!(printers[0]["needs_clearing"], false);
+    let proposals = accepted(&app, get("/api/v1/queue/proposals"), 200).await;
+    assert_eq!(proposals[0]["id"], second["id"]);
+    assert!(proposals
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p["printer"].is_null()));
+    assert_eq!(
+        send(
+            &app,
+            queue_json(&challenge_path(second_id), json!({"printer":"demo"}))
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send(&app, queue_dispatch(second_id, &second_challenge))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(backend.starts.load(Ordering::SeqCst), 1);
+    // A missing binding lookup must not silently release the unknown reservation.
+    gate.fail_lookup.store(true, Ordering::SeqCst);
+    assert_eq!(
+        send(&app, get("/api/v1/queue/proposals")).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    gate.fail_lookup.store(false, Ordering::SeqCst);
+    gate.release.notify_one();
+    let (status, _, _) = tokio::time::timeout(Duration::from_secs(5), dispatch)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    let entries = accepted(&app, get("/api/v1/queue"), 200).await;
+    assert_eq!(entries.as_array().unwrap().len(), 1);
+    assert_eq!(entries[0]["id"], second["id"]);
+    // After the first job completes, the remaining entry can be proposed and started.
+    clock.advance(120);
+    let proposals = accepted(&app, get("/api/v1/queue/proposals"), 200).await;
+    assert_eq!(proposals[0]["printer"], "demo");
+    let challenge = accepted(
+        &app,
+        queue_json(&challenge_path(second_id), json!({"printer":"demo"})),
+        201,
+    )
+    .await;
+    accepted(&app, queue_dispatch(second_id, &challenge), 200).await;
+    assert_eq!(backend.starts.load(Ordering::SeqCst), 2);
 }
