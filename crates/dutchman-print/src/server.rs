@@ -282,7 +282,12 @@ async fn initialize(app: &App) -> Result<(), Problem> {
             .map_err(internal)?;
         match crate::safety::read_state(&app.config.storage.data_dir.join("saved.json")).await {
             Ok(bytes) => {
-                *app.saved.lock().await = serde_json::from_slice(&bytes).map_err(internal)?
+                let saved: HashMap<String, Saved> =
+                    serde_json::from_slice(&bytes).map_err(internal)?;
+                for id in saved.keys() {
+                    crate::validate_job_id(id).map_err(internal)?;
+                }
+                *app.saved.lock().await = saved;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(internal(e)),
@@ -317,6 +322,9 @@ async fn challenge(
     State(app): State<Shared>,
     Json(intent): Json<Intent>,
 ) -> Result<impl IntoResponse, Problem> {
+    if let Some(id) = &intent.job {
+        crate::validate_job_id(id).map_err(bad)?;
+    }
     let challenge = app
         .confirmations
         .issue(
@@ -371,7 +379,10 @@ async fn expire(app: &App) -> Result<(), Problem> {
             _ => {}
         }
         app.backend.forget(&id).await.map_err(backend_error)?;
-        let _ = tokio::fs::remove_dir_all(app.config.storage.data_dir.join(&id)).await;
+        let _ = tokio::fs::remove_dir_all(
+            crate::job_dir(&app.config.storage.data_dir, &id).map_err(internal)?,
+        )
+        .await;
         app.saved.lock().await.remove(&id);
     }
     Ok(())
@@ -381,6 +392,7 @@ async fn printers(State(app): State<Shared>) -> Result<impl IntoResponse, Proble
     Ok(Json(app.backend.printers().await.map_err(backend_error)?))
 }
 async fn job(State(app): State<Shared>, Path(id): Path<String>) -> Result<Json<Job>, Problem> {
+    crate::validate_job_id(&id).map_err(bad)?;
     Ok(Json(app.backend.job(&id).await.map_err(backend_error)?))
 }
 async fn create(State(app): State<Shared>, request: Request) -> Result<impl IntoResponse, Problem> {
@@ -410,7 +422,7 @@ async fn create(State(app): State<Shared>, request: Request) -> Result<impl Into
         )
     })?;
     let id = crate::new_job_id().map_err(internal)?;
-    let dir = app.config.storage.data_dir.join(&id);
+    let dir = crate::job_dir(&app.config.storage.data_dir, &id).map_err(internal)?;
     tokio::fs::create_dir(&dir).await.map_err(internal)?;
     let result = create_in(&app, &id, &dir, request).await;
     if result.is_err() {
@@ -637,16 +649,18 @@ async fn create_in(
 }
 
 async fn preview(State(app): State<Shared>, Path(id): Path<String>) -> Result<Response, Problem> {
+    let dir = crate::job_dir(&app.config.storage.data_dir, &id).map_err(bad)?;
     let saved = app.saved.lock().await;
-    let path = saved
+    saved
         .get(&id)
         .and_then(|saved| saved.preview.as_ref())
         .ok_or_else(|| (StatusCode::NOT_FOUND, "This job has no preview.".into()))?;
-    let metadata = tokio::fs::metadata(path).await.map_err(internal)?;
+    let path = dir.join("preview.png");
+    let metadata = tokio::fs::metadata(&path).await.map_err(internal)?;
     if metadata.len() > 16 << 20 {
         return Err(internal("preview too big"));
     }
-    let bytes = tokio::fs::read(path).await.map_err(internal)?;
+    let bytes = tokio::fs::read(&path).await.map_err(internal)?;
     Ok(([(header::CONTENT_TYPE, "image/png")], bytes).into_response())
 }
 
@@ -687,6 +701,7 @@ async fn confirm(
     id: &str,
 ) -> Result<crate::confirmation::Observation, Problem> {
     let target = if matches!(action, "start" | "cancel") {
+        crate::validate_job_id(id).map_err(bad)?;
         app.backend
             .job_printer(id)
             .await

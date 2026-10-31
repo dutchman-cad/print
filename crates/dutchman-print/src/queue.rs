@@ -63,6 +63,13 @@ pub(super) async fn load(app: &App) -> Result<Vec<Entry>, Problem> {
             if entries.len() > 5000 {
                 return Err(internal("queue capacity"));
             }
+            for entry in &entries {
+                crate::validate_job_id(&entry.id).map_err(internal)?;
+                crate::validate_job_id(&entry.job).map_err(internal)?;
+                if let Some(id) = &entry.prepared {
+                    crate::validate_job_id(id).map_err(internal)?;
+                }
+            }
             Ok(entries)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -86,6 +93,7 @@ pub(super) async fn add(
     State(app): State<Shared>,
     Json(input): Json<Add>,
 ) -> Result<impl IntoResponse, Problem> {
+    crate::validate_job_id(&input.job).map_err(bad)?;
     for text in [&input.job, &input.target]
         .into_iter()
         .chain(input.profile.iter())
@@ -344,15 +352,13 @@ pub(super) async fn challenge(
             return Err(refused("Prepare and review the original job again."));
         }
         let new_id = crate::new_job_id().map_err(internal)?;
-        let dir = app.config.storage.data_dir.join(&new_id);
+        let dir = crate::job_dir(&app.config.storage.data_dir, &new_id).map_err(internal)?;
         let preparation = async {
             tokio::fs::create_dir(&dir).await.map_err(internal)?;
             let path = dir.join("input.3mf");
             tokio::fs::copy(
-                app.config
-                    .storage
-                    .data_dir
-                    .join(&entry.job)
+                crate::job_dir(&app.config.storage.data_dir, &entry.job)
+                    .map_err(internal)?
                     .join("input.3mf"),
                 &path,
             )

@@ -437,7 +437,8 @@ async fn command(
                 let name = dutchman_serve::upload::safe_name(
                     &file.file_name().unwrap_or_default().to_string_lossy(),
                 );
-                let dir = data.join(&id);
+                let dir = dutchman_print::job_dir(data, &id)
+                    .map_err(|message| dutchman_print::backend::Error::Refused(message.into()))?;
                 let estimate = prepare_cli(
                     backend,
                     &id,

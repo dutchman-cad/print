@@ -584,9 +584,8 @@ impl Backend for Simulated {
 }
 
 fn remove_job_files(path: &Path, id: &str) {
-    if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
-        if let Some(root) = path.parent() {
-            let _ = std::fs::remove_dir_all(root.join(id));
-        }
+    let Some(root) = path.parent() else { return };
+    if let Ok(dir) = crate::job_dir(root, id) {
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

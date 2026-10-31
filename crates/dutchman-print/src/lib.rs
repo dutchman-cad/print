@@ -32,6 +32,25 @@ pub fn new_job_id() -> Result<String, String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// Service jobs use generated 128-bit lowercase hexadecimal ids, never path components
+/// supplied by a request or restored state without checking them first.
+pub(crate) fn validate_job_id(id: &str) -> Result<(), &'static str> {
+    if id.len() != 32
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err("Use a generated job id of 32 lowercase hexadecimal characters.");
+    }
+    Ok(())
+}
+
+/// The single boundary for joining a service job id to the configured private data folder.
+pub fn job_dir(data_dir: &std::path::Path, id: &str) -> Result<std::path::PathBuf, &'static str> {
+    validate_job_id(id)?;
+    Ok(data_dir.join(id))
+}
+
 pub fn text_report(reports: &[Printer]) -> String {
     let mut text = String::new();
     for report in reports {
@@ -83,9 +102,11 @@ fn remove_older_than(data_dir: &std::path::Path, keep: std::time::Duration) {
             .is_some_and(|age| age > keep);
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let job = name.len() == 32 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-        if old && job {
-            let _ = std::fs::remove_dir_all(entry.path());
+        if !old {
+            continue;
+        }
+        if let Ok(dir) = job_dir(data_dir, &name) {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }

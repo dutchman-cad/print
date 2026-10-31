@@ -286,6 +286,14 @@ The service persists its separate job state in its private data folder. Only one
 use a data folder at once; after a killed process, remove `serve.lock` only once it has stopped. Tracked jobs are
 reloaded and reconciled from live status before control after a restart.
 
+### Private job paths
+
+Service job and queue entry ids are generated as 32 lowercase hexadecimal characters.
+Requests with malformed job ids are refused. Restored queue ids, source job ids, prepared
+job ids, and saved-job keys are checked before use; malformed state must be repaired or
+removed before the service can load it. Job folders stay below the configured data folder.
+Preview reads use the job folder's `preview.png`, never a path supplied in stored metadata.
+
 ## Print history
 
 Finished tracked jobs and bed-clear acknowledgements are saved in `history.jsonl` in

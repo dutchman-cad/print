@@ -656,3 +656,13 @@ or restart; a crash after success may leave this blocked entry in the queue. Rea
 `GET /api/v1/jobs/{prepared}` to reconcile the outcome. No queue request or background
 work automatically retries Start. Normal tracked-job controls remain available with
 their own fresh challenges. Removing an entry never cancels or retries its execution.
+
+### Service id validation
+
+Service job and queue entry ids contain exactly 32 lowercase hexadecimal characters.
+Malformed job ids in job routes, confirmation requests, and queue additions return 400.
+Queue and saved-job state loaded from disk must also contain valid ids; invalid state
+returns a generic 500 error before filesystem operations can use those ids. This does not
+change printer ids or backend-reported job identities. Preview paths are derived from the
+validated service job id and the fixed filename `preview.png`; stored preview paths are
+not followed. The JSON schemas are unchanged.
