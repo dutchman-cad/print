@@ -1,6 +1,6 @@
 //! In-memory demonstration backend. Optional external slicing; no printer connections.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -47,7 +47,12 @@ pub struct Simulated {
     jobs: Mutex<BTreeMap<String, Running>>,
     clock: Arc<dyn Clock>,
     slicers: BTreeMap<String, crate::slicer::Slicer>,
+    /// Printers whose configured external job has been stopped.
+    ended_external: Mutex<BTreeSet<String>>,
 }
+
+/// Identity of the job a scenario printer reports without Print having started it.
+const EXTERNAL_ID: &str = "external";
 
 impl Simulated {
     pub fn new(config: crate::config::Config, clock: Arc<dyn Clock>) -> Result<Self, String> {
@@ -65,8 +70,48 @@ impl Simulated {
             slicers,
             printers: config.printers,
             jobs: Mutex::new(BTreeMap::new()),
+            ended_external: Mutex::new(BTreeSet::new()),
             clock,
         })
+    }
+
+    fn config(&self, printer: &str) -> Option<&crate::config::Printer> {
+        self.printers.iter().find(|p| p.id == printer)
+    }
+
+    fn offline(&self, printer: &str) -> bool {
+        self.config(printer).is_some_and(|p| p.offline)
+    }
+
+    /// The external job name while the printer still reports it.
+    fn external(&self, printer: &str) -> Option<&str> {
+        let name = self.config(printer)?.external_job.as_deref()?;
+        let ended = self.ended_external.lock().ok()?;
+        (!ended.contains(printer)).then_some(name)
+    }
+
+    /// Start-blocking scenario for this printer, as the real backends refuse it.
+    fn refuse_start(&self, printer: &str) -> Result<(), Error> {
+        if self.offline(printer) {
+            return Err(Error::Unavailable);
+        }
+        match self.config(printer).and_then(|p| p.fault.as_deref()) {
+            Some("error") => {
+                return Err(Error::Refused(
+                    "The printer reports an error. Clear it on the printer first.".into(),
+                ))
+            }
+            Some(_) => {
+                return Err(Error::Refused(
+                    "The printer needs attention. Check it first.".into(),
+                ))
+            }
+            None => {}
+        }
+        if self.external(printer).is_some() {
+            return Err(Error::Busy);
+        }
+        Ok(())
     }
 
     /// CLI snapshots contain only simulation state, never backend credentials.
@@ -140,7 +185,18 @@ impl Simulated {
                 running.job.progress =
                     Some((elapsed.as_secs_f64() / seconds as f64).clamp(0.0, 1.0));
                 running.job.seconds_left = Some(seconds.saturating_sub(elapsed.as_secs()));
-                if elapsed >= Duration::from_secs(seconds) {
+                let fail_after = self
+                    .printers
+                    .iter()
+                    .find(|p| p.id == running.job.printer)
+                    .and_then(|p| p.fail_after_seconds)
+                    .filter(|after| *after < seconds);
+                if fail_after.is_some_and(|after| elapsed >= Duration::from_secs(after)) {
+                    running.job.state = JobState::Failed;
+                    running.job.seconds_left = None;
+                    running.job.detail = Some("The simulated printer failed the job.".into());
+                    running.since = None;
+                } else if elapsed >= Duration::from_secs(seconds) {
                     running.job.state = JobState::Done;
                     running.since = None;
                 }
@@ -162,6 +218,14 @@ impl Simulated {
     fn change(&self, printer: &str, pause: bool) -> Result<Job, Error> {
         if !self.printers.iter().any(|p| p.id == printer) {
             return Err(Error::NotFound);
+        }
+        if self.offline(printer) {
+            return Err(Error::Unavailable);
+        }
+        if self.external(printer).is_some() {
+            return Err(Error::Refused(
+                "Print did not start this job, so it cannot pause or resume it. Use Stop.".into(),
+            ));
         }
         let mut jobs = self.jobs()?;
         let running = jobs
@@ -208,6 +272,47 @@ impl Backend for Simulated {
         ))
     }
 
+    fn check_action(&self, printer: &str, action: &str) -> Result<(), Error> {
+        if self.offline(printer) {
+            return Err(Error::Unavailable);
+        }
+        if self.controls(printer).contains(&action) {
+            Ok(())
+        } else {
+            Err(Error::Refused(format!(
+                "This printer does not support {action}. Choose a supported control."
+            )))
+        }
+    }
+
+    fn check_control(&self, printer: &str) -> Result<(), Error> {
+        if self.offline(printer) {
+            Err(Error::Unavailable)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A bed sensor reports a clear bed only while the printer is idle and healthy.
+    fn bed_ready(&self, printer: &str, _detail: Option<&str>) -> bool {
+        let Some(config) = self.config(printer) else {
+            return false;
+        };
+        if !config.bed_sensor
+            || config.offline
+            || config.fault.is_some()
+            || self.external(printer).is_some()
+        {
+            return false;
+        }
+        self.jobs().is_ok_and(|jobs| {
+            !jobs.values().any(|r| {
+                r.job.printer == printer
+                    && matches!(r.job.state, JobState::Printing | JobState::Paused)
+            })
+        })
+    }
+
     fn restore_jobs<'a>(&'a self, path: &'a Path) -> Reply<'a, ()> {
         Box::pin(async move {
             self.restore_inner(path, true).map_err(Error::Failed)?;
@@ -231,7 +336,7 @@ impl Backend for Simulated {
                                 && matches!(r.job.state, JobState::Printing | JobState::Paused)
                         })
                         .map(|r| &r.job);
-                    Printer {
+                    let mut printer = Printer {
                         controls: self.controls(&p.id).into_iter().map(String::from).collect(),
                         detail: None,
                         needs_clearing: None,
@@ -250,7 +355,38 @@ impl Backend for Simulated {
                         seconds_left: active.and_then(|j| j.seconds_left),
                         nozzle_temperature: active.map(|_| 210.0),
                         bed_temperature: active.map(|_| 60.0),
+                    };
+                    if p.offline {
+                        printer.state = PrinterState::Offline;
+                        printer.detail = Some("The simulated printer is offline.".into());
+                        printer.job_id = None;
+                        printer.job_name = None;
+                        printer.progress = None;
+                        printer.seconds_left = None;
+                        printer.nozzle_temperature = None;
+                        printer.bed_temperature = None;
+                    } else if let Some(name) = self.external(&p.id) {
+                        printer.state = PrinterState::Printing;
+                        printer.job_id = Some(EXTERNAL_ID.into());
+                        printer.job_name = Some(name.into());
+                        printer.nozzle_temperature = Some(210.0);
+                        printer.bed_temperature = Some(60.0);
+                    } else if let Some(fault) = p.fault.as_deref() {
+                        let (state, detail) = if fault == "error" {
+                            (
+                                PrinterState::Error,
+                                "The simulated printer reports an error.",
+                            )
+                        } else {
+                            (
+                                PrinterState::Attention,
+                                "The simulated printer needs attention.",
+                            )
+                        };
+                        printer.state = state;
+                        printer.detail = Some(detail.into());
                     }
+                    printer
                 })
                 .collect())
         })
@@ -265,6 +401,9 @@ impl Backend for Simulated {
     ) -> Reply<'a, Estimate> {
         Box::pin(async move {
             options.validate().map_err(Error::Refused)?;
+            if self.offline(printer) {
+                return Err(Error::Unavailable);
+            }
             let profile = self
                 .printers
                 .iter()
@@ -334,6 +473,7 @@ impl Backend for Simulated {
             if target.job.state != JobState::Ready {
                 return Err(Error::Refused("Only a ready job can be started.".into()));
             }
+            self.refuse_start(&target.job.printer)?;
             if jobs.values().any(|r| {
                 r.job.printer == target.job.printer
                     && matches!(r.job.state, JobState::Printing | JobState::Paused)
@@ -351,6 +491,9 @@ impl Backend for Simulated {
         Box::pin(async move {
             let mut jobs = self.jobs()?;
             let target = jobs.get_mut(job).ok_or(Error::NotFound)?;
+            if self.offline(&target.job.printer) {
+                return Err(Error::Unavailable);
+            }
             if !matches!(
                 target.job.state,
                 JobState::Ready | JobState::Printing | JobState::Paused
@@ -371,7 +514,20 @@ impl Backend for Simulated {
         _path: Option<&'a str>,
     ) -> Reply<'a, Printer> {
         Box::pin(async move {
-            {
+            if self.offline(printer) {
+                return Err(Error::Unavailable);
+            }
+            if let Some(external) = self.external(printer) {
+                if identity != EXTERNAL_ID || name != external {
+                    return Err(Error::Refused(
+                        "The live job changed. Read fresh status and confirm Stop again.".into(),
+                    ));
+                }
+                self.ended_external
+                    .lock()
+                    .map_err(|_| Error::Unavailable)?
+                    .insert(printer.into());
+            } else {
                 let mut jobs = self.jobs()?;
                 let target = jobs
                     .values_mut()

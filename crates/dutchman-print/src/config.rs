@@ -84,6 +84,70 @@ pub struct Printer {
     pub printer_profile: Option<String>,
     pub print_profile: Option<String>,
     pub filament_profile: Option<String>,
+    /// Simulated backend only: the printer is unreachable.
+    #[serde(default)]
+    pub offline: bool,
+    /// Simulated backend only: report `error` or `attention`.
+    pub fault: Option<String>,
+    /// Simulated backend only: report printing a job Print did not start.
+    pub external_job: Option<String>,
+    /// Simulated backend only: a started job ends as failed after this many seconds.
+    pub fail_after_seconds: Option<u64>,
+    /// Simulated backend only: a sensor reports a clear bed, so no acknowledgement is needed.
+    #[serde(default)]
+    pub bed_sensor: bool,
+}
+
+impl Printer {
+    fn has_scenario(&self) -> bool {
+        self.offline
+            || self.fault.is_some()
+            || self.external_job.is_some()
+            || self.fail_after_seconds.is_some()
+            || self.bed_sensor
+    }
+
+    fn validate_scenario(&self) -> Result<(), String> {
+        if !self.has_scenario() {
+            return Ok(());
+        }
+        if let Some(fault) = &self.fault {
+            if !matches!(fault.as_str(), "error" | "attention") {
+                return Err(format!(
+                    "Printer {} sets fault to {fault:?}. Use \"error\" or \"attention\".",
+                    self.id
+                ));
+            }
+        }
+        if let Some(name) = &self.external_job {
+            if name.trim().is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+                return Err(format!(
+                    "Printer {} needs a plain external_job name of at most 256 bytes.",
+                    self.id
+                ));
+            }
+        }
+        if self
+            .fail_after_seconds
+            .is_some_and(|s| s == 0 || s > 31_536_000)
+        {
+            return Err(format!(
+                "Printer {} sets fail_after_seconds outside 1 to 31536000.",
+                self.id
+            ));
+        }
+        if u8::from(self.offline)
+            + u8::from(self.fault.is_some())
+            + u8::from(self.external_job.is_some())
+            > 1
+        {
+            return Err(format!(
+                "Printer {} sets more than one of offline, fault, and external_job. Choose one.",
+                self.id
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Config {
@@ -170,6 +234,14 @@ impl Config {
         }
         let mut ids = HashSet::new();
         for printer in &self.printers {
+            if self.backend.kind == "simulated" {
+                printer.validate_scenario()?;
+            } else if printer.has_scenario() {
+                return Err(format!(
+                    "Printer {} sets a simulation scenario. Scenario settings work only with the simulated backend.",
+                    printer.id
+                ));
+            }
             if self.backend.kind == "printers" {
                 if !printer
                     .kind

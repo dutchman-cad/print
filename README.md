@@ -43,7 +43,7 @@ Choose `simulated` in step 2 to try Print without a printer.
 
 | Printer or software | `kind` | Status | Control |
 | --- | --- | --- | --- |
-| Simulated printers | `simulated` | Built in, for trying the API | Start, pause, resume, cancel, Stop |
+| Simulated printers | `simulated` | Built in, for trying the API; can simulate an offline or faulty printer, an outside job, failing jobs, and a bed sensor | Start, pause, resume, cancel, Stop |
 | Prusa printers with PrusaLink | `prusalink` | Simulated only | Start, pause, resume, cancel, Stop |
 | OctoPrint | `octoprint` | Simulated only | Start, pause, resume, cancel, Stop |
 | Klipper with Moonraker | `moonraker` | Simulated only | Start, pause, resume, cancel, Stop |

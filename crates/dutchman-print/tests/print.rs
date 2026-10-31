@@ -2168,3 +2168,191 @@ async fn persistent_history_api_archives_before_expiry_and_keeps_confirmation_ch
         StatusCode::INTERNAL_SERVER_ERROR
     );
 }
+
+fn scenario_app(dir: &Path, extra: &str) -> (Router, Arc<TestClock>) {
+    let clock = Arc::new(TestClock::default());
+    let config: Config = toml::from_str(&format!("{CONFIG}{extra}")).unwrap();
+    let simulated = Arc::new(Simulated::new(config, clock.clone()).unwrap());
+    (router(simulated, settings(dir, clock.clone())), clock)
+}
+async fn demo_status(app: &Router) -> Value {
+    let all = accepted(app, get("/api/v1/printers"), 200).await;
+    all.as_array().unwrap()[0].clone()
+}
+async fn try_challenge(app: &Router, action: &str, job: Option<&str>) -> StatusCode {
+    send(
+        app,
+        Request::post("/api/v1/confirmations")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"action":action,"printer":"demo","job":job}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+    .0
+}
+async fn upload_job(app: &Router) -> Result<Value, StatusCode> {
+    let (status, _, body) = send(
+        app,
+        upload(
+            &[("bracket.3mf", &model())],
+            &[("printer", "demo"), ("name", "Bracket")],
+        ),
+    )
+    .await;
+    if status == StatusCode::CREATED {
+        Ok(serde_json::from_slice(&body).unwrap())
+    } else {
+        Err(status)
+    }
+}
+
+#[tokio::test]
+async fn default_simulated_printer_is_healthy_and_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = scenario_app(dir.path(), "");
+    let printer = demo_status(&app).await;
+    assert_eq!(printer["state"], "idle");
+    assert!(printer["detail"].is_null());
+    assert_eq!(printer["needs_clearing"], true);
+    let job = ready(&app).await;
+    assert_eq!(job["state"], "ready");
+}
+
+#[tokio::test]
+async fn offline_scenario_reports_offline_and_refuses_every_action() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = scenario_app(dir.path(), "offline = true\n");
+    let printer = demo_status(&app).await;
+    assert_eq!(printer["state"], "offline");
+    assert!(printer["detail"].as_str().is_some());
+    assert!(printer["job_name"].is_null());
+    assert_eq!(
+        upload_job(&app).await.unwrap_err(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    for action in ["start", "clear", "stop", "pause", "resume", "cancel"] {
+        assert_ne!(
+            try_challenge(&app, action, None).await,
+            StatusCode::CREATED,
+            "{action}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fault_scenarios_report_their_state_and_refuse_start() {
+    for (fault, state) in [("error", "error"), ("attention", "attention")] {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, _) = scenario_app(dir.path(), &format!("fault = \"{fault}\"\n"));
+        let printer = demo_status(&app).await;
+        assert_eq!(printer["state"], state);
+        assert!(printer["detail"].as_str().unwrap().contains("simulated"));
+        let job = upload_job(&app).await.unwrap();
+        let id = job["id"].as_str().unwrap();
+        assert_ne!(
+            try_challenge(&app, "start", Some(id)).await,
+            StatusCode::CREATED
+        );
+        // The backend itself refuses too, not only the safety layer.
+        let config: Config = toml::from_str(&format!("{CONFIG}fault = \"{fault}\"\n")).unwrap();
+        let clock = Arc::new(TestClock::default());
+        let simulated = Simulated::new(config, clock).unwrap();
+        let path = dir.path().join("job.3mf");
+        std::fs::write(&path, model()).unwrap();
+        simulated
+            .prepare("j1", &path, "demo", Options::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            simulated.start("j1").await,
+            Err(Error::Refused(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn external_job_scenario_is_busy_and_stops_with_a_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _) = scenario_app(dir.path(), "external_job = \"Someone else's part\"\n");
+    let printer = demo_status(&app).await;
+    assert_eq!(printer["state"], "printing");
+    assert_eq!(printer["job_name"], "Someone else's part");
+    let job = upload_job(&app).await.unwrap();
+    let id = job["id"].as_str().unwrap();
+    assert_ne!(
+        try_challenge(&app, "start", Some(id)).await,
+        StatusCode::CREATED
+    );
+    let token = dutchman_print::new_job_id().unwrap().repeat(2);
+    let request = action("/api/v1/printers/demo/stop", Some(&token));
+    assert_eq!(send(&app, request).await.0, StatusCode::FORBIDDEN);
+    let request = confirmed(&app, "/api/v1/printers/demo/stop", &token).await;
+    let stopped = accepted(&app, request, 200).await;
+    assert_eq!(stopped["state"], "idle");
+    assert!(stopped["job_name"].is_null());
+    assert_eq!(demo_status(&app).await["state"], "idle");
+}
+
+#[tokio::test]
+async fn fail_after_seconds_ends_the_job_as_failed_and_records_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, clock) = scenario_app(dir.path(), "fail_after_seconds = 20\n");
+    let job = ready(&app).await;
+    let id = job["id"].as_str().unwrap();
+    let token = dutchman_print::new_job_id().unwrap().repeat(2);
+    let request = confirmed(&app, &format!("/api/v1/jobs/{id}/start"), &token).await;
+    accepted(&app, request, 200).await;
+    clock.advance(10);
+    let running = accepted(&app, get(&format!("/api/v1/jobs/{id}")), 200).await;
+    assert_eq!(running["state"], "printing");
+    clock.advance(10);
+    let failed = accepted(&app, get(&format!("/api/v1/jobs/{id}")), 200).await;
+    assert_eq!(failed["state"], "failed");
+    assert!(failed["detail"].as_str().is_some());
+    let rows = accepted(&app, get("/api/v1/history?outcome=failed"), 200).await;
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["job_id"], id);
+    // The bed still needs a check after a failure.
+    assert_eq!(demo_status(&app).await["needs_clearing"], true);
+}
+
+#[tokio::test]
+async fn bed_sensor_scenario_needs_no_acknowledgement() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, clock) = scenario_app(dir.path(), "bed_sensor = true\n");
+    assert_eq!(demo_status(&app).await["needs_clearing"], false);
+    // No clear acknowledgement before the start.
+    let job = upload_job(&app).await.unwrap();
+    let id = job["id"].as_str().unwrap();
+    let token = dutchman_print::new_job_id().unwrap().repeat(2);
+    let request = confirmed(&app, &format!("/api/v1/jobs/{id}/start"), &token).await;
+    accepted(&app, request, 200).await;
+    assert_eq!(demo_status(&app).await["state"], "printing");
+    clock.advance(3600);
+    let printer = demo_status(&app).await;
+    assert_eq!(printer["state"], "idle");
+    assert_eq!(printer["needs_clearing"], false);
+}
+
+#[test]
+fn scenario_settings_are_validated() {
+    for extra in [
+        "fault = \"melted\"\n",
+        "external_job = \"\"\n",
+        "fail_after_seconds = 0\n",
+        "offline = true\nfault = \"error\"\n",
+        "fault = \"error\"\nexternal_job = \"x\"\n",
+    ] {
+        let error = Config::from_text(&format!("{CONFIG}{extra}"), None)
+            .err()
+            .unwrap();
+        assert!(error.contains("demo"), "{extra}: {error}");
+    }
+    let real = "[backend]\nkind = \"printers\"\n[[printers]]\nid = \"demo\"\nname = \"D\"\nmodel = \"M\"\nkind = \"octoprint\"\noffline = true\n";
+    assert!(Config::from_text(real, None)
+        .err()
+        .unwrap()
+        .contains("only with the simulated backend"));
+}
