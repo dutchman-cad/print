@@ -73,3 +73,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --locked
+
+  # Release builds of every push to main and every pull request, so nobody needs to
+  # build dutchman-print locally to try a change. Download them from the run's artifacts.
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            exe: dutchman-print
+          - os: macos-latest
+            exe: dutchman-print
+          - os: windows-latest
+            exe: dutchman-print.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: binaries
+      - run: cargo build --release --locked -p dutchman-print --bin dutchman-print
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dutchman-print-${{ runner.os }}-${{ runner.arch }}
+          path: target/release/${{ matrix.exe }}
+          if-no-files-found: error
+          retention-days: 14
