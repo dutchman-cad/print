@@ -835,16 +835,18 @@ impl Backend for Safety {
             let ids = {
                 let mut records = self.history_pending.records.lock().await;
                 let mut ids = Vec::new();
+                let mut changed = false;
                 for record in records
                     .values_mut()
                     .filter(|record| record.printer == printer && record.started_at.is_some())
                 {
                     record.outcome = "stopped".into();
+                    changed = true;
                     if let Some(id) = &record.job_id {
                         ids.push(id.clone());
                     }
                 }
-                if !ids.is_empty() {
+                if changed {
                     self.checkpoint_history(&records);
                 }
                 ids
