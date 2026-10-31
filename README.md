@@ -68,7 +68,8 @@ Print farms can keep a persistent FIFO job queue, review suitable idle printers,
 and dispatch each job with a fresh human confirmation. Queue commands support adding,
 listing, moving, removing, proposing, and dispatching jobs. Attempted dispatches
 reserve their printers until their entries leave the queue. See
-[Print farm queue](docs/print.md#print-farm-queue).
+[Print farm queue](docs/print.md#print-farm-queue), or follow the
+[print farm guide](docs/farm.md).
 
 ## Build from source
 
@@ -108,7 +109,8 @@ dutchman-print --config config.toml serve --listen 127.0.0.1:8730 --data-dir pri
 ```
 
 The simulated backend contacts no printers and needs no slicer by default.
-See the [companion guide](docs/print.md) for preparing jobs, slicing, and backend setup,
+See the [print farm guide](docs/farm.md) for running several printers, the
+[companion guide](docs/print.md) for preparing jobs, slicing, and backend setup,
 and the [job API v1 specification](docs/print-api.md) for clients.
 The SolidCraft plugin lives in [dutchman-cad/plugins](https://github.com/dutchman-cad/plugins).
 
