@@ -2356,3 +2356,106 @@ fn scenario_settings_are_validated() {
         .unwrap()
         .contains("only with the simulated backend"));
 }
+
+#[tokio::test]
+async fn service_job_traversal_is_refused_at_request_and_restore_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    std::fs::create_dir(&root).unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("input.3mf"), b"must remain untouched").unwrap();
+    let clock = Arc::new(TestClock::default());
+    let app = router(simulation(clock.clone()), settings(&root, clock.clone()));
+    for job in [
+        "../outside",
+        "..\\outside",
+        "/outside",
+        "C:\\outside",
+        "",
+        "saved.json",
+    ] {
+        let response = send(
+            &app,
+            queue_json("/api/v1/queue", json!({"job":job,"target":"any"})),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::BAD_REQUEST, "{job}");
+        assert!(dutchman_print::job_dir(&root, job).is_err());
+    }
+    for route in [
+        "/api/v1/jobs/..%2Foutside",
+        "/api/v1/jobs/..%2Foutside/preview.png",
+    ] {
+        assert_eq!(send(&app, get(route)).await.0, StatusCode::NOT_FOUND);
+    }
+    drop(app);
+    let valid = "0123456789abcdef0123456789abcdef";
+    for field in ["id", "job", "prepared"] {
+        let mut entry = json!({"id":valid,"job":valid,"target":"any","profile":null,
+            "kind":null,"reason":null,"prepared":null,"attempted":false});
+        entry[field] = json!("../outside");
+        std::fs::write(
+            root.join("queue.json"),
+            serde_json::to_vec(&vec![entry]).unwrap(),
+        )
+        .unwrap();
+        let app = router(simulation(clock.clone()), settings(&root, clock.clone()));
+        assert_eq!(
+            send(&app, get("/api/v1/queue")).await.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{field}"
+        );
+    }
+    std::fs::remove_file(root.join("queue.json")).unwrap();
+    // Expiry must refuse hostile restored ids before attempting recursive removal.
+    std::fs::write(
+        root.join("saved.json"),
+        br#"{"../outside":{"created":{"secs":0,"nanos":0},"preview":null,"options":{}}}"#,
+    )
+    .unwrap();
+    clock.advance(7200);
+    let app = router(simulation(clock.clone()), settings(&root, clock));
+    assert_eq!(
+        send(&app, get("/api/v1/jobs/0123456789abcdef0123456789abcdef"))
+            .await
+            .0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        std::fs::read(outside.join("input.3mf")).unwrap(),
+        b"must remain untouched"
+    );
+}
+
+#[tokio::test]
+async fn service_preview_ignores_paths_in_restored_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    let id = "0123456789abcdef0123456789abcdef";
+    let job_dir = dutchman_print::job_dir(&root, id).unwrap();
+    std::fs::create_dir_all(&job_dir).unwrap();
+    let outside = dir.path().join("private.png");
+    std::fs::write(&outside, b"private data").unwrap();
+    let expected = b"\x89PNG\r\n\x1a\nsynthetic preview";
+    std::fs::write(job_dir.join("preview.png"), expected).unwrap();
+    let state = json!({id: {"created":{"secs":0,"nanos":0},"preview":outside,"options":{}}});
+    std::fs::write(root.join("saved.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+    let clock = Arc::new(TestClock::default());
+    let app = router(simulation(clock.clone()), settings(&root, clock));
+    let response = app
+        .oneshot(get(&format!("/api/v1/jobs/{id}/preview.png")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .as_ref(),
+        expected
+    );
+}
