@@ -19,8 +19,6 @@ struct State {
     clearance: HashMap<String, (std::time::Duration, std::time::Duration)>,
     reviews: HashMap<String, Review>,
     #[serde(default)]
-    history: HashMap<String, crate::history::Record>,
-    #[serde(default)]
     job_names: HashMap<String, Option<String>>,
     #[serde(default)]
     terminal_seen: HashMap<String, bool>,
@@ -39,6 +37,7 @@ enum HistoryTask {
     Clear(crate::history::Record),
     Stop(Vec<String>),
     Poll(bool, Vec<crate::history::Record>),
+    Started(String, String),
 }
 
 #[derive(Clone)]
@@ -46,7 +45,7 @@ pub struct Safety {
     inner: Arc<dyn Backend>,
     state: Arc<Mutex<State>>,
     stops: Arc<Mutex<HashMap<String, bool>>>,
-    history_writes: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    history_pending: Arc<crate::history_pending::Pending>,
     history_poll: Arc<Mutex<()>>,
     history_tasks: Arc<tokio::sync::Semaphore>,
     store: Option<std::path::PathBuf>,
@@ -116,7 +115,7 @@ impl Safety {
             inner,
             state: Arc::new(Mutex::new(State::default())),
             stops: Arc::new(Mutex::new(HashMap::new())),
-            history_writes: Arc::new(Mutex::new(HashMap::new())),
+            history_pending: Arc::new(crate::history_pending::Pending::default()),
             history_poll: Arc::new(Mutex::new(())),
             history_tasks: Arc::new(tokio::sync::Semaphore::new(64)),
             store: None,
@@ -157,6 +156,14 @@ impl Safety {
                         }
                         Ok(())
                     }
+                    HistoryTask::Started(id, time) => {
+                        let mut records = safety.history_pending.records.lock().await;
+                        if let Some(record) = records.get_mut(&id) {
+                            record.started_at = Some(time);
+                        }
+                        safety.checkpoint_history(&records);
+                        Ok(())
+                    }
                     HistoryTask::Poll(restarting, records) => {
                         safety.poll_history_records(restarting, records).await
                     }
@@ -180,26 +187,43 @@ impl Safety {
         let records = self.history_records(restarting).await;
         self.queue_history(HistoryTask::Poll(restarting, records));
     }
-    /// Explicit history reads and CLI shutdown can wait for pending audit writes.
-    /// Machine actions and status reads never call this barrier.
+    /// Waits for in-flight history writes. Only history reads and CLI shutdown
+    /// call this barrier; machine actions and status reads never call it.
     pub async fn flush_history(&self) {
-        let _permits = self.history_tasks.clone().acquire_many_owned(64).await;
+        let permits = self.history_tasks.clone().acquire_many_owned(64).await;
+        drop(permits);
+        self.history_pending.flush().await;
     }
-    async fn history_lock(&self, printer: &str) -> Result<tokio::sync::OwnedMutexGuard<()>, Error> {
-        let mut locks = self.history_writes.lock().await;
-        if locks.len() >= 64 && !locks.contains_key(printer) {
-            return Err(Error::Unavailable);
+    fn history_pending_path(&self) -> Option<std::path::PathBuf> {
+        let root = self.history_root.as_ref()?;
+        match &self.store {
+            Some(store) if store.file_name().is_some_and(|name| name != "safety.json") => {
+                Some(store.with_extension("history-pending.json"))
+            }
+            _ => Some(root.join("history-pending.json")),
         }
-        let lock = locks.entry(printer.into()).or_default().clone();
-        drop(locks);
-        Ok(lock.lock_owned().await)
+    }
+    fn checkpoint_history(&self, records: &crate::history_pending::Records) {
+        if let Some(path) = self.history_pending_path() {
+            self.history_pending.changed(&path, records);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn history_write_hook(&self) -> Arc<crate::history_pending::WriteHook> {
+        self.history_pending.hook.clone()
     }
     async fn record_job(&self, job: &Job, outcome: Option<&str>) -> Result<(), Error> {
         let Some(root) = &self.history_root else {
             return Ok(());
         };
-        let _write = self.history_lock(&job.printer).await?;
-        let Some(mut record) = self.state.lock().await.history.get(&job.id).cloned() else {
+        let Some(mut record) = self
+            .history_pending
+            .records
+            .lock()
+            .await
+            .get(&job.id)
+            .cloned()
+        else {
             return Ok(());
         };
         let terminal = match job.state {
@@ -220,9 +244,16 @@ impl Safety {
             u64::try_from((end - start).whole_seconds()).ok()
         });
         crate::history::append(root, &record).await?;
-        let mut state = self.state.lock().await;
-        state.history.remove(&job.id);
-        self.checkpoint(&state).await
+        let mut records = self.history_pending.records.lock().await;
+        // An older result must not remove a new execution of the same job id.
+        if records
+            .get(&job.id)
+            .is_some_and(|pending| pending.started_at == record.started_at)
+        {
+            records.remove(&job.id);
+            self.checkpoint_history(&records);
+        }
+        Ok(())
     }
     /// Polling only reads backend jobs; it never sends machine commands.
     pub async fn poll_history(&self, restarting: bool) -> Result<(), Error> {
@@ -233,10 +264,10 @@ impl Safety {
         self.poll_history_records(restarting, records).await
     }
     async fn history_records(&self, restarting: bool) -> Vec<crate::history::Record> {
-        self.state
+        self.history_pending
+            .records
             .lock()
             .await
-            .history
             .values()
             .filter(|r| restarting || r.started_at.is_some())
             .cloned()
@@ -282,10 +313,9 @@ impl Safety {
                     }
                 }
                 Ok(Err(Error::NotFound)) if record.started_at.is_none() => {
-                    let mut state = self.state.lock().await;
-                    state.history.remove(id);
-                    state.reviews.remove(id);
-                    self.checkpoint(&state).await?;
+                    let mut records = self.history_pending.records.lock().await;
+                    records.remove(id);
+                    self.checkpoint_history(&records);
                 }
                 _ if restarting && record.started_at.is_some() => {
                     let job = Job {
@@ -307,13 +337,14 @@ impl Safety {
         Ok(())
     }
     pub async fn history_source(&self, id: &str, source: &str) -> Result<(), Error> {
-        let mut state = self.state.lock().await;
-        if let Some(record) = state.history.get_mut(id) {
+        let mut records = self.history_pending.records.lock().await;
+        if let Some(record) = records.get_mut(id) {
             let label = crate::history::label(source);
             if record.printer_kind == "simulated" {
                 record.file_name = Some(label.clone());
             }
             record.source = Some(label);
+            self.checkpoint_history(&records);
         }
         Ok(())
     }
@@ -387,7 +418,10 @@ impl Safety {
     }
     async fn checkpoint(&self, state: &State) -> Result<(), Error> {
         if let Some(path) = &self.store {
-            let bytes = serde_json::to_vec(state).map_err(|_| Error::Unavailable)?;
+            let bytes = self
+                .history_pending
+                .safety_bytes(state)
+                .map_err(|_| Error::Unavailable)?;
             write_state(path, &bytes)
                 .await
                 .map_err(|_| Error::Unavailable)?;
@@ -399,8 +433,7 @@ impl Safety {
             Ok(bytes) if bytes.len() <= 16 << 20 => {
                 let state: State = serde_json::from_slice(&bytes)
                     .map_err(|_| "Cannot read safety state. Check the private data folder.")?;
-                if state.history.len() > 5000
-                    || state.reviews.len() > 5000
+                if state.reviews.len() > 5000
                     || state.observed.len() > 64
                     || state.job_names.len() > 64
                     || state.terminal_seen.len() > 64
@@ -410,15 +443,26 @@ impl Safety {
                     );
                 }
                 *self.state.lock().await = state;
+                if let Some(pending) = self.history_pending_path() {
+                    self.history_pending.restore(&pending, Some(&bytes)).await;
+                }
                 Ok(())
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(pending) = self.history_pending_path() {
+                    self.history_pending.restore(&pending, None).await;
+                }
+                Ok(())
+            }
             _ => Err("Cannot read safety state. Check the private data folder.".into()),
         }
     }
     pub async fn save(&self, path: &Path) -> Result<(), String> {
         let state = self.state.lock().await;
-        let bytes = serde_json::to_vec(&*state).map_err(|_| "Cannot save safety state.")?;
+        let bytes = self
+            .history_pending
+            .safety_bytes(&*state)
+            .map_err(|_| "Cannot save safety state.")?;
         write_state(path, &bytes)
             .await
             .map_err(|_| "Cannot save safety state.".into())
@@ -638,8 +682,15 @@ impl Backend for Safety {
                     hash: digest,
                 },
             );
+            drop(state);
             if let Some(record) = record {
-                state.history.insert(id.into(), record);
+                let mut records = self.history_pending.records.lock().await;
+                if records.len() < 5000 {
+                    records.insert(id.into(), record);
+                    self.checkpoint_history(&records);
+                } else {
+                    crate::history::log_error();
+                }
             }
             Ok(estimate)
         })
@@ -707,11 +758,17 @@ impl Backend for Safety {
             }
             // A failed or uncertain start can still have moved the machine.
             state.cleared.insert(job.printer.clone(), false);
-            if let Some(record) = state.history.get_mut(id) {
-                record.started_at = Some(crate::history::now());
-            }
             self.checkpoint(&state).await?;
             drop(state);
+            let time = crate::history::now();
+            if let Ok(mut records) = self.history_pending.records.try_lock() {
+                if let Some(record) = records.get_mut(id) {
+                    record.started_at = Some(time);
+                }
+                self.checkpoint_history(&records);
+            } else {
+                self.queue_history(HistoryTask::Started(id.into(), time));
+            }
             let result = self.inner.start(id).await;
             if self.stops.lock().await.get(id).copied().unwrap_or(false) {
                 // Backends reconcile uncertain starts and verify the live job before cancelling.
@@ -768,31 +825,29 @@ impl Backend for Safety {
     ) -> Reply<'a, Printer> {
         Box::pin(async move {
             self.inner.check_action(printer, "stop")?;
+            let result = self.inner.stop(printer, identity, name, path).await;
             self.state
                 .lock()
                 .await
                 .cleared
                 .insert(printer.into(), false);
-            let ids: Vec<_> = self
-                .state
-                .lock()
-                .await
-                .history
-                .values()
-                .filter(|r| r.printer == printer && r.started_at.is_some())
-                .filter_map(|r| r.job_id.clone())
-                .collect();
-            let result = self.inner.stop(printer, identity, name, path).await?;
-            {
-                let mut state = self.state.lock().await;
-                for id in &ids {
-                    if let Some(record) = state.history.get_mut(id) {
-                        record.outcome = "stopped".into();
+            let ids = {
+                let mut records = self.history_pending.records.lock().await;
+                let mut ids = Vec::new();
+                for record in records
+                    .values_mut()
+                    .filter(|record| record.printer == printer && record.started_at.is_some())
+                {
+                    record.outcome = "stopped".into();
+                    if let Some(id) = &record.job_id {
+                        ids.push(id.clone());
                     }
                 }
-            }
+                self.checkpoint_history(&records);
+                ids
+            };
             self.queue_history(HistoryTask::Stop(ids));
-            Ok(result)
+            result
         })
     }
     fn pause<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
@@ -853,7 +908,9 @@ impl Backend for Safety {
             }) {
                 self.record_job_best_effort(&job);
             } else {
-                self.state.lock().await.history.remove(id);
+                let mut records = self.history_pending.records.lock().await;
+                records.remove(id);
+                self.checkpoint_history(&records);
             }
             self.state.lock().await.reviews.remove(id);
             self.stops.lock().await.remove(id);

@@ -292,6 +292,18 @@ Action-side writes run in a bounded background queue; an overloaded queue is log
 without changing the machine result. The history command and API
 route still report storage errors, so repair storage if the journal cannot be read.
 
+Pending job metadata uses its own mutex and a separate `history-pending.json` file in the
+service's private data folder. CLI state uses a matching `*.history-pending.json` file,
+so CLI and service records do not overwrite each other's pending metadata. A background
+writer receives serialized snapshots and performs disk I/O after data locks are released;
+it never holds the machine safety mutex. Stop reaches the backend before any bookkeeping,
+even when a history write is stalled. A failed Stop still withdraws bed clearance.
+
+Startup reloads the pending file and migrates a legacy `history` map from older safety
+state. The legacy payload remains recoverable until the new file is synced, then the next
+safety checkpoint omits it. An existing pending file is authoritative, including an empty
+one, so old safety snapshots cannot resurrect finished jobs.
+
 The JSON Lines journal retains the newest **10,000 records**, including acknowledgements.
 Writes append a complete line and sync it to disk. A torn final line is ignored on read
 and removed before the next append. Rotation writes and syncs a replacement before an

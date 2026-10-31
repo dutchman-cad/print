@@ -12,7 +12,7 @@ Not released yet. Tested against simulated printers.
 - Review and confirm each machine action, with a bed check before every start.
 - Keep persistent print history and bed-clear acknowledgements; filter them through
   `dutchman-print history` or the [history API](docs/print-api.md#print-history).
-  History failures are logged without affecting printer actions.
+  History failures are logged, and slow history writes never hold up printer actions.
 
 ## First run
 

@@ -3,7 +3,7 @@ use crate::backend::{Error, Estimate};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 
 const KEEP: usize = 10_000;
 const MAX_BYTES: u64 = 32 << 20;
@@ -130,8 +130,11 @@ async fn lock(root: &Path) -> Result<std::fs::File, Error> {
                 #[cfg(not(any(unix, windows)))]
                 return Err(storage_error("Unsupported history locking"));
             }
+            // Another holder shows as a sharing (32) or lock (33) violation on Windows.
             #[cfg(windows)]
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || matches!(e.raw_os_error(), Some(32 | 33)) => {}
             Err(e) => return Err(storage_error(e)),
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -221,13 +224,17 @@ pub(crate) async fn append(root: &Path, record: &Record) -> Result<(), Error> {
             .map_err(storage_error)?;
     } else {
         let mut options = tokio::fs::OpenOptions::new();
-        options.create(true).append(true);
+        // Not append mode: on Windows that grants no right to truncate the torn tail.
+        options.create(true).write(true).truncate(false);
         #[cfg(unix)]
         options.mode(0o600);
         let mut file = options.open(&path).await.map_err(storage_error)?;
         if torn {
             file.set_len(complete).await.map_err(storage_error)?;
         }
+        file.seek(std::io::SeekFrom::Start(complete))
+            .await
+            .map_err(storage_error)?;
         file.write_all(&line).await.map_err(storage_error)?;
         file.sync_all().await.map_err(storage_error)?;
         #[cfg(unix)]
@@ -415,6 +422,204 @@ url = "http://127.0.0.1/?token=private-token"
         safety.flush_history().await;
     }
     #[tokio::test]
+    async fn pending_history_write_never_blocks_stop_cancel_clear_or_start() {
+        let root = tempfile::tempdir().unwrap();
+        let safety = safety(backend(Arc::new(TestClock::default())), root.path());
+        prepare(&safety, root.path(), "stop").await;
+        safety.clear("bench").await.unwrap();
+        safety.start("stop").await.unwrap();
+        safety.flush_history().await;
+        let hook = safety.history_write_hook();
+        hook.block.store(true, Ordering::Release);
+        safety.history_source("stop", "original.3mf").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), hook.entered.notified())
+            .await
+            .unwrap();
+        assert!(hook.waiting.load(Ordering::Acquire));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            safety
+                .stop("bench", "stop", "part.3mf", None)
+                .await
+                .unwrap();
+            assert_eq!(safety.job("stop").await.unwrap().state, JobState::Cancelled);
+            safety.clear("bench").await.unwrap();
+            prepare(&safety, root.path(), "cancel").await;
+            safety.start("cancel").await.unwrap();
+            assert_eq!(
+                safety.cancel("cancel").await.unwrap().state,
+                JobState::Cancelled
+            );
+        })
+        .await
+        .unwrap();
+        assert!(hook.waiting.load(Ordering::Acquire));
+        hook.release.notify_one();
+        safety.flush_history().await;
+        let rows = query(root.path(), &Filter::default()).await.unwrap();
+        assert_eq!(rows.iter().filter(|r| r.outcome == "stopped").count(), 1);
+        assert_eq!(rows.iter().filter(|r| r.outcome == "cancelled").count(), 1);
+        let pending: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(root.path().join("history-pending.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pending, serde_json::json!({}));
+    }
+    #[tokio::test]
+    async fn pending_history_restart_reloads_its_own_file_without_safety_history() {
+        let root = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::default());
+        let inner = backend(clock.clone());
+        let first = safety(inner.clone(), root.path());
+        prepare(&first, root.path(), "restart").await;
+        first.clear("bench").await.unwrap();
+        first.start("restart").await.unwrap();
+        first
+            .history_source("restart", "original.3mf")
+            .await
+            .unwrap();
+        first.flush_history().await;
+        first.save(&root.path().join("safety.json")).await.unwrap();
+        inner.save(&root.path().join("jobs.json")).unwrap();
+        let state: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(root.path().join("safety.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(state.get("history").is_none());
+        let pending: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(root.path().join("history-pending.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pending["restart"]["source"], "original.3mf");
+        assert!(pending["restart"]["started_at"].is_string());
+        drop(first);
+        clock.0.store(120, Ordering::SeqCst);
+        let inner = backend(clock);
+        inner
+            .restore_for_history(&root.path().join("jobs.json"))
+            .unwrap();
+        let restored = safety(inner, root.path());
+        restored
+            .restore(&root.path().join("safety.json"))
+            .await
+            .unwrap();
+        restored.poll_history(true).await.unwrap();
+        restored.flush_history().await;
+        let rows = query(
+            root.path(),
+            &Filter {
+                outcome: Some("done".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source.as_deref(), Some("original.3mf"));
+        assert_eq!(
+            rows[0].started_at.as_ref(),
+            pending["restart"]["started_at"]
+                .as_str()
+                .map(str::to_owned)
+                .as_ref()
+        );
+    }
+    #[tokio::test]
+    async fn pending_history_migrates_legacy_safety_entries_and_drops_them_on_save() {
+        let root = tempfile::tempdir().unwrap();
+        let mut legacy = record(1);
+        legacy.printer = "bench".into();
+        legacy.job_id = Some("lost".into());
+        let state = serde_json::json!({"reviews": {}, "history": {"lost": legacy}});
+        tokio::fs::write(
+            root.path().join("safety.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .await
+        .unwrap();
+        let first = safety(backend(Arc::new(TestClock::default())), root.path());
+        let hook = first.history_write_hook();
+        hook.block.store(true, Ordering::Release);
+        first
+            .restore(&root.path().join("safety.json"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), hook.entered.notified())
+            .await
+            .unwrap();
+        // A safety checkpoint before migration completes must still recover on a crash.
+        first.save(&root.path().join("safety.json")).await.unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(root.path().join("safety.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["history"]["lost"]["job_id"], "lost");
+        hook.release.notify_one();
+        first.flush_history().await;
+        first.save(&root.path().join("safety.json")).await.unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(root.path().join("safety.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(saved.get("history").is_none());
+        drop(first);
+        let restored = safety(backend(Arc::new(TestClock::default())), root.path());
+        restored
+            .restore(&root.path().join("safety.json"))
+            .await
+            .unwrap();
+        restored.poll_history(true).await.unwrap();
+        restored.flush_history().await;
+        let rows = query(root.path(), &Filter::default()).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "unresolved_after_restart");
+        // A stale safety snapshot must not resurrect an already archived pending record.
+        tokio::fs::write(
+            root.path().join("stale.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .await
+        .unwrap();
+        let replay = safety(backend(Arc::new(TestClock::default())), root.path());
+        replay
+            .restore(&root.path().join("stale.json"))
+            .await
+            .unwrap();
+        replay.poll_history(true).await.unwrap();
+        assert_eq!(
+            query(root.path(), &Filter::default()).await.unwrap().len(),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn pending_history_failed_stop_still_withdraws_clearance() {
+        let root = tempfile::tempdir().unwrap();
+        let safety = safety(backend(Arc::new(TestClock::default())), root.path());
+        safety.clear("bench").await.unwrap();
+        assert_eq!(
+            safety.printer("bench").await.unwrap().needs_clearing,
+            Some(false)
+        );
+        assert!(safety
+            .stop("bench", "missing", "part.3mf", None)
+            .await
+            .is_err());
+        assert_eq!(
+            safety.printer("bench").await.unwrap().needs_clearing,
+            Some(true)
+        );
+        safety.flush_history().await;
+    }
+    #[tokio::test]
     async fn history_deduplicates_only_the_same_printer_job_and_start() {
         let root = tempfile::tempdir().unwrap();
         let first = record(1);
@@ -508,6 +713,9 @@ url = "http://127.0.0.1/?token=private-token"
         let stale = tokio::fs::read(root.path().join("safety.json"))
             .await
             .unwrap();
+        let stale_pending = tokio::fs::read(root.path().join("history-pending.json"))
+            .await
+            .unwrap();
         drop(first);
         clock.0.store(7200, Ordering::SeqCst);
         let restored = backend(clock.clone());
@@ -535,12 +743,17 @@ url = "http://127.0.0.1/?token=private-token"
         tokio::fs::write(root.path().join("stale.json"), stale)
             .await
             .unwrap();
+        next.flush_history().await;
+        tokio::fs::write(root.path().join("history-pending.json"), stale_pending)
+            .await
+            .unwrap();
         let replay = safety(restored.clone(), root.path());
         replay
             .restore(&root.path().join("stale.json"))
             .await
             .unwrap();
         replay.poll_history(true).await.unwrap();
+        replay.flush_history().await;
         assert_eq!(
             query(
                 root.path(),

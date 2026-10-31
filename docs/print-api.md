@@ -401,7 +401,10 @@ Bed-clear acknowledgements use `outcome: "bed_clear"`, printer identity, and `en
 other fields are null. No operator identity is known. This audit entry never restores
 clearance. History writes are best effort and run outside machine-action responses.
 Failures are logged without changing actions or status reads; this history route still
-reports storage errors. No external printer jobs are added to history.
+reports storage errors. Pending records are stored separately from safety state and migrate
+from older safety files on startup. History disk writes hold no machine safety lock; Stop
+calls the backend first and withdraws clearance even if the backend reports an error.
+No external printer jobs are added to history.
 
 The private `history.jsonl` retains the newest 10,000 records including acknowledgements,
 independently of the one-hour job-file retention. It appends complete lines and syncs them;
