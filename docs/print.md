@@ -289,7 +289,7 @@ reloaded and reconciled from live status before control after a restart.
 ### Private job paths
 
 Service job and queue entry ids are generated as 32 lowercase hexadecimal characters.
-Requests with malformed job ids are refused. Restored queue ids, source job ids, prepared
+A queue addition with a malformed job id is refused. Restored queue ids, source job ids, prepared
 job ids, and saved-job keys are checked before use; malformed state must be repaired or
 removed before the service can load it. Job folders stay below the configured data folder.
 Preview reads use the job folder's `preview.png`, never a path supplied in stored metadata.

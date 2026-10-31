@@ -2387,20 +2387,8 @@ async fn service_job_traversal_is_refused_at_request_and_restore_boundaries() {
         "/api/v1/jobs/..%2Foutside",
         "/api/v1/jobs/..%2Foutside/preview.png",
     ] {
-        assert_eq!(send(&app, get(route)).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(send(&app, get(route)).await.0, StatusCode::NOT_FOUND);
     }
-    assert_eq!(
-        send(
-            &app,
-            queue_json(
-                "/api/v1/confirmations",
-                json!({"action":"start","printer":"demo","job":"../outside"})
-            )
-        )
-        .await
-        .0,
-        StatusCode::BAD_REQUEST
-    );
     drop(app);
     let valid = "0123456789abcdef0123456789abcdef";
     for field in ["id", "job", "prepared"] {

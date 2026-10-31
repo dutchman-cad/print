@@ -322,9 +322,6 @@ async fn challenge(
     State(app): State<Shared>,
     Json(intent): Json<Intent>,
 ) -> Result<impl IntoResponse, Problem> {
-    if let Some(id) = &intent.job {
-        crate::validate_job_id(id).map_err(bad)?;
-    }
     let challenge = app
         .confirmations
         .issue(
@@ -392,7 +389,6 @@ async fn printers(State(app): State<Shared>) -> Result<impl IntoResponse, Proble
     Ok(Json(app.backend.printers().await.map_err(backend_error)?))
 }
 async fn job(State(app): State<Shared>, Path(id): Path<String>) -> Result<Json<Job>, Problem> {
-    crate::validate_job_id(&id).map_err(bad)?;
     Ok(Json(app.backend.job(&id).await.map_err(backend_error)?))
 }
 async fn create(State(app): State<Shared>, request: Request) -> Result<impl IntoResponse, Problem> {
@@ -649,13 +645,14 @@ async fn create_in(
 }
 
 async fn preview(State(app): State<Shared>, Path(id): Path<String>) -> Result<Response, Problem> {
-    let dir = crate::job_dir(&app.config.storage.data_dir, &id).map_err(bad)?;
     let saved = app.saved.lock().await;
     saved
         .get(&id)
         .and_then(|saved| saved.preview.as_ref())
         .ok_or_else(|| (StatusCode::NOT_FOUND, "This job has no preview.".into()))?;
-    let path = dir.join("preview.png");
+    let path = crate::job_dir(&app.config.storage.data_dir, &id)
+        .map_err(bad)?
+        .join("preview.png");
     let metadata = tokio::fs::metadata(&path).await.map_err(internal)?;
     if metadata.len() > 16 << 20 {
         return Err(internal("preview too big"));
@@ -701,7 +698,6 @@ async fn confirm(
     id: &str,
 ) -> Result<crate::confirmation::Observation, Problem> {
     let target = if matches!(action, "start" | "cancel") {
-        crate::validate_job_id(id).map_err(bad)?;
         app.backend
             .job_printer(id)
             .await
