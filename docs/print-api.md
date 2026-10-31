@@ -512,3 +512,62 @@ If `nozzle_temper` is unavailable, the scalar nozzle temperature uses extruder 0
 back to extruder 1; `detail` lists the available per-extruder temperatures. Packed temperatures
 use the low sixteen bits for current temperature. Bed leveling defaults on and can be
 disabled explicitly with `start_profile.bed_leveling = false`.
+
+## Print farm queue
+
+These additive v1 routes operate on the running service's private, durable FIFO queue.
+They use the same authentication and origin checks as job routes. Nothing starts
+without an explicit confirmed dispatch.
+
+| Method and path | Request | Success |
+|---|---|---|
+| `GET /api/v1/queue` | No body | 200, entry array in FIFO order |
+| `POST /api/v1/queue` | `{"job":"JOB_ID","target":"any","profile":null,"kind":null}` | 201, entry |
+| `DELETE /api/v1/queue/{id}` | No body | 204, membership removed; job records retained |
+| `POST /api/v1/queue/{id}/move` | `{"position":0}` (zero-based, within queue) | 200, ordered entry array |
+| `GET /api/v1/queue/proposals` | No body | 200, proposal array in FIFO order |
+| `POST /api/v1/queue/{id}/confirmations` | `{"printer":"workbench"}` | 201, ordinary Start challenge |
+| `POST /api/v1/queue/{id}/dispatch` | Ordinary confirmation JSON or query, plus `Plugin-Confirmation` | 200, tracked job |
+
+Entries contain `id`, original prepared `job`, `target` (printer id or `any`), nullable
+`profile`, nullable `kind`, nullable refusal `reason`, nullable bound `prepared` job id,
+and boolean `attempted`. Stored refusal reasons are limited to 1 KiB. Add accepts a ready job from `POST /api/v1/jobs` once; profile
+and kind are optional filters. Filters and fields are plain text of at most 256 bytes.
+Add, move, and queue challenge bodies are limited to 4 KiB. Capacity is 5,000 entries.
+Queue mutations share the service's state-write lock and use durable private state
+replacement. Entries and their job files survive restart and normal job expiry while
+queued. Remote bed acknowledgements are still withdrawn at restart.
+
+Each proposal has `id`, nullable `printer`, and nullable `reason`. Matching reads fresh
+printer status, requires `idle`, `needs_clearing: false`, and `start` in `controls`,
+and compares backend kind and resolved printer, print, and filament preset names
+against the original preparation. Absent presets must match absent presets. Optional
+profile/kind filters must match too. Candidates use configured printer order; each
+printer is proposed at most once, assigned to its earliest compatible entry. Entries
+without a match do not prevent later entries matching different printers. Matching
+has a 30-second deadline (503 on expiry). Proposals are advisory, with no reservation.
+
+To dispatch, first request the queue entry's challenge for its current proposed printer.
+The server reuses the original job when it was prepared for that printer, or prepares
+a new job from the retained input for a different printer, applying all existing
+preparation checks. `prepared` records the binding. A reviewed entry remains bound
+to that printer; before any attempt, remove and re-add the original job to change it.
+The returned challenge is the existing observation- and digest-bound `start` challenge
+for that printer and the bound job. Show its summary verbatim and obtain approval.
+Clearance requires its own ordinary printer Clear challenge and action first.
+
+Send the challenge once to dispatch, with the ordinary unique 64-character lowercase
+hexadecimal `Plugin-Confirmation` header. Dispatch rechecks the proposal, invokes the
+existing confirmation consumer, checks controls and bed readiness, and calls the same
+Start implementation. Direct job Start refuses queued source or bound jobs; use queue
+dispatch. Invalid/missing confirmations, changed observations, missing clearance, and
+backend refusals retain the entry and record a safe `reason`. Dispatch uses the normal
+403/409 errors, or backend/storage error codes. Success removes membership and returns
+the bound tracked job. The original prepared record remains available.
+
+Before calling backend Start, the entry is durably marked `attempted: true`. This
+entry can never dispatch again, including after an uncertain result, storage failure,
+or restart; a crash after success may leave this blocked entry in the queue. Read
+`GET /api/v1/jobs/{prepared}` to reconcile the outcome. No queue request or background
+work automatically retries Start. Normal tracked-job controls remain available with
+their own fresh challenges. Removing an entry never cancels or retries its execution.

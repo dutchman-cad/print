@@ -74,6 +74,8 @@ impl Default for ServerConfig {
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Saved {
+    #[serde(default)]
+    options: Options,
     created: Duration,
     preview: Option<PathBuf>,
 }
@@ -85,6 +87,7 @@ struct App {
     config: ServerConfig,
     confirmations: Confirmations,
     saved: Mutex<HashMap<String, Saved>>,
+    queue: Mutex<Vec<queue::Entry>>,
     uploads: Semaphore,
     runs: Semaphore,
 }
@@ -138,12 +141,43 @@ pub fn router(backend: Arc<dyn Backend>, config: ServerConfig) -> Router {
         config,
         confirmations,
         saved: Mutex::new(HashMap::new()),
+        queue: Mutex::new(Vec::new()),
+    });
+    // Expiry shares queue membership locking, so queued inputs cannot be deleted
+    // by the old folder-age cleanup while waiting for an operator.
+    let weak = Arc::downgrade(&app);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            let Some(app) = weak.upgrade() else { break };
+            let initialized = *app.initialized.lock().await;
+            if initialized && expire(&app).await.is_ok() {
+                let _ = checkpoint(&app).await;
+            }
+        }
     });
     Router::new()
         .route(
             "/healthz",
             get(|| async { Json(serde_json::json!({"service": "dutchman-print", "api": 1})) }),
         )
+        .route(
+            "/api/v1/queue",
+            get(queue::list)
+                .post(queue::add)
+                .layer(DefaultBodyLimit::max(4096)),
+        )
+        .route("/api/v1/queue/proposals", get(queue::proposals))
+        .route("/api/v1/queue/{id}", axum::routing::delete(queue::remove))
+        .route(
+            "/api/v1/queue/{id}/move",
+            post(queue::move_entry).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/v1/queue/{id}/confirmations",
+            post(queue::challenge).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route("/api/v1/queue/{id}/dispatch", post(queue::dispatch))
         .route("/api/v1/printers", get(printers))
         .route(
             "/api/v1/confirmations",
@@ -194,7 +228,7 @@ async fn guard_in(app: &App, request: Request, next: Next) -> Response {
     if request.uri().path() == "/healthz" && request.method() == Method::GET {
         return next.run(request).await;
     }
-    if request.method() == Method::POST
+    if matches!(*request.method(), Method::POST | Method::DELETE)
         && !hardening::allowed_origin(request.headers(), &app.config.public_origin)
     {
         return (
@@ -246,6 +280,7 @@ async fn initialize(app: &App) -> Result<(), Problem> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(internal(e)),
         }
+        *app.queue.lock().await = queue::load(app).await?;
         *initialized = true;
     }
     Ok(())
@@ -289,6 +324,11 @@ async fn challenge(
 
 async fn expire(app: &App) -> Result<(), Problem> {
     let now = app.config.clock.now();
+    // A queue preparation or dispatch must never delay another printer's Stop.
+    // Expiry can safely wait until the next request.
+    let Ok(queue) = app.queue.try_lock() else {
+        return Ok(());
+    };
     let mut saved = app.saved.lock().await;
     let ids: Vec<_> = saved
         .iter()
@@ -296,6 +336,12 @@ async fn expire(app: &App) -> Result<(), Problem> {
         .map(|(id, _)| id.clone())
         .collect();
     for id in ids {
+        if queue
+            .iter()
+            .any(|e| e.job == id || e.prepared.as_deref() == Some(&id))
+        {
+            continue;
+        }
         app.backend.forget(&id).await.map_err(backend_error)?;
         let _ = tokio::fs::remove_dir_all(app.config.storage.data_dir.join(&id)).await;
         saved.remove(&id);
@@ -513,7 +559,7 @@ async fn create_in(
     let _run = app.runs.acquire().await.map_err(internal)?;
     let estimate = app
         .backend
-        .prepare(id, &path, &printer, options)
+        .prepare(id, &path, &printer, options.clone())
         .await
         .map_err(backend_error)?;
     let preview = if let Some(source) = estimate.preview {
@@ -548,6 +594,7 @@ async fn create_in(
         Saved {
             created: app.config.clock.now(),
             preview,
+            options,
         },
     );
     drop(saved);
@@ -573,6 +620,30 @@ async fn preview(State(app): State<Shared>, Path(id): Path<String>) -> Result<Re
 #[serde(deny_unknown_fields)]
 struct Confirmation {
     confirmation: Option<String>,
+}
+fn confirmation_header(headers: &HeaderMap) -> Result<&str, Problem> {
+    let error = || {
+        (
+            StatusCode::FORBIDDEN,
+            "This action needs confirmation in SolidCraft (or --yes on the command line).".into(),
+        )
+    };
+    let values: Vec<_> = headers.get_all("Plugin-Confirmation").iter().collect();
+    if values.len() != 1 {
+        return Err(error());
+    }
+    let token = values
+        .first()
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(error)?;
+    if token.len() != 64
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(error());
+    }
+    Ok(token)
 }
 async fn confirm(
     app: &App,
@@ -600,21 +671,7 @@ async fn confirm(
             "This action needs confirmation in SolidCraft (or --yes on the command line).".into(),
         )
     };
-    let values: Vec<_> = headers.get_all("Plugin-Confirmation").iter().collect();
-    if values.len() != 1 {
-        return Err(error());
-    }
-    let token = values
-        .first()
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(error)?;
-    if token.len() != 64
-        || !token
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err(error());
-    }
+    let token = confirmation_header(headers)?;
     let Query(query) = Query::<Confirmation>::try_from_uri(request.uri())
         .map_err(|_| bad("Use a confirmation id."))?;
     let bytes = axum::body::to_bytes(request.into_body(), 4096)
@@ -670,6 +727,17 @@ async fn start(
     headers: HeaderMap,
     request: Request,
 ) -> Result<Json<Job>, Problem> {
+    let queue = app.queue.lock().await;
+    if queue
+        .iter()
+        .any(|e| e.job == id || e.prepared.as_deref() == Some(&id))
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Use queue dispatch for this job.".into(),
+        ));
+    }
+    drop(queue);
     action(&app, &id, headers, request, "start").await
 }
 async fn cancel(
@@ -731,3 +799,6 @@ async fn stop(
     checkpoint(&app).await?;
     Ok(Json(result.map_err(backend_error)?))
 }
+
+#[path = "queue.rs"]
+mod queue;

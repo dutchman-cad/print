@@ -32,6 +32,8 @@ struct Args {
 enum Command {
     /// Write a config for one printer, asking on a terminal. Contacts nothing.
     Init(Box<dutchman_print::init::Flags>),
+    /// Manage the running server's print farm queue.
+    Queue(queue_cli::Flags),
     /// List printers.
     Printers {
         #[arg(long)]
@@ -137,6 +139,9 @@ async fn run(args: Args) -> Result<(), String> {
     if let Command::Init(flags) = args.command {
         return dutchman_print::init::run(*flags, args.config);
     }
+    if let Command::Queue(flags) = args.command {
+        return queue_cli::run(flags).await;
+    }
     let path = args.config.map(Ok).unwrap_or_else(config::default_path)?;
     if let Command::Fingerprint { printer, json } = &args.command {
         let config = config::Config::load_for_fingerprint(&path, printer)?;
@@ -227,10 +232,6 @@ async fn run(args: Args) -> Result<(), String> {
             ..Default::default()
         };
         settings.storage.data_dir = data_dir.clone();
-        let cleanup = tokio::spawn(dutchman_print::remove_expired(
-            data_dir,
-            settings.storage.keep,
-        ));
         eprintln!("dutchman-print: listening on http://{address}");
         let result = serve_until(
             listener,
@@ -239,7 +240,6 @@ async fn run(args: Args) -> Result<(), String> {
             stopped(),
         )
         .await;
-        cleanup.abort();
         return result.map_err(|err| err.to_string());
     }
     let state = state_path(&data_dir, &path)?;
@@ -477,6 +477,7 @@ async fn command(
                 output(&job).map_err(dutchman_print::backend::Error::Failed)?;
             }
             Command::Init(_)
+            | Command::Queue(_)
             | Command::Printers { .. }
             | Command::Serve { .. }
             | Command::Fingerprint { .. } => {}
@@ -708,10 +709,6 @@ async fn real_command(
             ..Default::default()
         };
         settings.storage.data_dir = data.into();
-        let cleanup = tokio::spawn(dutchman_print::remove_expired(
-            data.into(),
-            settings.storage.keep,
-        ));
         let result = serve_until(
             listener,
             dutchman_print::router(backend.clone(), settings),
@@ -719,7 +716,6 @@ async fn real_command(
             stopped(),
         )
         .await;
-        cleanup.abort();
         return result.map_err(|_| "Print server stopped unexpectedly.".into());
     }
     backend.restore(state).await?;
@@ -812,3 +808,5 @@ mod tests {
         }
     }
 }
+
+mod queue_cli;

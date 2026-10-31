@@ -1693,3 +1693,49 @@ python3 scripts/changelog.py release 0.1.0
 python3 -m pip install PyYAML==6.0.3
 python3 scripts/check-release-workflow.py
 ```
+
+## Print farm queue
+
+A running server can keep a FIFO queue of prepared jobs in its private data folder.
+Queue commands connect to `--server http://127.0.0.1:8730` by default; they use
+`DUTCHMAN_PRINT_PASSWORD` and `--user dutchman` when the server requires login.
+Start the server with the farm's config, then use another terminal:
+
+```sh
+dutchman-print queue add bracket.3mf --printer workbench --target any
+dutchman-print queue list
+dutchman-print queue proposals
+dutchman-print queue move ENTRY_ID 0
+dutchman-print queue dispatch ENTRY_ID --printer workbench --bed-clear --yes
+dutchman-print queue remove ENTRY_ID
+```
+
+`add` uploads through the existing preparation route using `--printer`'s presets;
+`--target` is a printer id or `any` (the default). Optional `--profile` and `--kind`
+filters narrow matching. Printers must share the preparation printer's kind and
+resolved printer, print, and filament presets; absent presets must also match.
+A different printer gets a separate preparation and tracked job before Start review,
+so its own tooling and readiness checks still apply. Review physical compatibility
+of printers sharing presets before confirming.
+
+Proposals walk entries in FIFO order and configured printers in order. They skip
+busy, offline, uncleared, incompatible, and monitoring-only printers, and propose each
+printer only once. An unmatched entry does not block later entries with other targets.
+Proposals reserve nothing and never start anything. Positions for `move` are zero-based.
+`remove` removes queue membership, retaining prepared and tracked job records.
+
+Dispatch requests a fresh server-issued Start challenge. The person must still check
+the bed; `--bed-clear` requests its own separate Clear challenge and approval first.
+Without `--yes`, each summary is shown for terminal approval. `--yes` approves those
+same challenges. Fresh status, per-printer controls, reviewed bytes, and bed checks
+remain mandatory. After challenge preparation, an entry stays bound to that printer;
+to change it before any attempt, remove the entry and queue its original job again.
+
+Successful dispatch removes the entry and returns the tracked job. A refusal leaves
+it queued with a reason. Once a backend Start attempt begins, dispatch is durably
+blocked from retrying that entry, even after failure or restart. Read its `prepared`
+job's status and reconcile any uncertain result before deciding what to do next.
+The service retains queued job files beyond normal expiry; removing or successfully
+dispatching an entry releases that retention. Queue order, bindings, reasons, and
+attempt markers survive restart, but bed acknowledgements do not. The queue is limited
+to 5,000 entries; matching has a 30-second deadline.
