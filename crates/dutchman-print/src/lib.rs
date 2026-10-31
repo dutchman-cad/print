@@ -6,6 +6,7 @@ pub mod config;
 pub mod confirmation;
 pub mod duet;
 pub mod elegoo_sdcp;
+pub mod history;
 pub mod init;
 pub mod moonraker;
 pub mod octoprint;

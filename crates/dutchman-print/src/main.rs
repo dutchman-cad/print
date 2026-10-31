@@ -30,6 +30,13 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// List persistent finished-job and bed-clear history.
+    History {
+        #[command(flatten)]
+        filter: dutchman_print::history::Filter,
+        #[arg(long)]
+        json: bool,
+    },
     /// Write a config for one printer, asking on a terminal. Contacts nothing.
     Init(Box<dutchman_print::init::Flags>),
     /// Manage the running server's print farm queue.
@@ -186,10 +193,33 @@ async fn run(args: Args) -> Result<(), String> {
             dutchman_serve::prepare_data_dir(&data_dir)
                 .map_err(|_| "Cannot use the private data folder.")?;
         }
-        backend.restore(&state)?;
-        let safety = dutchman_print::safety::Safety::new(Arc::new(backend));
-        safety.restore(&state.with_extension("safety.json")).await?;
+        let _lock = if data_dir.exists() {
+            let path = state.with_extension("lock");
+            std::fs::create_dir(&path).map_err(|_| {
+                "Another CLI command is using simulated jobs. Wait for it to finish."
+            })?;
+            Some(Lock(path))
+        } else {
+            None
+        };
+        backend.restore_for_history(&state)?;
+        let backend = Arc::new(backend);
+        let mut safety = dutchman_print::safety::Safety::new(backend.clone());
+        let safety_path = state.with_extension("safety.json");
+        if data_dir.exists() {
+            safety = safety
+                .with_store(safety_path.clone())
+                .with_history(data_dir.clone());
+        }
+        safety.restore(&safety_path).await?;
+        safety.poll_history_best_effort(true).await;
         let reports = safety.printers().await;
+        if data_dir.exists() {
+            safety.poll_history_best_effort(false).await;
+            safety.flush_history().await;
+            backend.save(&state)?;
+            safety.save(&safety_path).await?;
+        }
         shutdown_backend(&safety).await;
         let reports = reports.map_err(|e| e.to_string())?;
         if json {
@@ -252,13 +282,17 @@ async fn run(args: Args) -> Result<(), String> {
     })?;
     let _lock = Lock(lock);
     let backend = Simulated::new(config, Arc::new(WallClock))?;
-    backend.restore(&state)?;
+    backend.restore_for_history(&state)?;
     let backend = Arc::new(backend);
     let safety_path = state.with_extension("safety.json");
-    let safety =
-        dutchman_print::safety::Safety::new(backend.clone()).with_store(safety_path.clone());
+    let safety = dutchman_print::safety::Safety::new(backend.clone())
+        .with_store(safety_path.clone())
+        .with_history(data_dir.clone());
     safety.restore(&safety_path).await?;
+    safety.poll_history_best_effort(true).await;
     let result = command(args.command, &safety, &data_dir).await;
+    safety.poll_history_best_effort(false).await;
+    safety.flush_history().await;
     let safety_saved = safety.save(&safety_path).await;
     let jobs_saved = backend.save(&state);
     shutdown_backend(&safety).await;
@@ -358,6 +392,18 @@ async fn command(
     let confirmations = dutchman_print::confirmation::Confirmations::new(None);
     let result: Result<(), dutchman_print::backend::Error> = async {
         match command {
+            Command::History { filter, json } => {
+                filter.validate().map_err(dutchman_print::backend::Error::Refused)?;
+                backend.flush_history().await;
+                backend.poll_history(false).await?;
+                let records = dutchman_print::history::query(data, &filter).await?;
+                if json { output(&records).map_err(dutchman_print::backend::Error::Failed)?; } else {
+                    for record in records {
+                        println!("{} {} {} {}", record.ended_at, record.printer, record.outcome,
+                            record.job_name.as_deref().unwrap_or("Bed clear"));
+                    }
+                }
+            },
             Command::Print {
                 file,
                 printer,
@@ -392,6 +438,7 @@ async fn command(
                     let _ = tokio::fs::remove_dir_all(&dir).await;
                 }
                 let estimate = estimate?;
+                backend.history_source(&id, &file.file_name().unwrap_or_default().to_string_lossy()).await?;
                 if !json {
                     eprintln!(
                         "Estimate: {} seconds, {} mm filament, {} g, {} layers.",
@@ -668,10 +715,32 @@ async fn real_command(
             dutchman_serve::prepare_data_dir(data)
                 .map_err(|_| "Cannot use the private data folder.")?;
         }
+        let _lock = if data.exists() {
+            let path = state.with_extension("lock");
+            std::fs::create_dir(&path).map_err(|_| {
+                "Another CLI command is using these printers. Wait for it to finish."
+            })?;
+            Some(Lock(path))
+        } else {
+            None
+        };
         backend.restore(state).await?;
-        let safety = dutchman_print::safety::Safety::new(backend.clone());
-        safety.restore(&state.with_extension("safety.json")).await?;
+        let mut safety = dutchman_print::safety::Safety::new(backend.clone());
+        let safety_path = state.with_extension("safety.json");
+        if data.exists() {
+            safety = safety
+                .with_store(safety_path.clone())
+                .with_history(data.into());
+        }
+        safety.restore(&safety_path).await?;
+        safety.poll_history_best_effort(true).await;
         let reports = safety.printers().await.map_err(|e| e.to_string())?;
+        if data.exists() {
+            safety.poll_history_best_effort(false).await;
+            safety.flush_history().await;
+            backend.save(state).await?;
+            safety.save(&safety_path).await?;
+        }
         if json {
             output(&reports)?;
         } else {
@@ -720,11 +789,15 @@ async fn real_command(
     }
     backend.restore(state).await?;
     let safety_path = state.with_extension("safety.json");
-    let safety =
-        dutchman_print::safety::Safety::new(backend.clone()).with_store(safety_path.clone());
+    let safety = dutchman_print::safety::Safety::new(backend.clone())
+        .with_store(safety_path.clone())
+        .with_history(data.into());
     safety.restore(&safety_path).await?;
+    safety.poll_history_best_effort(true).await;
     let result = command(cmd, &safety, data).await;
     let jobs_saved = backend.save(state).await;
+    safety.poll_history_best_effort(false).await;
+    safety.flush_history().await;
     let safety_saved = safety.save(&safety_path).await;
     jobs_saved?;
     safety_saved?;

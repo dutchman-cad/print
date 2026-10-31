@@ -15,6 +15,7 @@ response fields. Breaking changes require a new path version such as `/api/v2`.
 | Method and path | Request | Success |
 |---|---|---|
 | `GET /healthz` | No body | 200, `{"service":"dutchman-print","api":1}` for Dutchman Print |
+| `GET /api/v1/history` | Optional `printer`, `outcome`, `since`, and `limit` query fields | 200, array of history records, newest first |
 | `GET /api/v1/printers` | No body | 200, array of printer objects |
 | `POST /api/v1/jobs` | Raw 3MF or multipart, described below | 201, prepared job object |
 | `GET /api/v1/jobs/{id}` | No body | 200, current job object |
@@ -120,8 +121,8 @@ the server polls that printer every 5 seconds (`--clearance-interval-seconds`, 2
 It is withdrawn on any non-idle or unknown state, failed read, observation gap longer than
 twice that interval, reconnect following unavailable telemetry, job identity or finished-job
 signal change, or expiry after 15 minutes (`--clearance-expiry-minutes`, 1–120). A Start
-attempt consumes it even if the result is uncertain or fails. Polling stops when no remote
-acknowledgement is held. Activity entirely between polls with no identity or terminal signal
+attempt consumes it even if the result is uncertain or fails. Bed-clear polling stops when no remote
+acknowledgement is held; separate history polling continues for tracked jobs. Activity entirely between polls with no identity or terminal signal
 change cannot be detected; clearance is not proof that no physical activity occurred.
 PrusaLink `READY` is the operator's printer-side bed-clear signal and substitutes for the
 remote acknowledgement; `IDLE` still requires one. Restarting never restores remote clearance.
@@ -356,12 +357,59 @@ telemetry without an observed terminal result; observed FINISHED and STOPPED rem
 cancellation or a halt, since standalone firmware does not report the outcome.
 Repetier-Server uses it for every ending not caused by this companion's cancellation. BUSY cannot revive a terminal job.
 Incompatible actions return 409. Printer pause and resume target that printer's active job.
-Jobs may expire; subsequent reads return 404. Dutchman Print retains jobs for one hour and
+Jobs may expire; subsequent reads return 404. Dutchman Print retains finished jobs for one hour and
 persists service jobs in its private data folder. Startup reloads tracked jobs and reconciles
 attempted jobs with live status before control; unavailable printers stay tracked and controls
 require live reconciliation. Clients must still handle expired jobs disappearing.
 When the service stops, it releases printer connections within three seconds without sending
 machine actions; durable job and safety checkpoints are retained.
+
+## Print history
+
+`GET /api/v1/history?printer=workbench&outcome=done&since=2026-10-01T00:00:00Z&limit=20`
+returns finished tracked jobs and bed-clear acknowledgements, newest appended first.
+Filters combine: `printer` matches the printer id, `outcome` matches a value below,
+`since` includes records whose `ended_at` is at or after the RFC 3339 timestamp (offset
+required), and `limit` defaults to 100, with a range of 1–10,000. Invalid filters return
+400. Encode `+` in timestamps as `%2B`. Authentication and no-store policy match other
+read routes. An empty result is `[]`.
+
+| Record field | Type | Meaning |
+|---|---|---|
+| `printer` | string | Configured printer id |
+| `printer_kind` | string | Configured backend kind, or `simulated` |
+| `job_id` | string or null | Tracked job id; null for bed clearance |
+| `job_name` | string or null | Safe job label; null for bed clearance |
+| `file_name` | string or null | Prepared basename (input for simulation); null for bed clearance |
+| `file_size` | nonnegative integer or null | Prepared bytes (input for simulation); null for bed clearance |
+| `source` | string or null | Prepared-from input basename when known; no local path |
+| `outcome` | string | `done`, `cancelled`, `failed`, `stopped`, `ended`, `unresolved_after_restart`, or `bed_clear` |
+| `started_at` | string or null | UTC RFC 3339 Start-attempt time; null if never attempted |
+| `ended_at` | string | UTC RFC 3339 terminal observation or bed acknowledgement time |
+| `duration_seconds` | nonnegative integer or null | Wall-clock duration, including pauses; null without a start |
+| `estimate` | object or null | Preparation estimate fields from Job JSON; null for bed clearance |
+
+`stopped` distinguishes printer Stop of tracked work from job Cancel; Job JSON remains
+`cancelled`. `ended` means the printer could not establish the outcome.
+`unresolved_after_restart` means an attempted job could not be reconciled during a bounded
+startup read (including a missing expired snapshot). It does not assert success, alter
+machine state, or permit retries. Each execution, keyed by printer id, job id, and start time, contributes at most one history record;
+repeated reads and restarts do not duplicate it. History begins with jobs prepared after
+this feature is installed; older tracked jobs without history metadata are not backfilled.
+
+Bed-clear acknowledgements use `outcome: "bed_clear"`, printer identity, and `ended_at`;
+other fields are null. No operator identity is known. This audit entry never restores
+clearance. History writes are best effort and run outside machine-action responses.
+Failures are logged without changing actions or status reads; this history route still
+reports storage errors. No external printer jobs are added to history.
+
+The private `history.jsonl` retains the newest 10,000 records including acknowledgements,
+independently of the one-hour job-file retention. It appends complete lines and syncs them;
+rotation syncs an atomic replacement. A torn final line is skipped on read and repaired
+before append. Complete corrupt lines produce a storage error. Labels contain at most
+256 bytes, omit local directories, and redact URLs; credentials, backend addresses,
+confirmation values, previews, and file contents are never serialized. See
+[Print history](print.md#print-history) for storage and automatic lock release after a crash.
 
 ## Confirmation for machine actions
 

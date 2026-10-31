@@ -1522,6 +1522,29 @@ impl Backend for Printers {
         ))
     }
 
+    fn history_file<'a>(&'a self, id: &'a str) -> Reply<'a, Option<(String, u64)>> {
+        Box::pin(async move {
+            let target = self
+                .jobs
+                .lock()
+                .await
+                .get(id)
+                .cloned()
+                .ok_or(Error::NotFound)?;
+            let size = tokio::fs::metadata(&target.path)
+                .await
+                .map_err(|_| Error::Unavailable)?
+                .len();
+            Ok(Some((target.filename, size)))
+        })
+    }
+    fn printer_kind(&self, printer: &str) -> &str {
+        self.configs
+            .iter()
+            .find(|p| p.id == printer)
+            .and_then(|p| p.kind.as_deref())
+            .unwrap_or("prusalink")
+    }
     fn controls(&self, printer: &str) -> Vec<&'static str> {
         self.configs
             .iter()

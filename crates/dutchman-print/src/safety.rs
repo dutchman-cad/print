@@ -19,6 +19,8 @@ struct State {
     clearance: HashMap<String, (std::time::Duration, std::time::Duration)>,
     reviews: HashMap<String, Review>,
     #[serde(default)]
+    history: HashMap<String, crate::history::Record>,
+    #[serde(default)]
     job_names: HashMap<String, Option<String>>,
     #[serde(default)]
     terminal_seen: HashMap<String, bool>,
@@ -32,11 +34,23 @@ struct Review {
     hash: String,
 }
 
+enum HistoryTask {
+    Job(Job, Option<&'static str>),
+    Clear(crate::history::Record),
+    Stop(Vec<String>),
+    Poll(bool, Vec<crate::history::Record>),
+}
+
+#[derive(Clone)]
 pub struct Safety {
     inner: Arc<dyn Backend>,
-    state: Mutex<State>,
-    stops: Mutex<HashMap<String, bool>>,
+    state: Arc<Mutex<State>>,
+    stops: Arc<Mutex<HashMap<String, bool>>>,
+    history_writes: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    history_poll: Arc<Mutex<()>>,
+    history_tasks: Arc<tokio::sync::Semaphore>,
     store: Option<std::path::PathBuf>,
+    history_root: Option<std::path::PathBuf>,
     clock: Arc<dyn crate::simulated::Clock>,
     interval: std::time::Duration,
     expiry: std::time::Duration,
@@ -100,13 +114,208 @@ impl Safety {
     pub fn new(inner: Arc<dyn Backend>) -> Self {
         Self {
             inner,
-            state: Mutex::new(State::default()),
-            stops: Mutex::new(HashMap::new()),
+            state: Arc::new(Mutex::new(State::default())),
+            stops: Arc::new(Mutex::new(HashMap::new())),
+            history_writes: Arc::new(Mutex::new(HashMap::new())),
+            history_poll: Arc::new(Mutex::new(())),
+            history_tasks: Arc::new(tokio::sync::Semaphore::new(64)),
             store: None,
+            history_root: None,
             clock: Arc::new(crate::simulated::SystemClock::default()),
             interval: std::time::Duration::from_secs(5),
             expiry: std::time::Duration::from_secs(900),
         }
+    }
+    pub fn with_history(mut self, root: std::path::PathBuf) -> Self {
+        self.history_root = Some(root);
+        self
+    }
+    fn queue_history(&self, task: HistoryTask) {
+        if self.history_root.is_none() {
+            return;
+        }
+        let Ok(permit) = self.history_tasks.clone().try_acquire_owned() else {
+            crate::history::log_error();
+            return;
+        };
+        let safety = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result: Result<(), Error> = async {
+                match task {
+                    HistoryTask::Job(job, outcome) => safety.record_job(&job, outcome).await,
+                    HistoryTask::Clear(record) => {
+                        if let Some(root) = &safety.history_root {
+                            crate::history::append(root, &record).await?;
+                        }
+                        Ok(())
+                    }
+                    HistoryTask::Stop(ids) => {
+                        for id in ids {
+                            let job = safety.inner.job(&id).await?;
+                            safety.record_job(&job, None).await?;
+                        }
+                        Ok(())
+                    }
+                    HistoryTask::Poll(restarting, records) => {
+                        safety.poll_history_records(restarting, records).await
+                    }
+                }
+            }
+            .await;
+            if result.is_err() {
+                crate::history::log_error();
+            }
+        });
+    }
+    fn record_job_best_effort(&self, job: &Job) {
+        if matches!(
+            job.state,
+            JobState::Done | JobState::Cancelled | JobState::Failed | JobState::Ended
+        ) {
+            self.queue_history(HistoryTask::Job(job.clone(), None));
+        }
+    }
+    pub async fn poll_history_best_effort(&self, restarting: bool) {
+        let records = self.history_records(restarting).await;
+        self.queue_history(HistoryTask::Poll(restarting, records));
+    }
+    /// Explicit history reads and CLI shutdown can wait for pending audit writes.
+    /// Machine actions and status reads never call this barrier.
+    pub async fn flush_history(&self) {
+        let _permits = self.history_tasks.clone().acquire_many_owned(64).await;
+    }
+    async fn history_lock(&self, printer: &str) -> Result<tokio::sync::OwnedMutexGuard<()>, Error> {
+        let mut locks = self.history_writes.lock().await;
+        if locks.len() >= 64 && !locks.contains_key(printer) {
+            return Err(Error::Unavailable);
+        }
+        let lock = locks.entry(printer.into()).or_default().clone();
+        drop(locks);
+        Ok(lock.lock_owned().await)
+    }
+    async fn record_job(&self, job: &Job, outcome: Option<&str>) -> Result<(), Error> {
+        let Some(root) = &self.history_root else {
+            return Ok(());
+        };
+        let _write = self.history_lock(&job.printer).await?;
+        let Some(mut record) = self.state.lock().await.history.get(&job.id).cloned() else {
+            return Ok(());
+        };
+        let terminal = match job.state {
+            JobState::Done => "done",
+            JobState::Cancelled => "cancelled",
+            JobState::Failed => "failed",
+            JobState::Ended => "ended",
+            _ => return Ok(()),
+        };
+        let stopped = terminal == "cancelled" && record.outcome == "stopped";
+        record.outcome = outcome
+            .unwrap_or(if stopped { "stopped" } else { terminal })
+            .into();
+        record.ended_at = crate::history::now();
+        record.duration_seconds = record.started_at.as_deref().and_then(|start| {
+            let start = crate::history::parse_time(start).ok()?;
+            let end = crate::history::parse_time(&record.ended_at).ok()?;
+            u64::try_from((end - start).whole_seconds()).ok()
+        });
+        crate::history::append(root, &record).await?;
+        let mut state = self.state.lock().await;
+        state.history.remove(&job.id);
+        self.checkpoint(&state).await
+    }
+    /// Polling only reads backend jobs; it never sends machine commands.
+    pub async fn poll_history(&self, restarting: bool) -> Result<(), Error> {
+        if self.history_root.is_none() {
+            return Ok(());
+        }
+        let records = self.history_records(restarting).await;
+        self.poll_history_records(restarting, records).await
+    }
+    async fn history_records(&self, restarting: bool) -> Vec<crate::history::Record> {
+        self.state
+            .lock()
+            .await
+            .history
+            .values()
+            .filter(|r| restarting || r.started_at.is_some())
+            .cloned()
+            .collect()
+    }
+    async fn poll_history_records(
+        &self,
+        restarting: bool,
+        records: Vec<crate::history::Record>,
+    ) -> Result<(), Error> {
+        let _poll = if restarting {
+            self.history_poll.lock().await
+        } else {
+            match self.history_poll.try_lock() {
+                Ok(lock) => lock,
+                Err(_) => return Ok(()),
+            }
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        use futures_util::StreamExt as _;
+        let reads = futures_util::stream::iter(records)
+            .map(|record| async move {
+                let result = match record.job_id.as_deref() {
+                    Some(id) => tokio::time::timeout_at(deadline, self.inner.job(id)).await,
+                    None => Ok(Err(Error::NotFound)),
+                };
+                (record, result)
+            })
+            .buffer_unordered(64);
+        tokio::pin!(reads);
+        while let Some((record, result)) = reads.next().await {
+            let Some(id) = record.job_id.as_deref() else {
+                continue;
+            };
+            match result {
+                Ok(Ok(mut job)) => {
+                    if restarting && record.started_at.is_some() && job.state == JobState::Ready {
+                        job.state = JobState::Ended;
+                        self.record_job(&job, Some("unresolved_after_restart"))
+                            .await?;
+                    } else {
+                        self.record_job(&job, None).await?;
+                    }
+                }
+                Ok(Err(Error::NotFound)) if record.started_at.is_none() => {
+                    let mut state = self.state.lock().await;
+                    state.history.remove(id);
+                    state.reviews.remove(id);
+                    self.checkpoint(&state).await?;
+                }
+                _ if restarting && record.started_at.is_some() => {
+                    let job = Job {
+                        id: id.into(),
+                        printer: record.printer,
+                        name: String::new(),
+                        state: JobState::Ended,
+                        estimate: Estimate::default(),
+                        progress: None,
+                        seconds_left: None,
+                        detail: None,
+                    };
+                    self.record_job(&job, Some("unresolved_after_restart"))
+                        .await?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    pub async fn history_source(&self, id: &str, source: &str) -> Result<(), Error> {
+        let mut state = self.state.lock().await;
+        if let Some(record) = state.history.get_mut(id) {
+            let label = crate::history::label(source);
+            if record.printer_kind == "simulated" {
+                record.file_name = Some(label.clone());
+            }
+            record.source = Some(label);
+        }
+        Ok(())
     }
     pub fn timing(
         mut self,
@@ -121,6 +330,7 @@ impl Safety {
     }
     /// The task owns only a weak reference; dropping the server stops polling.
     pub fn monitor(self: &Arc<Self>) {
+        self.monitor_history();
         let weak = Arc::downgrade(self);
         let interval = self.interval;
         tokio::spawn(async move {
@@ -138,6 +348,20 @@ impl Safety {
                     .collect();
                 for id in ids {
                     let _ = safety.fresh(&id).await;
+                }
+            }
+        });
+    }
+    // History reads must not delay the existing bed-clear polling cadence.
+    fn monitor_history(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let interval = self.interval;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(safety) = weak.upgrade() else { break };
+                if safety.poll_history(false).await.is_err() {
+                    crate::history::log_error();
                 }
             }
         });
@@ -175,7 +399,8 @@ impl Safety {
             Ok(bytes) if bytes.len() <= 16 << 20 => {
                 let state: State = serde_json::from_slice(&bytes)
                     .map_err(|_| "Cannot read safety state. Check the private data folder.")?;
-                if state.reviews.len() > 5000
+                if state.history.len() > 5000
+                    || state.reviews.len() > 5000
                     || state.observed.len() > 64
                     || state.job_names.len() > 64
                     || state.terminal_seen.len() > 64
@@ -333,7 +558,23 @@ impl Backend for Safety {
             state
                 .clearance
                 .insert(id.into(), (self.clock.now(), self.clock.now()));
-            self.checkpoint(&state).await
+            self.checkpoint(&state).await?;
+            drop(state);
+            self.queue_history(HistoryTask::Clear(crate::history::Record {
+                printer: id.into(),
+                printer_kind: self.inner.printer_kind(id).into(),
+                job_id: None,
+                job_name: None,
+                file_name: None,
+                file_size: None,
+                source: None,
+                outcome: "bed_clear".into(),
+                started_at: None,
+                ended_at: crate::history::now(),
+                duration_seconds: None,
+                estimate: None,
+            }));
+            Ok(())
         })
     }
     fn prepare<'a>(
@@ -346,7 +587,50 @@ impl Backend for Safety {
         Box::pin(async move {
             let digest = hash(&file_bytes(path).await?);
             let estimate = self.inner.prepare(id, path, printer, options).await?;
-            self.state.lock().await.reviews.insert(
+            let record = if self.history_root.is_some() {
+                let record = async {
+                    let name = crate::history::label(&self.inner.job(id).await?.name);
+                    let source = crate::history::label(
+                        &path.file_name().unwrap_or_default().to_string_lossy(),
+                    );
+                    let (file_name, file_size) = match self.inner.history_file(id).await? {
+                        Some(file) => file,
+                        None => (
+                            source.clone(),
+                            tokio::fs::metadata(path)
+                                .await
+                                .map_err(|_| Error::Unavailable)?
+                                .len(),
+                        ),
+                    };
+                    Ok::<_, Error>(crate::history::Record {
+                        printer: printer.into(),
+                        printer_kind: self.inner.printer_kind(printer).into(),
+                        job_id: Some(id.into()),
+                        job_name: Some(name),
+                        file_name: Some(crate::history::label(&file_name)),
+                        file_size: Some(file_size),
+                        source: Some(source),
+                        outcome: String::new(),
+                        started_at: None,
+                        ended_at: String::new(),
+                        duration_seconds: None,
+                        estimate: Some(estimate.clone()),
+                    })
+                }
+                .await;
+                match record {
+                    Ok(record) => Some(record),
+                    Err(_) => {
+                        crate::history::log_error();
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let mut state = self.state.lock().await;
+            state.reviews.insert(
                 id.into(),
                 Review {
                     printer: printer.into(),
@@ -354,6 +638,9 @@ impl Backend for Safety {
                     hash: digest,
                 },
             );
+            if let Some(record) = record {
+                state.history.insert(id.into(), record);
+            }
             Ok(estimate)
         })
     }
@@ -420,6 +707,9 @@ impl Backend for Safety {
             }
             // A failed or uncertain start can still have moved the machine.
             state.cleared.insert(job.printer.clone(), false);
+            if let Some(record) = state.history.get_mut(id) {
+                record.started_at = Some(crate::history::now());
+            }
             self.checkpoint(&state).await?;
             drop(state);
             let result = self.inner.start(id).await;
@@ -427,10 +717,16 @@ impl Backend for Safety {
                 // Backends reconcile uncertain starts and verify the live job before cancelling.
                 if let Ok(job) = self.inner.job(id).await {
                     if job.state == JobState::Cancelled {
+                        self.record_job_best_effort(&job);
                         return Ok(job);
                     }
                 }
-                return self.inner.cancel(id).await;
+                let job = self.inner.cancel(id).await?;
+                self.record_job_best_effort(&job);
+                return Ok(job);
+            }
+            if let Ok(job) = &result {
+                self.record_job_best_effort(job);
             }
             result
         })
@@ -448,6 +744,7 @@ impl Backend for Safety {
             }
             let before = self.inner.job(id).await?;
             if before.state == JobState::Cancelled {
+                self.record_job_best_effort(&before);
                 return Ok(before);
             }
             if before.state != JobState::Ready {
@@ -457,7 +754,9 @@ impl Backend for Safety {
                     .cleared
                     .insert(before.printer, false);
             }
-            self.inner.cancel(id).await
+            let job = self.inner.cancel(id).await?;
+            self.record_job_best_effort(&job);
+            Ok(job)
         })
     }
     fn stop<'a>(
@@ -474,8 +773,26 @@ impl Backend for Safety {
                 .await
                 .cleared
                 .insert(printer.into(), false);
-            self.inner.stop(printer, identity, name, path).await?;
-            self.printer(printer).await
+            let ids: Vec<_> = self
+                .state
+                .lock()
+                .await
+                .history
+                .values()
+                .filter(|r| r.printer == printer && r.started_at.is_some())
+                .filter_map(|r| r.job_id.clone())
+                .collect();
+            let result = self.inner.stop(printer, identity, name, path).await?;
+            {
+                let mut state = self.state.lock().await;
+                for id in &ids {
+                    if let Some(record) = state.history.get_mut(id) {
+                        record.outcome = "stopped".into();
+                    }
+                }
+            }
+            self.queue_history(HistoryTask::Stop(ids));
+            Ok(result)
         })
     }
     fn pause<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
@@ -516,14 +833,28 @@ impl Backend for Safety {
             if matches!(job.state, JobState::Printing | JobState::Paused)
                 && self.stops.lock().await.get(id).copied().unwrap_or(false)
             {
-                return self.inner.cancel(id).await;
+                let job = self.inner.cancel(id).await?;
+                self.record_job_best_effort(&job);
+                return Ok(job);
             }
+            self.record_job_best_effort(&job);
             Ok(job)
         })
     }
     fn forget<'a>(&'a self, id: &'a str) -> Reply<'a, ()> {
         Box::pin(async move {
+            let job = self.inner.job(id).await.ok();
             self.inner.forget(id).await?;
+            if let Some(job) = job.filter(|job| {
+                matches!(
+                    job.state,
+                    JobState::Done | JobState::Cancelled | JobState::Failed | JobState::Ended
+                )
+            }) {
+                self.record_job_best_effort(&job);
+            } else {
+                self.state.lock().await.history.remove(id);
+            }
             self.state.lock().await.reviews.remove(id);
             self.stops.lock().await.remove(id);
             Ok(())

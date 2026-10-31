@@ -162,6 +162,9 @@ pub trait Backend: Send + Sync {
     fn queue_profile(&self, _printer: &str) -> Option<(String, Options)> {
         None
     }
+    fn printer_kind(&self, _printer: &str) -> &str {
+        "simulated"
+    }
     /// Supported machine actions in configuration order, independent of live state.
     fn controls(&self, _printer: &str) -> Vec<&'static str> {
         ALL_CONTROLS.to_vec()
@@ -250,6 +253,10 @@ pub trait Backend: Send + Sync {
     }
     fn pause<'a>(&'a self, printer: &'a str) -> Reply<'a, Job>;
     fn resume<'a>(&'a self, printer: &'a str) -> Reply<'a, Job>;
+    /// Metadata for the prepared file, without its private local path.
+    fn history_file<'a>(&'a self, _job: &'a str) -> Reply<'a, Option<(String, u64)>> {
+        Box::pin(async { Ok(None) })
+    }
     /// Resolve a stored job's printer without reading machine status.
     fn job_printer<'a>(&'a self, job: &'a str) -> Reply<'a, String> {
         Box::pin(async move { Ok(self.job(job).await?.printer) })

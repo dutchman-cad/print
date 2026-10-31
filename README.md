@@ -6,6 +6,14 @@ It slices with your own PrusaSlicer or OrcaSlicer, installed separately.
 
 Not released yet. Tested against simulated printers.
 
+## Features
+
+- Prepare and estimate jobs with separately installed slicers.
+- Review and confirm each machine action, with a bed check before every start.
+- Keep persistent print history and bed-clear acknowledgements; filter them through
+  `dutchman-print history` or the [history API](docs/print-api.md#print-history).
+  History failures are logged without affecting printer actions.
+
 ## First run
 
 1. Build `dutchman-print` (see [Build from source](#build-from-source)) and put it on `PATH`.
