@@ -621,8 +621,10 @@ states block Start. ATTENTION reports `attention` (waiting for a person); BUSY r
 Pause requires printing and resume requires paused; cancel remains available for a
 matching tracked job in attention. Status reads have a four-second deadline. Control
 requests allow 15 seconds. One keep-alive HTTP connection per printer is reused for reads, with
-cached Digest challenges and incrementing nonce counts. Only reads may retry once on
-a stale Digest challenge or an idle socket the printer has closed; controls are never resent.
+cached Digest challenges and incrementing nonce counts. A request refused with a stale
+Digest nonce (401 with `stale=true`) was not acted on, so it is resent once with the new
+nonce, commands included. Reads also retry once on an idle socket the printer has closed;
+any other failure of a command is final and it is never resent.
 Uploads and controls always open a fresh connection, so a socket the printer closed while
 idle cannot make a Stop or another command fail before it reaches the printer. Commands poll matching status for
 25 seconds for start/stop and 10 seconds for pause/resume, announcing pending on stderr

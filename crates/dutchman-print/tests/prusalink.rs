@@ -1378,7 +1378,7 @@ async fn failed_upload_and_validation_delete_without_start() {
 }
 
 #[tokio::test]
-async fn stale_digest_retries_only_reads() {
+async fn stale_digest_resends_once_with_the_fresh_nonce() {
     let fake = Fake::new().await;
     fake.shared.machine.lock().await.digest = true;
     let mut config = fake.config().printers.remove(0);
@@ -1389,15 +1389,17 @@ async fn stale_digest_retries_only_reads() {
     client.snapshot().await.unwrap();
     fake.shared.machine.lock().await.stale = Some(Method::GET);
     client.snapshot().await.unwrap();
+    // The printer refused the first PUT before acting on it; the one resend carries the new nonce.
     fake.shared.machine.lock().await.stale = Some(Method::PUT);
-    assert!(client
+    let (code, _) = client
         .request(Method::PUT, "/api/v1/job/40/pause", Bytes::new(), false)
         .await
-        .is_err());
+        .unwrap();
+    assert!(code.is_success(), "{code}");
     let m = fake.shared.machine.lock().await;
     assert_eq!(
         m.records.iter().filter(|r| r.method == Method::PUT).count(),
-        1
+        2
     );
     assert_eq!(
         m.records.iter().filter(|r| r.method == Method::GET).count(),

@@ -338,8 +338,10 @@ impl Client {
                 let challenge = headers
                     .get("www-authenticate")
                     .and_then(|v| v.to_str().ok());
+                // A 401 with stale=true means the printer refused the request before acting on
+                // it, so even a command is resent once with the fresh nonce. Every other
+                // failure of a command is final.
                 if attempt == 0
-                    && method == Method::GET
                     && credentials.is_some()
                     && challenge.is_some_and(|c| {
                         c.split(',')
