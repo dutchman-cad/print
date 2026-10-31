@@ -320,6 +320,10 @@ nonzero result, or one that cannot be read, is `error`. Both kinds are `offline`
 reply in the last 30 seconds. See
 [Snapmaker 2.0 and J1/Artisan](print.md#snapmaker-20-and-j1artisan).
 
+Direct Start and queue dispatch share one Start lock per printer, held through outcome
+reconciliation; waiting starts repeat readiness, review, and bed-clear checks against fresh
+status. Stop and Cancel never wait on this lock.
+
 Printer commands are serialized separately for each printer. Uploads and command outcome
 waits on one printer do not block another printer's status, confirmation review, or Stop.
 Stop can also overtake its own printer's pending Start, pause, or resume outcome wait;

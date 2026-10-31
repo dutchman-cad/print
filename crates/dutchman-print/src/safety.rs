@@ -45,6 +45,9 @@ pub struct Safety {
     inner: Arc<dyn Backend>,
     state: Arc<Mutex<State>>,
     stops: Arc<Mutex<HashMap<String, bool>>>,
+    // Only Start takes these locks. Stop, cancel, pause, resume, clear, status,
+    // and history must never wait on a pending Start.
+    starts: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     history_pending: Arc<crate::history_pending::Pending>,
     history_poll: Arc<Mutex<()>>,
     history_tasks: Arc<tokio::sync::Semaphore>,
@@ -115,6 +118,7 @@ impl Safety {
             inner,
             state: Arc::new(Mutex::new(State::default())),
             stops: Arc::new(Mutex::new(HashMap::new())),
+            starts: Arc::new(Mutex::new(HashMap::new())),
             history_pending: Arc::new(crate::history_pending::Pending::default()),
             history_poll: Arc::new(Mutex::new(())),
             history_tasks: Arc::new(tokio::sync::Semaphore::new(64)),
@@ -699,6 +703,16 @@ impl Backend for Safety {
     fn start<'a>(&'a self, id: &'a str) -> Reply<'a, Job> {
         Box::pin(async move {
             let printer = self.inner.job_printer(id).await?;
+            let start = {
+                let mut starts = self.starts.lock().await;
+                if starts.len() >= 64 && !starts.contains_key(&printer) {
+                    return Err(Error::Unavailable);
+                }
+                starts.entry(printer.clone()).or_default().clone()
+            };
+            // Keep the per-printer guard through backend Start and reconciliation.
+            // A waiting Start must repeat every check against fresh status.
+            let _start = start.lock().await;
             self.inner.check_action(&printer, "start")?;
             let job = self.inner.job(id).await?;
             if job.state != JobState::Ready {
@@ -922,5 +936,277 @@ impl Backend for Safety {
             self.stops.lock().await.remove(id);
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+    use tokio::time::timeout;
+
+    struct BlockingStart {
+        jobs: Mutex<HashMap<String, Job>>,
+        entered: Semaphore,
+        release: Semaphore,
+        calls: AtomicUsize,
+    }
+
+    impl BlockingStart {
+        fn new() -> Self {
+            Self {
+                jobs: Mutex::new(HashMap::new()),
+                entered: Semaphore::new(0),
+                release: Semaphore::new(0),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        async fn wait_for_start(&self) {
+            timeout(Duration::from_secs(5), self.entered.acquire())
+                .await
+                .unwrap()
+                .unwrap()
+                .forget();
+        }
+    }
+
+    impl Backend for BlockingStart {
+        fn bed_ready(&self, _printer: &str, _detail: Option<&str>) -> bool {
+            true
+        }
+
+        fn printers(&self) -> Reply<'_, Vec<Printer>> {
+            Box::pin(async {
+                let jobs = self.jobs.lock().await;
+                Ok(["one", "two"]
+                    .into_iter()
+                    .map(|id| {
+                        let active = jobs
+                            .values()
+                            .find(|job| job.printer == id && job.state == JobState::Printing);
+                        Printer {
+                            id: id.into(),
+                            name: id.into(),
+                            model: "Test printer".into(),
+                            state: if active.is_some() {
+                                PrinterState::Printing
+                            } else {
+                                PrinterState::Idle
+                            },
+                            controls: crate::backend::ALL_CONTROLS
+                                .iter()
+                                .map(|action| (*action).into())
+                                .collect(),
+                            job_id: active.map(|job| job.id.clone()),
+                            job_name: active.map(|job| job.name.clone()),
+                            job_path: None,
+                            detail: None,
+                            needs_clearing: Some(false),
+                            progress: None,
+                            seconds_left: None,
+                            nozzle_temperature: None,
+                            bed_temperature: None,
+                        }
+                    })
+                    .collect())
+            })
+        }
+
+        fn prepare<'a>(
+            &'a self,
+            id: &'a str,
+            _path: &'a Path,
+            printer: &'a str,
+            _options: Options,
+        ) -> Reply<'a, Estimate> {
+            Box::pin(async move {
+                self.jobs.lock().await.insert(
+                    id.into(),
+                    Job {
+                        id: id.into(),
+                        printer: printer.into(),
+                        name: id.into(),
+                        state: JobState::Ready,
+                        estimate: Estimate::default(),
+                        progress: None,
+                        seconds_left: None,
+                        detail: None,
+                    },
+                );
+                Ok(Estimate::default())
+            })
+        }
+
+        fn start<'a>(&'a self, id: &'a str) -> Reply<'a, Job> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.entered.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+                let mut jobs = self.jobs.lock().await;
+                let job = jobs.get_mut(id).ok_or(Error::NotFound)?;
+                if job.state == JobState::Ready {
+                    job.state = JobState::Printing;
+                }
+                Ok(job.clone())
+            })
+        }
+
+        fn cancel<'a>(&'a self, id: &'a str) -> Reply<'a, Job> {
+            Box::pin(async move {
+                let mut jobs = self.jobs.lock().await;
+                let job = jobs.get_mut(id).ok_or(Error::NotFound)?;
+                job.state = JobState::Cancelled;
+                Ok(job.clone())
+            })
+        }
+
+        fn stop<'a>(
+            &'a self,
+            printer: &'a str,
+            _identity: &'a str,
+            _name: &'a str,
+            _path: Option<&'a str>,
+        ) -> Reply<'a, Printer> {
+            // No live execution yet: still return promptly while Start is blocked.
+            Box::pin(async move { self.printer(printer).await })
+        }
+
+        fn pause<'a>(&'a self, _printer: &'a str) -> Reply<'a, Job> {
+            Box::pin(async { Err(Error::Busy) })
+        }
+
+        fn resume<'a>(&'a self, _printer: &'a str) -> Reply<'a, Job> {
+            Box::pin(async { Err(Error::Busy) })
+        }
+
+        fn job<'a>(&'a self, id: &'a str) -> Reply<'a, Job> {
+            Box::pin(async move {
+                self.jobs
+                    .lock()
+                    .await
+                    .get(id)
+                    .cloned()
+                    .ok_or(Error::NotFound)
+            })
+        }
+
+        fn forget<'a>(&'a self, id: &'a str) -> Reply<'a, ()> {
+            Box::pin(async move {
+                self.jobs.lock().await.remove(id);
+                Ok(())
+            })
+        }
+    }
+
+    async fn prepared(printers: &[&str]) -> (tempfile::TempDir, Safety, Arc<BlockingStart>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reviewed.3mf");
+        tokio::fs::write(&path, b"synthetic reviewed bytes")
+            .await
+            .unwrap();
+        let backend = Arc::new(BlockingStart::new());
+        let safety = Safety::new(backend.clone());
+        for (index, printer) in printers.iter().enumerate() {
+            safety
+                .prepare(&format!("job{index}"), &path, printer, Options::default())
+                .await
+                .unwrap();
+        }
+        (dir, safety, backend)
+    }
+
+    fn spawn_start(
+        safety: &Safety,
+        id: &'static str,
+    ) -> tokio::task::JoinHandle<Result<Job, Error>> {
+        let safety = safety.clone();
+        tokio::spawn(async move { safety.start(id).await })
+    }
+
+    #[tokio::test]
+    async fn start_lock_serializes_sensor_ready_printer() {
+        let (_dir, safety, backend) = prepared(&["one", "one"]).await;
+        let first = spawn_start(&safety, "job0");
+        backend.wait_for_start().await;
+        let mut second = spawn_start(&safety, "job1");
+        assert!(timeout(Duration::from_millis(100), &mut second)
+            .await
+            .is_err());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        backend.release.add_permits(1);
+        assert_eq!(
+            timeout(Duration::from_secs(5), first)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Printing
+        );
+        let result = timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(Error::Refused(message)) if message.contains("busy")));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn start_lock_does_not_delay_stop_or_cancel() {
+        let (_dir, safety, backend) = prepared(&["one"]).await;
+        let first = spawn_start(&safety, "job0");
+        backend.wait_for_start().await;
+        timeout(
+            Duration::from_secs(5),
+            safety.stop("one", "job0", "job0", None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(5), safety.cancel("job0"))
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Cancelled
+        );
+        assert!(!first.is_finished());
+        backend.release.add_permits(1);
+        assert_eq!(
+            timeout(Duration::from_secs(5), first)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn start_lock_is_independent_per_printer() {
+        let (_dir, safety, backend) = prepared(&["one", "two"]).await;
+        let first = spawn_start(&safety, "job0");
+        backend.wait_for_start().await;
+        let second = spawn_start(&safety, "job1");
+        backend.wait_for_start().await;
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+        assert!(!first.is_finished());
+        backend.release.add_permits(2);
+        for task in [first, second] {
+            assert_eq!(
+                timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                JobState::Printing
+            );
+        }
     }
 }

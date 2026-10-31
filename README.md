@@ -10,6 +10,7 @@ Not released yet. Tested against simulated printers.
 
 - Prepare and estimate jobs with separately installed slicers.
 - Review and confirm each machine action, with a bed check before every start.
+  Only one Start per printer runs at a time; Stop never waits for it.
 - Keep persistent print history and bed-clear acknowledgements; filter them through
   `dutchman-print history` or the [history API](docs/print-api.md#print-history).
   History failures are logged, and slow history writes never hold up printer actions.
