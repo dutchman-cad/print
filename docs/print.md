@@ -1723,8 +1723,9 @@ busy, offline, uncleared, incompatible, and monitoring-only printers, and propos
 printer only once. An unmatched entry does not block later entries with other targets.
 Proposals themselves reserve nothing and never start anything. An attempted dispatch
 reserves its bound printer while the entry remains queued, even before telemetry reports
-printing and after an uncertain refusal. Reconcile the tracked job before removing such
-an entry. Matching fails closed if an attempted entry's bound printer cannot be resolved.
+printing and after an uncertain refusal. A failed or uncertain entry keeps that printer
+reserved until you remove it from the queue, so the printer gets no proposals until then:
+read the tracked job, check the printer, and then run `queue remove`. Matching fails closed if an attempted entry's bound printer cannot be resolved.
 Positions for `move` are zero-based.
 `remove` removes queue membership, retaining prepared and tracked job records.
 
