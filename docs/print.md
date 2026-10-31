@@ -403,6 +403,7 @@ are consumed before attempting a backend action, including failed attempts. Head
 are never logged. Confirmation is separate from authentication. Standalone CLI prompts
 and `--yes` create and consume the same observation-bound challenges internally.
 
+Only one Start per printer runs at a time, rechecking fresh status after waiting; Stop never waits for it.
 Printer commands are serialized separately for each printer. Uploads and command outcome
 waits on one printer do not block another printer's status, confirmation review, or Stop.
 Stop can also overtake its own printer's pending Start, pause, or resume outcome wait;
