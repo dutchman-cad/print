@@ -160,8 +160,8 @@ impl Safety {
                         let mut records = safety.history_pending.records.lock().await;
                         if let Some(record) = records.get_mut(&id) {
                             record.started_at = Some(time);
+                            safety.checkpoint_history(&records);
                         }
-                        safety.checkpoint_history(&records);
                         Ok(())
                     }
                     HistoryTask::Poll(restarting, records) => {
@@ -314,8 +314,9 @@ impl Safety {
                 }
                 Ok(Err(Error::NotFound)) if record.started_at.is_none() => {
                     let mut records = self.history_pending.records.lock().await;
-                    records.remove(id);
-                    self.checkpoint_history(&records);
+                    if records.remove(id).is_some() {
+                        self.checkpoint_history(&records);
+                    }
                 }
                 _ if restarting && record.started_at.is_some() => {
                     let job = Job {
@@ -764,8 +765,8 @@ impl Backend for Safety {
             if let Ok(mut records) = self.history_pending.records.try_lock() {
                 if let Some(record) = records.get_mut(id) {
                     record.started_at = Some(time);
+                    self.checkpoint_history(&records);
                 }
-                self.checkpoint_history(&records);
             } else {
                 self.queue_history(HistoryTask::Started(id.into(), time));
             }
@@ -843,7 +844,9 @@ impl Backend for Safety {
                         ids.push(id.clone());
                     }
                 }
-                self.checkpoint_history(&records);
+                if !ids.is_empty() {
+                    self.checkpoint_history(&records);
+                }
                 ids
             };
             self.queue_history(HistoryTask::Stop(ids));
@@ -909,8 +912,9 @@ impl Backend for Safety {
                 self.record_job_best_effort(&job);
             } else {
                 let mut records = self.history_pending.records.lock().await;
-                records.remove(id);
-                self.checkpoint_history(&records);
+                if records.remove(id).is_some() {
+                    self.checkpoint_history(&records);
+                }
             }
             self.state.lock().await.reviews.remove(id);
             self.stops.lock().await.remove(id);
