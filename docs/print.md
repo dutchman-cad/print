@@ -324,9 +324,9 @@ that same count. Bed-clear acknowledgements are counted in their own `bed_clears
 and are not jobs. The default output is a table, `--json` prints the same figures as JSON:
 
 ```text
-PRINTER    JOBS  DONE  FAILED  CANCELLED  STOPPED  ENDED  UNRESOLVED  SUCCESS  TOTAL TIME  AVG TIME  LAST FINISHED         BED CLEARS
-bench      3     2     1       0          0        0      0           66.7%    0h06m40s    0h03m20s  2026-10-03T01:00:00Z  1
-TOTAL      3     2     1       0          0        0      0           66.7%    0h06m40s    0h03m20s  2026-10-03T01:00:00Z  1
+PRINTER  JOBS  DONE  FAILED  CANCELLED  STOPPED  ENDED  UNRESOLVED  SUCCESS  TOTAL TIME  AVG TIME  LAST FINISHED         BED CLEARS
+bench    3     2     1       0          0        0      0           66.7%    0h06m40s    0h03m20s  2026-10-03T01:00:00Z  1
+TOTAL    3     2     1       0          0        0      0           66.7%    0h06m40s    0h03m20s  2026-10-03T01:00:00Z  1
 ```
 
 `history --csv` writes the records matching the usual filters (`--limit` still defaults to
