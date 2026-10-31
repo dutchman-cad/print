@@ -1,5 +1,7 @@
 # Dutchman Print
 
+Running several printers? Start with the [print farm guide](farm.md).
+
 Dutchman Print is a local print companion for SolidCraft and a standalone command line.
 A backend prepares 3MF files, estimates jobs, and controls printers. The included
 `simulated` backend is a demo: it contacts no printers and can optionally run a local slicer.
