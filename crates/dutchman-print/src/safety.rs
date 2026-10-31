@@ -866,7 +866,10 @@ impl Backend for Safety {
                 ids
             };
             self.queue_history(HistoryTask::Stop(ids));
-            result
+            result?;
+            // Read status only after the stop has been sent, so the reply carries the
+            // printer's state and its bed-check requirement.
+            self.printer(printer).await
         })
     }
     fn pause<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {
