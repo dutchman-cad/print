@@ -101,6 +101,9 @@ fn storage_name(name: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
+fn read_only(method: &Method, upload: bool) -> bool {
+    method == Method::GET && !upload
+}
 impl Client {
     /// There is no protocol logout; release the cached HTTP socket without another request.
     pub async fn shutdown(&self) {
@@ -137,7 +140,7 @@ impl Client {
         upload: bool,
         deadline: Duration,
     ) -> Result<(StatusCode, HeaderMap, Bytes), Error> {
-        let read = method == Method::GET && !upload;
+        let read = read_only(&method, upload);
         let (result, stale) = self
             .raw_once(
                 method.clone(),
@@ -174,7 +177,9 @@ impl Client {
             return (Err(Error::Unavailable), false);
         }
         let mut active = cached.take();
-        if active.as_ref().is_some_and(|c| c.sender.is_closed()) {
+        // A command never rides an idle keep-alive socket: the printer may have closed it,
+        // and a command is never repeated, so it would fail without reaching the printer.
+        if active.as_ref().is_some_and(|c| c.sender.is_closed()) || !read_only(&method, upload) {
             active = None;
         }
         let (progress, _) = crate::progress::channel();
@@ -687,12 +692,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_keep_alive_retries_reads_once_but_never_controls() {
+    async fn closed_keep_alive_retries_reads_once_and_sends_controls_on_a_fresh_socket() {
         for method in [Method::GET, Method::POST] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let count = accepted.clone();
+            let reused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen = reused.clone();
             let server = tokio::spawn(async move {
                 // The first connection answers once, then drops the next request unanswered,
                 // as a printer does when it closes an idle keep-alive socket.
@@ -705,7 +712,7 @@ mod tests {
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
                     .await
                     .unwrap();
-                head(&mut socket).await;
+                seen.store(head(&mut socket).await, std::sync::atomic::Ordering::SeqCst);
                 drop(socket);
                 while let Ok((socket, _)) = listener.accept().await {
                     count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -745,13 +752,14 @@ mod tests {
                     STATUS_TIMEOUT,
                 )
                 .await;
-            if method == Method::GET {
-                assert!(second.is_ok());
-                assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
-            } else {
-                assert!(second.is_err());
-                assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
-            }
+            // A read tries the idle socket and repeats once; a control goes straight to a new
+            // socket, so the closed one never sees it and it is sent exactly once.
+            assert!(second.is_ok());
+            assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(
+                reused.load(std::sync::atomic::Ordering::SeqCst),
+                method == Method::GET
+            );
             server.abort();
         }
     }
