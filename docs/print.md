@@ -245,6 +245,39 @@ Profile names affect slicing only when it is enabled. Started jobs progress with
 time, pause freezes progress, resume continues, and cancel ends the job.
 Simulated controls are `start`, `pause`, `resume`, `cancel`, `stop`, and `clear`.
 
+### Simulated scenarios
+
+A simulated printer can show things going wrong, so you can see how Print, a farm queue, and
+the SolidCraft plugin respond without hardware. Add any of these keys to a `[[printers]]`
+entry of a `simulated` backend. Without them the printer is healthy, as described above.
+
+```toml
+[[printers]]
+id = "sim-error"
+name = "Printer with an error"
+model = "Example model"
+fault = "error"
+
+[[printers]]
+id = "sim-flaky"
+name = "Printer whose jobs fail"
+model = "Example model"
+fail_after_seconds = 30
+```
+
+| Key | Effect |
+|---|---|
+| `offline = true` | Status reports `offline` with a detail. Preparing and every action are refused as unavailable before anything happens. |
+| `fault = "error"` or `"attention"` | Status reports that state with a detail. Start is refused, as real printers in those states refuse it. |
+| `external_job = "name"` | Status reports `printing` a job Print did not start, under that name. Start is refused as busy and a queue skips the printer. Stop works after its normal confirmation and leaves the printer idle; pause and resume are refused. |
+| `fail_after_seconds = N` | A job Print started ends as `failed` after N seconds of simulated printing (1 to 31536000) instead of `done`, and history records the outcome `failed`. A value at or above the job's estimate has no effect. |
+| `bed_sensor = true` | The printer reports a clear bed whenever it is idle and healthy, so `needs_clearing` is false and no bed acknowledgement is needed, like a printer with a bed sensor. |
+
+Use at most one of `offline`, `fault`, and `external_job` per printer. Unknown values are
+refused when the config loads, and these keys are refused with any other backend. Scenarios
+change only what the printer reports: confirmations, controls, the bed check, and the rule
+that an uncertain start is never retried apply as usual.
+
 CLI simulation state is saved in the private data folder, separately for each config path,
 so later commands can read and control it. Jobs older than one hour are removed on the
 next command. One CLI command at a time may change that state.
