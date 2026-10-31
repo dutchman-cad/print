@@ -866,7 +866,17 @@ impl Backend for Safety {
                 ids
             };
             self.queue_history(HistoryTask::Stop(ids));
-            result
+            let mut sent = result?;
+            // Read status only after the stop has been sent, so the reply carries the
+            // printer's state and its bed-check requirement. A Stop that reached the
+            // printer is never reported as failed because that read failed.
+            match self.printer(printer).await {
+                Ok(read) => Ok(read),
+                Err(_) => {
+                    sent.needs_clearing = Some(true);
+                    Ok(sent)
+                }
+            }
         })
     }
     fn pause<'a>(&'a self, printer: &'a str) -> Reply<'a, Job> {

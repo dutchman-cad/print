@@ -222,6 +222,8 @@ async fn simulator_printer_stop_ends_only_the_confirmed_live_job() {
     .await;
     assert_eq!(stopped["state"], "idle");
     assert!(stopped.get("job_id").is_none_or(Value::is_null));
+    // The Stop reply itself says the bed must be checked before the next start.
+    assert_eq!(stopped["needs_clearing"], true);
     let job = accepted(&app, get(&format!("/api/v1/jobs/{id}")), 200).await;
     assert_eq!(job["state"], "cancelled");
     let printers = accepted(&app, get("/api/v1/printers"), 200).await;
