@@ -158,6 +158,10 @@ pub const ALL_CONTROLS: &[&str] = &["start", "pause", "resume", "cancel", "stop"
 
 /// Errors must be safe to show to callers, without credentials or backend addresses.
 pub trait Backend: Send + Sync {
+    /// Conservative farm compatibility: backend kind and configured slicing presets.
+    fn queue_profile(&self, _printer: &str) -> Option<(String, Options)> {
+        None
+    }
     /// Supported machine actions in configuration order, independent of live state.
     fn controls(&self, _printer: &str) -> Vec<&'static str> {
         ALL_CONTROLS.to_vec()

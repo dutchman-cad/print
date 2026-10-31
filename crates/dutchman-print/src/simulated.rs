@@ -71,6 +71,10 @@ impl Simulated {
 
     /// CLI snapshots contain only simulation state, never backend credentials.
     pub fn restore(&self, path: &Path) -> Result<(), String> {
+        self.restore_inner(path, false)
+    }
+
+    fn restore_inner(&self, path: &Path, service: bool) -> Result<(), String> {
         use std::io::Read as _;
         let file = match std::fs::File::open(path) {
             Ok(file) => file,
@@ -92,7 +96,7 @@ impl Simulated {
         }
         let now = self.clock.now();
         jobs.retain(|id, r| {
-            let expired = now.saturating_sub(r.created) > Duration::from_secs(3600);
+            let expired = !service && now.saturating_sub(r.created) > Duration::from_secs(3600);
             if expired && id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
                 if let Some(root) = path.parent() {
                     let _ = std::fs::remove_dir_all(root.join(id));
@@ -171,9 +175,22 @@ impl Simulated {
 }
 
 impl Backend for Simulated {
+    fn queue_profile(&self, printer: &str) -> Option<(String, Options)> {
+        let p = self.printers.iter().find(|p| p.id == printer)?;
+        Some((
+            p.kind.clone().unwrap_or_else(|| "simulated".into()),
+            Options {
+                printer_profile: p.printer_profile.clone(),
+                print_profile: p.print_profile.clone(),
+                filament_profile: p.filament_profile.clone(),
+                name: None,
+            },
+        ))
+    }
+
     fn restore_jobs<'a>(&'a self, path: &'a Path) -> Reply<'a, ()> {
         Box::pin(async move {
-            self.restore(path).map_err(Error::Failed)?;
+            self.restore_inner(path, true).map_err(Error::Failed)?;
             Ok(())
         })
     }

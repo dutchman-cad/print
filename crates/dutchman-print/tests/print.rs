@@ -4,7 +4,7 @@
 use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1318,4 +1318,686 @@ async fn simulated_stop_matches_its_advertised_support() {
         accepted(&app, get(&format!("/api/v1/jobs/{id}")), 200).await["state"],
         "cancelled"
     );
+}
+
+fn queue_json(path: &str, value: Value) -> Request<Body> {
+    Request::post(path)
+        .header("content-type", "application/json")
+        .body(Body::from(value.to_string()))
+        .unwrap()
+}
+async fn queue_add(app: &Router, target: &str) -> Value {
+    let job = accepted(
+        app,
+        upload(&[("part.3mf", &model())], &[("printer", "demo")]),
+        201,
+    )
+    .await;
+    accepted(
+        app,
+        queue_json("/api/v1/queue", json!({"job":job["id"],"target":target})),
+        201,
+    )
+    .await
+}
+async fn queue_clear(app: &Router, printer: &str) {
+    let c = accepted(
+        app,
+        queue_json(
+            "/api/v1/confirmations",
+            json!({"action":"clear","printer":printer}),
+        ),
+        201,
+    )
+    .await;
+    let request = queue_json(
+        &format!("/api/v1/printers/{printer}/clear"),
+        json!({"confirmation":c["id"]}),
+    );
+    let (mut parts, body) = request.into_parts();
+    parts.headers.insert(
+        "Plugin-Confirmation",
+        dutchman_print::new_job_id()
+            .unwrap()
+            .repeat(2)
+            .parse()
+            .unwrap(),
+    );
+    assert_eq!(
+        send(app, Request::from_parts(parts, body)).await.0,
+        StatusCode::NO_CONTENT
+    );
+}
+fn queue_dispatch(id: &str, confirmation: &Value) -> Request<Body> {
+    let request = queue_json(
+        &format!("/api/v1/queue/{id}/dispatch"),
+        json!({"confirmation":confirmation["id"]}),
+    );
+    let (mut parts, body) = request.into_parts();
+    parts.headers.insert(
+        "Plugin-Confirmation",
+        dutchman_print::new_job_id()
+            .unwrap()
+            .repeat(2)
+            .parse()
+            .unwrap(),
+    );
+    Request::from_parts(parts, body)
+}
+#[tokio::test]
+async fn farm_queue_fifo_moves_remove_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let app = router(
+        simulation(clock.clone()),
+        settings(dir.path(), clock.clone()),
+    );
+    let first = queue_add(&app, "any").await;
+    let second = queue_add(&app, "demo").await;
+    let ids = |v: &Value| {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(&accepted(&app, get("/api/v1/queue"), 200).await),
+        vec![first["id"].clone(), second["id"].clone()]
+    );
+    accepted(
+        &app,
+        queue_json(
+            &format!("/api/v1/queue/{}/move", second["id"].as_str().unwrap()),
+            json!({"position":0}),
+        ),
+        200,
+    )
+    .await;
+    clock.advance(7200);
+    drop(app);
+    let app = router(simulation(clock.clone()), settings(dir.path(), clock));
+    assert_eq!(
+        ids(&accepted(&app, get("/api/v1/queue"), 200).await),
+        vec![second["id"].clone(), first["id"].clone()]
+    );
+    let request = Request::delete(format!("/api/v1/queue/{}", first["id"].as_str().unwrap()))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&app, request).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(
+        ids(&accepted(&app, get("/api/v1/queue"), 200).await),
+        vec![second["id"].clone()]
+    );
+}
+#[tokio::test]
+async fn farm_queue_dispatch_requires_confirmation_and_keeps_refusals() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let app = router(
+        simulation(clock.clone()),
+        settings(dir.path(), clock.clone()),
+    );
+    let entry = queue_add(&app, "any").await;
+    let id = entry["id"].as_str().unwrap();
+    // Uncleared beds cannot be proposed or challenged.
+    let p = accepted(&app, get("/api/v1/queue/proposals"), 200).await;
+    assert!(p[0]["printer"].is_null());
+    assert_eq!(
+        send(
+            &app,
+            queue_json(
+                &format!("/api/v1/queue/{id}/confirmations"),
+                json!({"printer":"demo"})
+            )
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    queue_clear(&app, "demo").await;
+    let c = accepted(
+        &app,
+        queue_json(
+            &format!("/api/v1/queue/{id}/confirmations"),
+            json!({"printer":"demo"}),
+        ),
+        201,
+    )
+    .await;
+    assert_eq!(
+        send(
+            &app,
+            queue_json(
+                &format!("/api/v1/queue/{id}/dispatch"),
+                json!({"confirmation":c["id"]})
+            )
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        accepted(&app, get("/api/v1/queue"), 200)
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    clock.advance(61);
+    assert_eq!(
+        send(&app, queue_dispatch(id, &c)).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        accepted(&app, get("/api/v1/queue"), 200)
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    queue_clear(&app, "demo").await;
+    // Clearance is fresh again, but the previous Start challenge has expired.
+    assert_eq!(
+        send(&app, queue_dispatch(id, &c)).await.0,
+        StatusCode::CONFLICT
+    );
+    let c = accepted(
+        &app,
+        queue_json(
+            &format!("/api/v1/queue/{id}/confirmations"),
+            json!({"printer":"demo"}),
+        ),
+        201,
+    )
+    .await;
+    let job = accepted(&app, queue_dispatch(id, &c), 200).await;
+    assert_eq!(job["state"], "printing");
+    assert!(accepted(&app, get("/api/v1/queue"), 200)
+        .await
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        send(&app, queue_dispatch(id, &c)).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+#[tokio::test]
+async fn farm_queue_one_printer_per_proposal_and_cross_printer_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let config = format!("{CONFIG}\n[[printers]]\nid='second'\nname='Second'\nmodel='Example model'\n[[printers]]\nid='incompatible'\nname='Other'\nmodel='Example model'\nprinter_profile='Other profile'\n");
+    let backend =
+        Arc::new(Simulated::new(toml::from_str(&config).unwrap(), clock.clone()).unwrap());
+    let app = router(backend, settings(dir.path(), clock));
+    let a = queue_add(&app, "any").await;
+    let b = queue_add(&app, "any").await;
+    queue_add(&app, "any").await;
+    for p in ["demo", "second", "incompatible"] {
+        queue_clear(&app, p).await;
+    }
+    let proposals = accepted(&app, get("/api/v1/queue/proposals"), 200).await;
+    assert_eq!(proposals[0]["printer"], "demo");
+    assert_eq!(proposals[1]["printer"], "second");
+    assert!(proposals[2]["printer"].is_null());
+    let id = b["id"].as_str().unwrap();
+    let c = accepted(
+        &app,
+        queue_json(
+            &format!("/api/v1/queue/{id}/confirmations"),
+            json!({"printer":"second"}),
+        ),
+        201,
+    )
+    .await;
+    let job = accepted(&app, queue_dispatch(id, &c), 200).await;
+    assert_eq!(job["printer"], "second");
+    assert_ne!(job["id"], b["job"]);
+    let proposals = accepted(&app, get("/api/v1/queue/proposals"), 200).await;
+    assert_eq!(proposals[0]["id"], a["id"]);
+    assert_eq!(proposals[0]["printer"], "demo");
+    assert!(proposals[1]["printer"].is_null()); // busy second and incompatible third are skipped
+}
+
+#[derive(Default)]
+struct QueueStartGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    fail_lookup: AtomicBool,
+}
+struct QueueBackend {
+    inner: Simulated,
+    starts: AtomicU64,
+    fail: bool,
+    start_gate: Option<Arc<QueueStartGate>>,
+}
+impl Backend for QueueBackend {
+    fn bed_ready(&self, printer: &str, detail: Option<&str>) -> bool {
+        (printer == "monitor" && detail == Some("READY"))
+            || (printer == "demo" && self.start_gate.is_some())
+    }
+    fn controls(&self, printer: &str) -> Vec<&'static str> {
+        if printer == "monitor" {
+            Vec::new()
+        } else {
+            dutchman_print::backend::ALL_CONTROLS.to_vec()
+        }
+    }
+    fn queue_profile(&self, printer: &str) -> Option<(String, Options)> {
+        self.inner.queue_profile(printer)
+    }
+    fn restore_jobs<'a>(&'a self, path: &'a Path) -> dutchman_print::backend::Reply<'a, ()> {
+        self.inner.restore_jobs(path)
+    }
+    fn persist_jobs<'a>(&'a self, path: &'a Path) -> dutchman_print::backend::Reply<'a, ()> {
+        self.inner.persist_jobs(path)
+    }
+    fn printers(
+        &self,
+    ) -> dutchman_print::backend::Reply<'_, Vec<dutchman_print::backend::Printer>> {
+        Box::pin(async {
+            let mut printers = self.inner.printers().await?;
+            for p in &mut printers {
+                p.controls = self.controls(&p.id).iter().map(|s| s.to_string()).collect();
+                if p.id == "busy" {
+                    p.state = PrinterState::Busy;
+                }
+                if p.id == "monitor" {
+                    p.detail = Some("READY".into());
+                }
+            }
+            Ok(printers)
+        })
+    }
+    fn prepare<'a>(
+        &'a self,
+        id: &'a str,
+        path: &'a Path,
+        printer: &'a str,
+        options: Options,
+    ) -> dutchman_print::backend::Reply<'a, dutchman_print::backend::Estimate> {
+        self.inner.prepare(id, path, printer, options)
+    }
+    fn start<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> dutchman_print::backend::Reply<'a, dutchman_print::backend::Job> {
+        Box::pin(async move {
+            let previous = self.starts.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.start_gate {
+                if previous == 0 {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                }
+            }
+            if self.fail {
+                Err(Error::Refused(
+                    "Start outcome is uncertain. Read job status.".into(),
+                ))
+            } else {
+                self.inner.start(id).await
+            }
+        })
+    }
+    fn cancel<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> dutchman_print::backend::Reply<'a, dutchman_print::backend::Job> {
+        self.inner.cancel(id)
+    }
+    fn pause<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> dutchman_print::backend::Reply<'a, dutchman_print::backend::Job> {
+        self.inner.pause(id)
+    }
+    fn resume<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> dutchman_print::backend::Reply<'a, dutchman_print::backend::Job> {
+        self.inner.resume(id)
+    }
+    fn job_printer<'a>(&'a self, id: &'a str) -> dutchman_print::backend::Reply<'a, String> {
+        Box::pin(async move {
+            if self
+                .start_gate
+                .as_ref()
+                .is_some_and(|gate| gate.fail_lookup.load(Ordering::SeqCst))
+            {
+                return Err(Error::Unavailable);
+            }
+            self.inner.job_printer(id).await
+        })
+    }
+    fn job<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> dutchman_print::backend::Reply<'a, dutchman_print::backend::Job> {
+        self.inner.job(id)
+    }
+    fn forget<'a>(&'a self, id: &'a str) -> dutchman_print::backend::Reply<'a, ()> {
+        self.inner.forget(id)
+    }
+}
+#[tokio::test]
+async fn farm_queue_uncertain_dispatch_is_never_retried_even_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let backend = Arc::new(QueueBackend {
+        inner: Simulated::new(toml::from_str(CONFIG).unwrap(), clock.clone()).unwrap(),
+        starts: AtomicU64::new(0),
+        fail: true,
+        start_gate: None,
+    });
+    let app = router(backend.clone(), settings(dir.path(), clock.clone()));
+    let entry = queue_add(&app, "demo").await;
+    let id = entry["id"].as_str().unwrap();
+    queue_clear(&app, "demo").await;
+    let c = accepted(
+        &app,
+        queue_json(
+            &format!("/api/v1/queue/{id}/confirmations"),
+            json!({"printer":"demo"}),
+        ),
+        201,
+    )
+    .await;
+    assert_eq!(
+        send(&app, queue_dispatch(id, &c)).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(backend.starts.load(Ordering::SeqCst), 1);
+    let list = accepted(&app, get("/api/v1/queue"), 200).await;
+    assert_eq!(list[0]["attempted"], true);
+    assert!(list[0]["reason"].as_str().unwrap().contains("uncertain"));
+    assert_eq!(
+        send(&app, queue_dispatch(id, &c)).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(backend.starts.load(Ordering::SeqCst), 1);
+    drop(app);
+    let app = router(backend.clone(), settings(dir.path(), clock));
+    assert_eq!(
+        send(&app, queue_dispatch(id, &c)).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(backend.starts.load(Ordering::SeqCst), 1);
+}
+#[tokio::test]
+async fn farm_queue_skips_monitoring_busy_and_filter_mismatches() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let config = format!("{CONFIG}\n[[printers]]\nid='monitor'\nname='Monitor'\nmodel=''\n[[printers]]\nid='busy'\nname='Busy'\nmodel=''\n");
+    let backend = Arc::new(QueueBackend {
+        inner: Simulated::new(toml::from_str(&config).unwrap(), clock.clone()).unwrap(),
+        starts: AtomicU64::new(0),
+        fail: false,
+        start_gate: None,
+    });
+    let app = router(backend, settings(dir.path(), clock));
+    let first = queue_add(&app, "any").await;
+    let second = queue_add(&app, "any").await;
+    queue_clear(&app, "demo").await;
+    let p = accepted(&app, get("/api/v1/queue/proposals"), 200).await;
+    assert_eq!(p[0]["printer"], "demo");
+    assert!(p[1]["printer"].is_null());
+    let request = Request::delete(format!("/api/v1/queue/{}", second["id"].as_str().unwrap()))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&app, request).await.0, StatusCode::NO_CONTENT);
+    let request = Request::delete(format!("/api/v1/queue/{}", first["id"].as_str().unwrap()))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&app, request).await.0, StatusCode::NO_CONTENT);
+    accepted(
+        &app,
+        queue_json(
+            "/api/v1/queue",
+            json!({"job":second["job"],"target":"any","kind":"prusalink"}),
+        ),
+        201,
+    )
+    .await;
+    let p = accepted(&app, get("/api/v1/queue/proposals"), 200).await;
+    assert!(p[0]["printer"].is_null());
+    accepted(
+        &app,
+        queue_json(
+            "/api/v1/queue",
+            json!({"job":first["job"],"target":"any","profile":"Different preset"}),
+        ),
+        201,
+    )
+    .await;
+    let p = accepted(&app, get("/api/v1/queue/proposals"), 200).await;
+    assert!(p[0]["printer"].is_null());
+    assert!(p[1]["printer"].is_null());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn farm_queue_cli_round_trip_uses_the_server_and_human_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let app = router(simulation(clock.clone()), settings(dir.path(), clock));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let file = dir.path().join("test.3mf");
+    std::fs::write(&file, model()).unwrap();
+    async fn call(url: &str, args: Vec<String>) -> Output {
+        let url = url.to_string();
+        tokio::task::spawn_blocking(move || {
+            Command::new(env!("CARGO_BIN_EXE_dutchman-print"))
+                .args(["queue", "--server", &url])
+                .args(args)
+                .env_remove("DUTCHMAN_PRINT_PASSWORD")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap()
+    }
+    let out = call(
+        &url,
+        vec![
+            "add".into(),
+            file.to_string_lossy().into_owned(),
+            "--printer".into(),
+            "demo".into(),
+        ],
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let entry: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = entry["id"].as_str().unwrap().to_string();
+    for args in [
+        vec!["list".into()],
+        vec!["proposals".into()],
+        vec!["move".into(), id.clone(), "0".into()],
+    ] {
+        let out = call(&url, args).await;
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let out = call(
+        &url,
+        vec![
+            "dispatch".into(),
+            id.clone(),
+            "--printer".into(),
+            "demo".into(),
+            "--bed-clear".into(),
+        ],
+    )
+    .await;
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("needs confirmation"));
+    let out = call(
+        &url,
+        vec![
+            "dispatch".into(),
+            id.clone(),
+            "--printer".into(),
+            "demo".into(),
+            "--bed-clear".into(),
+            "--yes".into(),
+        ],
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let job: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(job["state"], "printing");
+    let out = call(&url, vec!["list".into()]).await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        json!([])
+    );
+    let out = call(
+        &url,
+        vec![
+            "add".into(),
+            file.to_string_lossy().into_owned(),
+            "--printer".into(),
+            "demo".into(),
+        ],
+    )
+    .await;
+    assert!(out.status.success());
+    let entry: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let out = call(
+        &url,
+        vec!["remove".into(), entry["id"].as_str().unwrap().into()],
+    )
+    .await;
+    assert!(out.status.success());
+    server.abort();
+}
+
+#[tokio::test]
+async fn farm_queue_in_flight_dispatch_reserves_sensor_ready_printer() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let gate = Arc::new(QueueStartGate::default());
+    let backend = Arc::new(QueueBackend {
+        inner: Simulated::new(toml::from_str(CONFIG).unwrap(), clock.clone()).unwrap(),
+        starts: AtomicU64::new(0),
+        fail: false,
+        start_gate: Some(gate.clone()),
+    });
+    let app = router(backend.clone(), settings(dir.path(), clock.clone()));
+    let first = queue_add(&app, "demo").await;
+    let second = queue_add(&app, "demo").await;
+    let first_id = first["id"].as_str().unwrap();
+    let second_id = second["id"].as_str().unwrap();
+    let challenge_path = |id| format!("/api/v1/queue/{id}/confirmations");
+    let move_path = |id| format!("/api/v1/queue/{id}/move");
+    let first_challenge = accepted(
+        &app,
+        queue_json(&challenge_path(first_id), json!({"printer":"demo"})),
+        201,
+    )
+    .await;
+    // Obtain a valid, bound challenge for the second entry before either Start.
+    accepted(
+        &app,
+        queue_json(&move_path(second_id), json!({"position":0})),
+        200,
+    )
+    .await;
+    let second_challenge = accepted(
+        &app,
+        queue_json(&challenge_path(second_id), json!({"printer":"demo"})),
+        201,
+    )
+    .await;
+    accepted(
+        &app,
+        queue_json(&move_path(first_id), json!({"position":0})),
+        200,
+    )
+    .await;
+    let request = queue_dispatch(first_id, &first_challenge);
+    let dispatch_app = app.clone();
+    let dispatch = tokio::spawn(async move { send(&dispatch_app, request).await });
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .unwrap();
+    // The reservation must apply even when the attempted entry is now later in FIFO.
+    accepted(
+        &app,
+        queue_json(&move_path(second_id), json!({"position":0})),
+        200,
+    )
+    .await;
+    let printers = accepted(&app, get("/api/v1/printers"), 200).await;
+    assert_eq!(printers[0]["state"], "idle");
+    assert_eq!(printers[0]["needs_clearing"], false);
+    let proposals = accepted(&app, get("/api/v1/queue/proposals"), 200).await;
+    assert_eq!(proposals[0]["id"], second["id"]);
+    assert!(proposals
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p["printer"].is_null()));
+    assert_eq!(
+        send(
+            &app,
+            queue_json(&challenge_path(second_id), json!({"printer":"demo"}))
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send(&app, queue_dispatch(second_id, &second_challenge))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(backend.starts.load(Ordering::SeqCst), 1);
+    // A missing binding lookup must not silently release the unknown reservation.
+    gate.fail_lookup.store(true, Ordering::SeqCst);
+    assert_eq!(
+        send(&app, get("/api/v1/queue/proposals")).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    gate.fail_lookup.store(false, Ordering::SeqCst);
+    gate.release.notify_one();
+    let (status, _, _) = tokio::time::timeout(Duration::from_secs(5), dispatch)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    let entries = accepted(&app, get("/api/v1/queue"), 200).await;
+    assert_eq!(entries.as_array().unwrap().len(), 1);
+    assert_eq!(entries[0]["id"], second["id"]);
+    // After the first job completes, the remaining entry can be proposed and started.
+    clock.advance(120);
+    let proposals = accepted(&app, get("/api/v1/queue/proposals"), 200).await;
+    assert_eq!(proposals[0]["printer"], "demo");
+    let challenge = accepted(
+        &app,
+        queue_json(&challenge_path(second_id), json!({"printer":"demo"})),
+        201,
+    )
+    .await;
+    accepted(&app, queue_dispatch(second_id, &challenge), 200).await;
+    assert_eq!(backend.starts.load(Ordering::SeqCst), 2);
 }

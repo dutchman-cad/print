@@ -264,6 +264,10 @@ impl Safety {
     }
 }
 impl Backend for Safety {
+    fn queue_profile(&self, printer: &str) -> Option<(String, Options)> {
+        self.inner.queue_profile(printer)
+    }
+
     fn controls(&self, printer: &str) -> Vec<&'static str> {
         self.inner.controls(printer)
     }

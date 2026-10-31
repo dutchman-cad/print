@@ -1509,6 +1509,19 @@ impl Printers {
 }
 
 impl Backend for Printers {
+    fn queue_profile(&self, printer: &str) -> Option<(String, Options)> {
+        let p = self.configs.iter().find(|p| p.id == printer)?;
+        Some((
+            p.kind.clone().unwrap_or_else(|| "unknown".into()),
+            Options {
+                printer_profile: p.printer_profile.clone(),
+                print_profile: p.print_profile.clone(),
+                filament_profile: p.filament_profile.clone(),
+                name: None,
+            },
+        ))
+    }
+
     fn controls(&self, printer: &str) -> Vec<&'static str> {
         self.configs
             .iter()
